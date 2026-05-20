@@ -1,0 +1,21 @@
+[project]
+name = "lea-platform"
+version = "0.1.0"
+description = "终身教育AI Agent平台"
+requires-python = ">=3.11"
+dependencies = [
+    "lea-server",
+]
+
+[tool.uv.sources]
+lea-server = { workspace = true }
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]

@@ -15,17 +15,17 @@ from pydantic_settings import BaseSettings
 
 
 class LLMSettings(BaseSettings):
-    """LLM相关配置，从环境变量 LEA_ 前缀读取。"""
+    """LLM相关配置，从环境变量 LEA_ 前缀读取。
 
-    tenant_api_base: str = Field(
-        default="https://tenantapi-ai.ouchn.edu.cn",
-        alias="LEA_TENANT_API_BASE",
-    )
-    tenant_api_key: str = Field(default="", alias="LEA_TENANT_API_KEY")
+    字段名 tenant_api_key → 环境变量 LEA_TENANT_API_KEY（自动加前缀）
+    """
 
-    model_chat: str = Field(default="qwen-max-latest", alias="LEA_MODEL_CHAT")
-    model_routing: str = Field(default="glm-4-plus", alias="LEA_MODEL_ROUTING")
-    model_fallback: str = Field(default="glm-4-flash", alias="LEA_MODEL_FALLBACK")
+    tenant_api_base: str = "https://tenantapi-ai.ouchn.edu.cn"
+    tenant_api_key: str = ""
+
+    model_chat: str = "qwen-max-latest"
+    model_routing: str = "glm-4-plus"
+    model_fallback: str = "glm-4-flash"
 
     model_config = {"env_prefix": "LEA_", "extra": "ignore"}
 

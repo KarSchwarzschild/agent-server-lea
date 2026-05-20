@@ -25,7 +25,7 @@ class Environment(str, Enum):
 
 def _load_env_files() -> Environment:
     """按优先级加载环境配置。"""
-    backend_dir = Path(__file__).parent.parent.parent.parent  # lea-platform/
+    backend_dir = Path(__file__).parent.parent.parent.parent.parent  # lea-platform/
 
     base_env = backend_dir / ".env"
     if base_env.exists():

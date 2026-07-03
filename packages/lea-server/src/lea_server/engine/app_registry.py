@@ -14,7 +14,8 @@ from fastapi import APIRouter
 from lea_graph.llm import get_chat_model
 from lea_graph.protocol import AppManifest, AppProtocol
 from lea_graph.services.memory_store import MemoryStore
-from lea_graph.tools import PLATFORM_TOOLS
+from lea_graph.mcp.client import get_mcp_client
+from lea_graph.tools import get_platform_tools
 
 if TYPE_CHECKING:
     from langgraph.graph.state import CompiledStateGraph
@@ -48,10 +49,16 @@ class AppRegistry:
                 models = app.get_models()
                 self.all_db_models.extend(models)
 
+                platform_tools = get_platform_tools()
+                mcp_client = get_mcp_client()
+                mcp_tools = mcp_client.get_tools() if mcp_client else []
+                all_tools = platform_tools + mcp_tools
+
                 agents = app.build_agents(
                     llm=get_chat_model,
-                    platform_tools=PLATFORM_TOOLS,
+                    platform_tools=all_tools,
                     services=self._services,
+                    checkpointer=self._services.get("checkpointer"),
                 )
                 self.app_agents[name] = agents
 
@@ -86,4 +93,19 @@ class AppRegistry:
             for agent_info in manifest.agents:
                 agents_map[agent_info.name] = all_keywords
             result[name] = agents_map
+        return result
+
+    def get_global_skills(self) -> list[Any]:
+        """返回所有 scope='global' 的工具实例，供 Supervisor 使用。"""
+        from langchain_core.tools import BaseTool
+
+        result: list[BaseTool] = []
+        for name, manifest in self.manifests.items():
+            app = self.apps[name]
+            global_names = {s.name for s in manifest.skills if s.scope == "global"}
+            if not global_names:
+                continue
+            for tool in app.skills:
+                if tool.name in global_names:
+                    result.append(tool)
         return result

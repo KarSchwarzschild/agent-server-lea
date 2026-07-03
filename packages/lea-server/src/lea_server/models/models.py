@@ -23,6 +23,7 @@ class User(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(String(100), unique=True, index=True)
     username = Column(String(100), unique=True, index=True)
+    tenant_id = Column(String(50), nullable=False, index=True, default="default")
     password_hash = Column(String(255))
     email = Column(String(200), default="")
     avatar = Column(String(500), default="")

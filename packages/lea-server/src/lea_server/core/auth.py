@@ -15,6 +15,7 @@ from lea_server.config import get_settings
 class TokenData(BaseModel):
     user_id: str
     roles: list[str] = []
+    tenant_id: str = "default"
 
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
@@ -33,7 +34,8 @@ def decode_token(token: str) -> Optional[TokenData]:
         if user_id is None:
             return None
         roles = payload.get("roles", [])
-        return TokenData(user_id=user_id, roles=roles)
+        tenant_id = payload.get("tenant_id", "default")
+        return TokenData(user_id=user_id, roles=roles, tenant_id=tenant_id)
     except JWTError:
         return None
 

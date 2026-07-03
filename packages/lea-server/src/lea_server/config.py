@@ -65,6 +65,11 @@ class Settings(BaseSettings):
     upload_dir: str = Field(default="./data/uploads", alias="UPLOAD_DIR")
     generated_files_dir: str = Field(default="./data/generated_files", alias="GENERATED_FILES_DIR")
 
+    minio_endpoint: str = Field(default="http://localhost:9000", alias="MINIO_ENDPOINT")
+    minio_access_key: str = Field(default="minioadmin", alias="MINIO_ACCESS_KEY")
+    minio_secret_key: str = Field(default="minioadmin", alias="MINIO_SECRET_KEY")
+    minio_bucket: str = Field(default="lea-uploads", alias="MINIO_BUCKET")
+
     @property
     def database_url(self) -> str:
         if self.db_host in ("sqlite", ""):

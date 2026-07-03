@@ -29,6 +29,7 @@ class SkillInfo:
     description: str
     trigger_keywords: list[str] = field(default_factory=list)
     category: str = "general"
+    scope: str = "app"
 
 
 @dataclass(frozen=True)

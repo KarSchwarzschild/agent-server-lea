@@ -97,6 +97,8 @@ async def stream_graph_as_sse(
     - messages: LLM逐token输出 → SSE content事件
     - custom: Agent/工具通过 get_stream_writer() 发送的自定义事件
     """
+    usage_total: dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
     try:
         async for event in graph.astream(
             input_state,
@@ -111,8 +113,14 @@ async def stream_graph_as_sse(
 
             if kind == "messages":
                 msg_chunk, _metadata = payload
-                if isinstance(msg_chunk, AIMessageChunk) and msg_chunk.content:
-                    yield _sse("content", {"text": msg_chunk.content})
+                if isinstance(msg_chunk, AIMessageChunk):
+                    if msg_chunk.content:
+                        yield _sse("content", {"text": msg_chunk.content})
+                    um = getattr(msg_chunk, "usage_metadata", None)
+                    if um:
+                        usage_total["input_tokens"] += um.get("input_tokens", 0)
+                        usage_total["output_tokens"] += um.get("output_tokens", 0)
+                        usage_total["total_tokens"] += um.get("total_tokens", 0)
 
             elif kind == "custom":
                 if isinstance(payload, dict):
@@ -124,7 +132,10 @@ async def stream_graph_as_sse(
         logger.error("stream_error", error=str(exc))
         yield _sse("error", {"message": str(exc)})
 
-    yield _sse("done", {"status": "completed"})
+    done_data: dict[str, Any] = {"status": "completed"}
+    if usage_total["total_tokens"] > 0:
+        done_data["usage"] = usage_total
+    yield _sse("done", done_data)
 
 
 async def stream_task_progress(

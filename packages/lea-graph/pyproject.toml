@@ -8,6 +8,8 @@ dependencies = [
     "langchain-openai>=0.3",
     "langgraph>=0.2",
     "langgraph-checkpoint>=2.0",
+    "langgraph-checkpoint-redis>=0.2",
+    "langmem>=0.0.20",
     "redis>=5.0",
     "pydantic>=2.5",
     "pydantic-settings>=2.1",
@@ -17,6 +19,11 @@ dependencies = [
     "opentelemetry-api>=1.20",
     "opentelemetry-sdk>=1.20",
     "structlog>=24.0",
+    "mcp>=1.0",
+    "langchain-mcp-adapters>=0.2",
+    "pyyaml>=6.0",
+    "python-pptx>=1.0",
+    "python-docx>=1.1",
 ]
 
 [build-system]

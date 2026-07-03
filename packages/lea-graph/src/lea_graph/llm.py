@@ -1,24 +1,24 @@
 """
 LLM 工厂 — 统一的模型创建入口。
 
-支持多模型配置（chat/routing/fallback），streaming默认开启，
-通过 infra/resilience 提供重试+熔断+fallback。
+支持多模型配置（chat/routing/fallback），streaming默认开启。
+三级降级链：在线 API → 本地模型 API → 友好错误。
 """
 
 from __future__ import annotations
 
 from functools import lru_cache
 
+import structlog
+from langchain_core.language_models import BaseChatModel
 from langchain_openai import ChatOpenAI
-from pydantic import Field
 from pydantic_settings import BaseSettings
+
+logger = structlog.get_logger()
 
 
 class LLMSettings(BaseSettings):
-    """LLM相关配置，从环境变量 LEA_ 前缀读取。
-
-    字段名 tenant_api_key → 环境变量 LEA_TENANT_API_KEY（自动加前缀）
-    """
+    """LLM相关配置，从环境变量 LEA_ 前缀读取。"""
 
     tenant_api_base: str = "https://tenantapi-ai.ouchn.edu.cn"
     tenant_api_key: str = ""
@@ -26,6 +26,11 @@ class LLMSettings(BaseSettings):
     model_chat: str = "qwen-max-latest"
     model_routing: str = "glm-4-plus"
     model_fallback: str = "glm-4-flash"
+
+    # 本地模型（自部署 Ollama/vLLM，降级用）
+    local_api_base: str = ""
+    local_api_key: str = "sk-local"
+    local_model: str = "qwen3:32b"
 
     model_config = {"env_prefix": "LEA_", "extra": "ignore"}
 
@@ -42,6 +47,31 @@ _MODEL_MAP = {
 }
 
 
+def _create_model(
+    model_name: str,
+    api_base: str,
+    api_key: str,
+    *,
+    streaming: bool = True,
+    temperature: float = 0.7,
+    max_tokens: int | None = None,
+    timeout: float = 120.0,
+) -> ChatOpenAI:
+    from lea_graph.infra.token_tracking import token_callback
+
+    return ChatOpenAI(
+        model=model_name,
+        openai_api_key=api_key,
+        openai_api_base=api_base,
+        streaming=streaming,
+        stream_usage=True,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        request_timeout=timeout,
+        callbacks=[token_callback],
+    )
+
+
 def get_chat_model(
     purpose: str = "chat",
     *,
@@ -49,20 +79,14 @@ def get_chat_model(
     temperature: float = 0.7,
     max_tokens: int | None = None,
     timeout: float = 120.0,
-) -> ChatOpenAI:
-    """创建 ChatOpenAI 实例。
+    with_fallback: bool = True,
+) -> BaseChatModel:
+    """创建 ChatOpenAI 实例，自动挂载降级链。
 
-    Args:
-        purpose: 用途，决定使用哪个模型。可选: "chat", "routing", "fallback"
-        streaming: 是否启用流式输出（LangGraph stream_mode="messages" 需要此项为True）
-        temperature: 温度参数
-        max_tokens: 最大token数
-        timeout: 超时秒数
+    降级链（with_fallback=True 时）：
+      在线 API (tenant_api_base) → 本地模型 API (local_api_base)
 
-    教学说明:
-        ChatOpenAI 通过 openai_api_base 参数兼容所有 OpenAI 格式的 API。
-        智能基座（国开大）、通义千问、GLM 等国内大模型都提供了 OpenAI 兼容接口，
-        因此统一使用 ChatOpenAI 即可，无需为每个厂商写不同的客户端。
+    with_fallback=False 可跳过降级链（用于测试或已有外层 fallback 逻辑时）。
     """
     settings = _get_llm_settings()
     attr = _MODEL_MAP.get(purpose, "model_chat")
@@ -71,12 +95,26 @@ def get_chat_model(
     api_base = f"{settings.tenant_api_base}/v1"
     api_key = settings.tenant_api_key or "sk-placeholder"
 
-    return ChatOpenAI(
-        model=model_name,
-        openai_api_key=api_key,
-        openai_api_base=api_base,
-        streaming=streaming,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        request_timeout=timeout,
+    primary = _create_model(
+        model_name, api_base, api_key,
+        streaming=streaming, temperature=temperature,
+        max_tokens=max_tokens, timeout=timeout,
     )
+
+    if not with_fallback or not settings.local_api_base:
+        return primary
+
+    local = _create_model(
+        settings.local_model,
+        f"{settings.local_api_base}/v1",
+        settings.local_api_key,
+        streaming=streaming, temperature=temperature,
+        max_tokens=max_tokens, timeout=timeout,
+    )
+
+    logger.debug(
+        "llm_fallback_chain",
+        primary=model_name,
+        fallback=settings.local_model,
+    )
+    return primary.with_fallbacks([local])

@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>模式选择测试</title>
+  <style>
+    .mode-selection-card { border: 1px solid #ccc; padding: 20px; margin: 20px; }
+    .mode-item { display: inline-block; padding: 10px; margin: 5px; border: 1px solid #999; cursor: pointer; }
+    .mode-item.selected { background: #e0e0ff; }
+    button { padding: 10px 20px; margin: 10px; }
+  </style>
+</head>
+<body>
+  <h1>模式选择功能测试</h1>
+
+  <div class="mode-selection-card">
+    <h3>选择讨论模式 <span id="countdown">30s</span></h3>
+
+    <div class="mode-item" data-mode="debate">辩论 ⚔️</div>
+    <div class="mode-item" data-mode="seminar">研讨 🎓</div>
+    <div class="mode-item selected" data-mode="socratic">苏格拉底 💡 (推荐)</div>
+
+    <br><br>
+    <button id="confirmBtn">确认开始</button>
+  </div>
+
+  <div id="log" style="margin: 20px; padding: 10px; background: #f0f0f0;"></div>
+
+  <script>
+    let selectedMode = 'socratic'
+    let pendingSelection = {
+      topic: '测试话题',
+      recommendedMode: 'socratic'
+    }
+
+    function log(msg) {
+      document.getElementById('log').innerHTML += msg + '<br>'
+      console.log(msg)
+    }
+
+    // 模式选择
+    document.querySelectorAll('.mode-item').forEach(item => {
+      item.addEventListener('click', () => {
+        document.querySelectorAll('.mode-item').forEach(i => i.classList.remove('selected'))
+        item.classList.add('selected')
+        selectedMode = item.dataset.mode
+        log('选择模式: ' + selectedMode)
+      })
+    })
+
+    // 确认按钮
+    document.getElementById('confirmBtn').addEventListener('click', () => {
+      log('点击确认按钮')
+      log('pendingSelection: ' + JSON.stringify(pendingSelection))
+      log('selectedMode: ' + selectedMode)
+
+      if (!pendingSelection) {
+        log('❌ pendingSelection 为空')
+        return
+      }
+
+      log('✅ 模拟发送请求: ' + pendingSelection.topic + ' (模式: ' + selectedMode + ')')
+      pendingSelection = null
+    })
+
+    // 倒计时
+    let countdown = 30
+    setInterval(() => {
+      countdown--
+      document.getElementById('countdown').textContent = countdown + 's'
+      if (countdown === 0) {
+        log('⏰ 倒计时结束，自动确认')
+        document.getElementById('confirmBtn').click()
+      }
+    }, 1000)
+  </script>
+</body>
+</html>

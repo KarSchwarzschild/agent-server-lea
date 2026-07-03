@@ -1,0 +1,144 @@
+/**
+ * CSS 变量规范
+ * 命名空间前缀：le (lifelong-edu)
+ */
+:root {
+  /* 布局尺寸 */
+  --le-header-height: 60px;
+  --le-tab-bar-height: 56px;
+  --le-sider-width: 260px;
+  --le-content-max-width: 1200px;
+
+  /* 间距系统（8pt网格） */
+  --le-spacing-xs: 4px;
+  --le-spacing-sm: 8px;
+  --le-spacing-md: 16px;
+  --le-spacing-lg: 24px;
+  --le-spacing-xl: 32px;
+
+  /* 消息宽度 */
+  --le-message-max-width: 75%;
+
+  /* 字体 */
+  --le-font-size-xs: 12px;
+  --le-font-size-sm: 14px;
+  --le-font-size-base: 15px;
+  --le-font-size-lg: 17px;
+  --le-font-size-xl: 20px;
+
+  /* 行高 */
+  --le-line-height-tight: 1.25;
+  --le-line-height-normal: 1.5;
+  --le-line-height-loose: 1.75;
+
+  /* 圆角 */
+  --le-radius-sm: 4px;
+  --le-radius-md: 8px;
+  --le-radius-lg: 16px;
+  --le-radius-full: 9999px;
+
+  /* 颜色 */
+  --le-color-primary: #2080f0;
+  --le-color-success: #18a058;
+  --le-color-warning: #f0a020;
+  --le-color-error: #d03050;
+  --le-color-text: #333;
+  --le-color-text-secondary: #666;
+  --le-color-text-tertiary: #999;
+  --le-color-border: #eee;
+  --le-color-background: #f5f7f9;
+
+  /* 执行阶段状态颜色 */
+  --le-phase-done: #10b981;
+  --le-phase-active: #3b82f6;
+  --le-phase-pending: #9ca3af;
+  --le-phase-done-bg: #dcfce7;
+  --le-phase-active-bg: #dbeafe;
+  --le-phase-pending-bg: #e5e7eb;
+
+  /* 状态文字背景 */
+  --le-status-processing-bg: #f0f5ff;
+  --le-status-success-bg: #f0fdf4;
+  --le-status-error-bg: #fef2f2;
+  --le-status-processing-text: #3b82f6;
+  --le-status-success-text: #16a34a;
+  --le-status-error-text: #dc2626;
+
+  /* 思考过程/工具调用背景（P1统一颜色后替换） */
+  --le-thinking-bg: #f0f5ff;
+  --le-thinking-border: #3b82f6;
+  --le-tool-bg: #f0fdf4;
+  --le-tool-border: #10b981;
+
+  /* iOS安全区域 */
+  --le-safe-area-top: env(safe-area-inset-top, 0px);
+  --le-safe-area-bottom: env(safe-area-inset-bottom, 0px);
+  --le-safe-area-left: env(safe-area-inset-left, 0px);
+  --le-safe-area-right: env(safe-area-inset-right, 0px);
+
+  /* 动态视口高度 */
+  --le-vh: 1vh;
+
+  /* z-index层级 */
+  --le-z-header: 100;
+  --le-z-tab-bar: 100;
+  --le-z-drawer: 200;
+  --le-z-modal: 300;
+  --le-z-message: 400;
+}
+
+/* 移动端变量覆盖 */
+@media (max-width: 768px) {
+  :root {
+    --le-header-height: 48px;
+    --le-sider-width: 0;
+    --le-spacing-md: 12px;
+    --le-spacing-lg: 16px;
+    --le-message-max-width: 90%;
+    --le-font-size-base: 16px;
+  }
+}
+
+@media (max-width: 480px) {
+  :root {
+    --le-message-max-width: 95%;
+  }
+}
+
+/* 触摸热区规范 - 最小44×44px */
+.touch-target {
+  min-height: 44px;
+  min-width: 44px;
+}
+
+.list-item-touch {
+  min-height: 48px;
+  padding: 12px var(--le-spacing-md);
+}
+
+.icon-btn-touch {
+  width: 44px;
+  height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.chip-touch {
+  min-height: 36px;
+  padding: 6px 12px;
+}
+
+/* 禁止双击缩放 */
+.no-double-tap-zoom {
+  touch-action: manipulation;
+}
+
+/* 移动端安全区域底部占位 */
+.safe-area-bottom {
+  height: var(--le-safe-area-bottom);
+}
+
+.safe-area-top {
+  height: var(--le-safe-area-top);
+}

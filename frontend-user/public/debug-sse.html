@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>SSE 事件调试</title>
+  <style>
+    body { font-family: monospace; padding: 20px; }
+    .event { margin: 10px 0; padding: 10px; background: #f0f0f0; }
+    .event.mode { background: #ffe0e0; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h1>SSE 事件调试</h1>
+  <button onclick="startTest()">开始测试</button>
+  <div id="log"></div>
+
+  <script>
+    function log(msg, isMode = false) {
+      const div = document.createElement('div')
+      div.className = isMode ? 'event mode' : 'event'
+      div.textContent = msg
+      document.getElementById('log').appendChild(div)
+    }
+
+    async function startTest() {
+      document.getElementById('log').innerHTML = ''
+      log('发送请求...')
+
+      const response = await fetch('/api/user/super-agent/chat/stream?async=true', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyXzMxYmJiMThjOTA4YSIsInJvbGVzIjpbInVzZXIiXSwicGVybWlzc2lvbnMiOlsiZG9jdW1lbnQ6cmVhZCIsImtiOnJlYWQiXSwiZXhwIjoxNzc2MjMxMDA1fQ.jc0bOdaoytQ-_7gQJl5_raCdeb0powMnjUUL-AH242o'
+        },
+        body: JSON.stringify({
+          message: '高校应该优先发展线上教学还是线下教学？',
+          force_skill: '__debate__'
+        })
+      })
+
+      const { session_id } = await response.json()
+      log(`会话ID: ${session_id}`)
+
+      const eventSource = new EventSource(`/api/user/super-agent/chat/events/${session_id}`)
+
+      eventSource.onmessage = (e) => {
+        log(`事件: ${e.type}, 数据: ${e.data.substring(0, 100)}`)
+      }
+
+      eventSource.addEventListener('mode_selection_required', (e) => {
+        log(`✅ 收到 mode_selection_required`, true)
+        log(`数据: ${e.data}`, true)
+      })
+
+      eventSource.addEventListener('debate_created', (e) => {
+        log(`❌ 收到 debate_created (不应该有)`)
+      })
+
+      eventSource.onerror = () => {
+        log('连接关闭')
+        eventSource.close()
+      }
+    }
+  </script>
+</body>
+</html>

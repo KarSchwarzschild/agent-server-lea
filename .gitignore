@@ -23,6 +23,12 @@ env/
 # Node
 node_modules/
 frontend/dist/
+frontend-user/dist/
+frontend-user/.vite/
+frontend-user/test-results/
+frontend-user/playwright-report/
+frontend-admin/dist/
+frontend-admin/.vite/
 *.tsbuildinfo
 
 # Environment

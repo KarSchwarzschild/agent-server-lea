@@ -1,0 +1,21 @@
+# Dependencies
+node_modules/
+
+# IDE
+.vscode/
+.idea/
+
+# Git
+.git/
+.gitignore
+
+# Build artifacts
+dist/
+
+# Docs
+*.md
+
+# Misc
+.DS_Store
+*.log
+.env.local

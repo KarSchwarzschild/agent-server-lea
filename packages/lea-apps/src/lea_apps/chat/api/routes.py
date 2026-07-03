@@ -1,4 +1,4 @@
-"""Chat App的API — 会话管理。"""
+"""Chat App的API — 会话管理（代理到平台层）。"""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ class SessionResponse(BaseModel):
     title: str
     app_name: str
     created_at: str | None = None
-    updated_at: str | None = None
+    last_active_at: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -32,12 +32,12 @@ async def list_sessions(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    from lea_apps.chat.models.models import ChatSession
+    from lea_server.models.chat_session import ChatSession
 
     sessions = (
         db.query(ChatSession)
-        .filter(ChatSession.user_id == user.id)
-        .order_by(ChatSession.updated_at.desc())
+        .filter(ChatSession.user_id == user.user_id)
+        .order_by(ChatSession.last_active_at.desc())
         .limit(50)
         .all()
     )
@@ -50,9 +50,9 @@ async def create_session(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    from lea_apps.chat.models.models import ChatSession
+    from lea_server.models.chat_session import ChatSession
 
-    session = ChatSession(user_id=user.id, title=data.title)
+    session = ChatSession(user_id=user.user_id, title=data.title)
     db.add(session)
     db.commit()
     db.refresh(session)
@@ -65,11 +65,11 @@ async def delete_session(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    from lea_apps.chat.models.models import ChatSession
+    from lea_server.models.chat_session import ChatSession
 
     session = db.query(ChatSession).filter(
         ChatSession.id == session_id,
-        ChatSession.user_id == user.id,
+        ChatSession.user_id == user.user_id,
     ).first()
 
     if not session:
@@ -86,11 +86,11 @@ async def get_messages(
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    from lea_apps.chat.models.models import ChatMessage, ChatSession
+    from lea_server.models.chat_session import ChatMessage, ChatSession
 
     session = db.query(ChatSession).filter(
         ChatSession.id == session_id,
-        ChatSession.user_id == user.id,
+        ChatSession.user_id == user.user_id,
     ).first()
     if not session:
         raise HTTPException(status_code=404, detail="会话不存在")

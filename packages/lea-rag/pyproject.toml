@@ -1,0 +1,26 @@
+[project]
+name = "lea-rag"
+version = "0.1.0"
+description = "LEA Platform RAG引擎（LlamaIndex + Milvus）"
+requires-python = ">=3.11"
+dependencies = [
+    "lea-graph",
+    "llama-index-core>=0.12",
+    "llama-index-vector-stores-milvus>=0.4",
+    "llama-index-llms-openai-like>=0.3",
+    "llama-index-embeddings-openai>=0.3",
+    "pymilvus>=2.5",
+    "PyMuPDF>=1.25",
+    "tiktoken>=0.8",
+    "httpx>=0.26",
+]
+
+[tool.uv.sources]
+lea-graph = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lea_rag"]

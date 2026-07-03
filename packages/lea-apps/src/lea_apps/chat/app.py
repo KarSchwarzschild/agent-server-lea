@@ -50,6 +50,13 @@ class ChatApp:
                     trigger_keywords=["搜索", "查找", "网上", "最新", "新闻"],
                     category="search",
                 ),
+                SkillInfo(
+                    name="document-generation",
+                    display_name="文档生成",
+                    description="生成PPT、Word等文档文件",
+                    trigger_keywords=["PPT", "ppt", "演示", "幻灯片", "Word", "文档", "报告", "生成文件", "做一个"],
+                    category="writing",
+                ),
             ],
             routes=[],  # 对话走统一Chat入口，无独立页面
         )

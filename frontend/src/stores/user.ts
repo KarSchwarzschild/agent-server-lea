@@ -24,6 +24,13 @@ export const useUserStore = defineStore('user', () => {
     await fetchUserInfo()
   }
 
+  async function register(username: string, password: string, email: string) {
+    const { data } = await request.post('/api/auth/register', { username, password, email })
+    token.value = data.access_token
+    localStorage.setItem('lea_token', data.access_token)
+    await fetchUserInfo()
+  }
+
   async function fetchUserInfo() {
     const { data } = await request.get('/api/auth/me')
     userInfo.value = data
@@ -35,5 +42,5 @@ export const useUserStore = defineStore('user', () => {
     localStorage.removeItem('lea_token')
   }
 
-  return { token, userInfo, isLoggedIn, login, fetchUserInfo, logout }
+  return { token, userInfo, isLoggedIn, login, register, fetchUserInfo, logout }
 })

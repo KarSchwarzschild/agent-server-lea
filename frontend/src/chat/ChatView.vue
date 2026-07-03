@@ -1,52 +1,86 @@
 <template>
-  <div class="chat-container">
-    <div class="messages" ref="messagesRef">
-      <div v-for="(msg, i) in messages" :key="i" :class="['message', msg.role]">
-        <div class="message-content">
-          <div class="role-label">{{ msg.role === 'user' ? '你' : '助手' }}</div>
-          <div class="text" v-html="msg.content"></div>
+  <div class="chat-page">
+    <SessionList :current-id="sessionId" @select="switchSession" ref="sessionListRef" />
+    <div class="chat-container">
+      <div class="messages" ref="messagesRef">
+        <div v-for="(msg, i) in messages" :key="i" :class="['message', msg.role]">
+          <div class="message-content">
+            <div class="role-label">{{ msg.role === 'user' ? '你' : '助手' }}</div>
+            <div v-if="msg.skillName" class="skill-badge">{{ msg.skillName }}</div>
+            <div class="text" v-html="msg.content"></div>
+          </div>
+        </div>
+
+        <!-- Plan 面板 -->
+        <PlanPanel
+          :plan="currentPlan"
+          :approved="planApproved"
+          @approve="handlePlanApprove"
+          @reject="handlePlanReject"
+        />
+
+        <!-- Artifact 面板 -->
+        <ArtifactPanel
+          ref="artifactPanelRef"
+          :slides="artifactSlides"
+          :artifact-id="artifactId"
+        />
+
+        <div v-if="streaming" class="message assistant">
+          <div class="message-content">
+            <div class="role-label">助手</div>
+            <div class="text">{{ streamingText }}<span class="cursor">|</span></div>
+          </div>
         </div>
       </div>
-      <div v-if="streaming" class="message assistant">
-        <div class="message-content">
-          <div class="role-label">助手</div>
-          <div class="text">{{ streamingText }}<span class="cursor">|</span></div>
-        </div>
-      </div>
-    </div>
-    <div class="input-area">
-      <n-input
-        v-model:value="inputText"
-        type="textarea"
-        :autosize="{ minRows: 1, maxRows: 4 }"
-        placeholder="输入消息..."
-        @keyup.enter.exact="sendMessage"
+
+      <ChatInput
+        :skills="skills"
         :disabled="streaming"
+        @send="sendMessage"
       />
-      <n-button type="primary" :loading="streaming" @click="sendMessage">
-        发送
-      </n-button>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, nextTick } from 'vue'
-import { NInput, NButton } from 'naive-ui'
+import { ref, nextTick, onMounted } from 'vue'
 import { useUserStore } from '../stores/user'
+import ChatInput from './ChatInput.vue'
+import PlanPanel from './PlanPanel.vue'
+import ArtifactPanel from './components/ArtifactPanel.vue'
+import SessionList from './components/SessionList.vue'
+import type { SkillItem } from './SkillPanel.vue'
+import request from '../utils/request'
 
 const userStore = useUserStore()
 
 interface Message {
   role: 'user' | 'assistant'
   content: string
+  skillName?: string
+}
+
+interface PlanStep {
+  step: number
+  task: string
+  tool?: string
+  status: string
 }
 
 const messages = ref<Message[]>([])
-const inputText = ref('')
 const streaming = ref(false)
 const streamingText = ref('')
 const messagesRef = ref<HTMLElement>()
+const skills = ref<SkillItem[]>([])
+const currentPlan = ref<PlanStep[]>([])
+const planApproved = ref(false)
+const sessionId = ref('default')
+const sessionListRef = ref<InstanceType<typeof SessionList>>()
+
+const artifactSlides = ref<string[]>([])
+const artifactId = ref('')
+const artifactPanelRef = ref<InstanceType<typeof ArtifactPanel>>()
 
 function scrollToBottom() {
   nextTick(() => {
@@ -56,32 +90,45 @@ function scrollToBottom() {
   })
 }
 
-async function sendMessage() {
-  const text = inputText.value.trim()
+async function fetchSkills() {
+  try {
+    const { data } = await request.get('/api/skills')
+    skills.value = data.skills || []
+  } catch { /* ignore */ }
+}
+
+async function sendMessage(text: string, skillId: number | null, attachmentIds: number[] = []) {
   if (!text || streaming.value) return
 
-  messages.value.push({ role: 'user', content: text })
-  inputText.value = ''
+  const skillName = skillId
+    ? skills.value.find(s => s.id === skillId)?.display_name
+    : undefined
+
+  messages.value.push({ role: 'user', content: text, skillName })
   streaming.value = true
   streamingText.value = ''
   scrollToBottom()
 
   try {
+    const body: Record<string, any> = { message: text, session_id: sessionId.value }
+    if (skillId) body.skill_id = skillId
+    if (attachmentIds.length) body.attachment_ids = attachmentIds
+
     const response = await fetch('/api/chat/stream', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${userStore.token}`,
       },
-      body: JSON.stringify({ message: text, session_id: 'default' }),
+      body: JSON.stringify(body),
     })
 
     const reader = response.body?.getReader()
     const decoder = new TextDecoder()
-
     if (!reader) return
 
     let buffer = ''
+    let currentEventType = ''
     while (true) {
       const { done, value } = await reader.read()
       if (done) break
@@ -91,33 +138,112 @@ async function sendMessage() {
       buffer = lines.pop() || ''
 
       for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          try {
-            const data = JSON.parse(line.slice(6))
-            if (data.text) {
-              streamingText.value += data.text
-              scrollToBottom()
-            }
-          } catch { /* skip non-JSON lines */ }
+        if (line.startsWith('event: ')) {
+          currentEventType = line.slice(7).trim()
+          continue
         }
+        if (!line.startsWith('data: ')) continue
+        try {
+          const data = JSON.parse(line.slice(6))
+          const eventType = currentEventType || ''
+          currentEventType = ''
+
+          if (data.text) {
+            streamingText.value += data.text
+            scrollToBottom()
+          }
+          if (data.plan) {
+            currentPlan.value = data.plan
+            planApproved.value = false
+            scrollToBottom()
+          }
+          // Slide 事件处理（用 SSE event type 判断）
+          if (eventType === 'slide') {
+            artifactSlides.value.push(data.svg)
+            scrollToBottom()
+          }
+          if (eventType === 'slide_updated') {
+            artifactSlides.value[data.index] = data.svg
+            artifactPanelRef.value?.highlightUpdated(data.index)
+          }
+          if (eventType === 'slide_added') {
+            artifactSlides.value.splice(data.index, 0, data.svg)
+            artifactPanelRef.value?.highlightUpdated(data.index)
+          }
+          if (eventType === 'slide_deleted') {
+            artifactSlides.value.splice(data.index, 1)
+          }
+          if (eventType === 'slides_created') {
+            artifactId.value = data.artifact_id
+          }
+          // Plan 步骤执行事件
+          if (eventType === 'plan_step_start' && currentPlan.value[data.step - 1]) {
+            currentPlan.value[data.step - 1].status = 'in_progress'
+          }
+          if (eventType === 'plan_step_done' && currentPlan.value[data.step - 1]) {
+            currentPlan.value[data.step - 1].status = 'completed'
+          }
+        } catch { /* skip */ }
       }
     }
 
     messages.value.push({ role: 'assistant', content: streamingText.value })
-  } catch (error) {
+  } catch {
     messages.value.push({ role: 'assistant', content: '抱歉，请求出错了。' })
   } finally {
     streaming.value = false
     streamingText.value = ''
   }
 }
+
+onMounted(fetchSkills)
+
+function switchSession(newId: string) {
+  sessionId.value = newId
+  messages.value = []
+  currentPlan.value = []
+  planApproved.value = false
+  artifactSlides.value = []
+  artifactId.value = ''
+  loadMessages(newId)
+}
+
+async function loadMessages(sid: string) {
+  try {
+    const response = await fetch(`/api/chat/sessions/${sid}/messages`, {
+      headers: { 'Authorization': `Bearer ${userStore.token}` },
+    })
+    const data = await response.json()
+    if (data.messages && data.messages.length) {
+      messages.value = data.messages
+      scrollToBottom()
+    }
+  } catch { /* ignore */ }
+}
+
+function handlePlanApprove() {
+  planApproved.value = true
+  sendMessage('确认执行', null, [])
+}
+
+function handlePlanReject() {
+  currentPlan.value = []
+  planApproved.value = false
+  sendMessage('取消', null, [])
+}
 </script>
 
 <style scoped>
+.chat-page {
+  display: flex;
+  height: calc(100vh - 82px);
+}
+
 .chat-container {
   display: flex;
   flex-direction: column;
-  height: calc(100vh - 82px);
+  flex: 1;
+  min-width: 0;
 }
 
 .messages {
@@ -151,6 +277,16 @@ async function sendMessage() {
   margin-bottom: 4px;
 }
 
+.skill-badge {
+  display: inline-block;
+  font-size: 11px;
+  background: #e0e7ff;
+  color: #4338ca;
+  padding: 1px 8px;
+  border-radius: 10px;
+  margin-bottom: 6px;
+}
+
 .text {
   white-space: pre-wrap;
   line-height: 1.6;
@@ -163,12 +299,5 @@ async function sendMessage() {
 @keyframes blink {
   0%, 100% { opacity: 1; }
   50% { opacity: 0; }
-}
-
-.input-area {
-  display: flex;
-  gap: 8px;
-  padding: 16px;
-  border-top: 1px solid #e8e8e8;
 }
 </style>

@@ -35,7 +35,7 @@ import {
   NLayout, NLayoutSider, NLayoutHeader, NLayoutContent,
   NMenu, NButton, NDropdown
 } from 'naive-ui'
-import { ChatbubbleEllipsesOutline, SettingsOutline, AppsOutline } from '@vicons/ionicons5'
+import { ChatbubbleEllipsesOutline, SettingsOutline, AppsOutline, LibraryOutline } from '@vicons/ionicons5'
 import { NIcon } from 'naive-ui'
 import { useUserStore } from '../stores/user'
 import request from '../utils/request'
@@ -65,6 +65,7 @@ function renderIcon(icon: any) {
 const menuOptions = computed(() => {
   const items: any[] = [
     { label: '智能对话', key: '/chat', icon: renderIcon(ChatbubbleEllipsesOutline) },
+    { label: '知识库', key: '/knowledge', icon: renderIcon(LibraryOutline) },
   ]
 
   for (const app of dynamicApps.value) {

@@ -27,6 +27,24 @@ services:
       - backend
     restart: unless-stopped
 
+  minio:
+    image: minio/minio:latest
+    container_name: lea-minio
+    ports:
+      - "9000:9000"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+    command: server /data
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
   mysql:
     image: mysql:8.0
     container_name: lea-mysql
@@ -63,3 +81,4 @@ services:
 volumes:
   mysql_data:
   redis_data:
+  minio_data:

@@ -1352,7 +1352,9 @@ function onMentionSelect(skill: MentionSkill) {
  * SSE 连接基地址：开发环境直连后端（绕过 Vite http-proxy，避免并发 SSE 流混淆），
  * 生产环境走 nginx 代理（相对路径）。
  */
-const SSE_BASE_URL = import.meta.env.DEV ? 'http://localhost:8000' : ''
+const SSE_BASE_URL = import.meta.env.DEV
+  ? (import.meta.env.VITE_SSE_BASE_URL || 'http://localhost:8100')
+  : ''
 
 const SSE_EVENT_TYPES = [
   'thinking', 'intent', 'skill_start', 'content', 'skill_done',

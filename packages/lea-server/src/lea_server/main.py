@@ -248,34 +248,34 @@ app = FastAPI(
 )
 
 # 中间件（注册顺序与执行顺序相反：后注册的先执行）
+# CORS: 开发期放行所有 localhost/127.0.0.1 端口（前端 vite dev server 端口经常变）
+# 生产时应改回具体域名白名单
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:5173",
-        "http://localhost:9001",
-        "http://localhost:9002",
-    ],
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+class UserPrefixStripMiddleware:
+    """/api/user/* → /api/*，纯 ASGI 版本（避免 BaseHTTPMiddleware 缓冲 SSE 流）。"""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            path = scope.get("path", "")
+            if path.startswith("/api/user/"):
+                new_path = "/api/" + path[len("/api/user/") :]
+                scope["path"] = new_path
+                scope["raw_path"] = new_path.encode("latin-1")
+        await self.app(scope, receive, send)
+
+
 app.add_middleware(TenantMiddleware)
 app.add_middleware(RequestTraceMiddleware)
-
-
-@app.middleware("http")
-async def strip_user_prefix(request, call_next):
-    """/api/user/* → /api/*，让前端 user 命名空间指向平台通用路由。
-
-    admin 前缀 (/api/admin/*) 保持不变。
-    """
-    path = request.url.path
-    if path.startswith("/api/user/"):
-        new_path = "/api/" + path[len("/api/user/") :]
-        request.scope["path"] = new_path
-        request.scope["raw_path"] = new_path.encode()
-    return await call_next(request)
+app.add_middleware(UserPrefixStripMiddleware)
 
 # 平台级路由
 app.include_router(health_router)

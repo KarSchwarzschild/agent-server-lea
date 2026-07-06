@@ -53,3 +53,6 @@ uv.lock
 
 # Claude
 .claude/
+
+# scratch curl bodies
+.lea-*.json

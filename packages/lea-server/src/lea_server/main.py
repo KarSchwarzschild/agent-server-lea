@@ -23,6 +23,7 @@ from lea_server.api.admin import router as admin_router
 from lea_server.api.admin_knowledge import router as admin_knowledge_router
 from lea_server.api.admin_skills import router as admin_skills_router
 from lea_server.api.admin_users import router as admin_users_router
+from lea_server.api.agents import router as agents_router
 from lea_server.api.artifact import router as artifact_router
 from lea_server.api.attachment import router as attachment_router
 from lea_server.api.auth import router as auth_router
@@ -30,6 +31,7 @@ from lea_server.api.chat import router as chat_router
 from lea_server.api.health import router as health_router
 from lea_server.api.knowledge import router as knowledge_router
 from lea_server.api.session import router as session_router
+from lea_server.api.super_agent import router as super_agent_router
 from lea_server.api.user_skills import router as user_skills_router
 from lea_server.config import LEA_ENV, get_settings
 from lea_server.core.middleware import RequestTraceMiddleware, TenantMiddleware
@@ -261,6 +263,20 @@ app.add_middleware(
 app.add_middleware(TenantMiddleware)
 app.add_middleware(RequestTraceMiddleware)
 
+
+@app.middleware("http")
+async def strip_user_prefix(request, call_next):
+    """/api/user/* → /api/*，让前端 user 命名空间指向平台通用路由。
+
+    admin 前缀 (/api/admin/*) 保持不变。
+    """
+    path = request.url.path
+    if path.startswith("/api/user/"):
+        new_path = "/api/" + path[len("/api/user/") :]
+        request.scope["path"] = new_path
+        request.scope["raw_path"] = new_path.encode()
+    return await call_next(request)
+
 # 平台级路由
 app.include_router(health_router)
 app.include_router(auth_router, prefix="/api")
@@ -274,6 +290,10 @@ app.include_router(admin_skills_router, prefix="/api")
 app.include_router(admin_users_router, prefix="/api")
 app.include_router(knowledge_router, prefix="/api")
 app.include_router(user_skills_router, prefix="/api")
+app.include_router(super_agent_router, prefix="/api")
+app.include_router(agents_router, prefix="/api")
+# 让 /api/super-agent/chat/stream 复用 chat_router 的 /chat/stream 实现
+app.include_router(chat_router, prefix="/api/super-agent")
 
 
 @app.get("/")

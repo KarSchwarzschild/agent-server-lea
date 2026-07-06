@@ -5,7 +5,7 @@ services:
       dockerfile: packages/lea-server/Dockerfile
     container_name: lea-backend-dev
     ports:
-      - "8000:8000"
+      - "8100:8000"  # host:container — 8100 避开 lifelong-edu 的 8000
     env_file:
       - ../.env
     environment:

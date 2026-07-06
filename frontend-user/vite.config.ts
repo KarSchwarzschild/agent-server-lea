@@ -1,9 +1,14 @@
-import { defineConfig } from 'vite'
+import { defineConfig, loadEnv } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import { resolve } from 'path'
 
 // https://vite.dev/config/
-export default defineConfig({
+export default defineConfig(({ mode }) => {
+  const env = loadEnv(mode, process.cwd(), '')
+  const apiTarget = env.VITE_API_TARGET || 'http://127.0.0.1:8100'
+  const devPort = Number(env.VITE_DEV_PORT || 9102)
+
+  return {
   plugins: [vue()],
   resolve: {
     alias: {
@@ -16,17 +21,17 @@ export default defineConfig({
     exclude: ['tests/e2e/**', 'node_modules/**'],
   },
   server: {
-    port: 9002,
+    port: devPort,
     proxy: {
       '/api': {
-        target: 'http://127.0.0.1:8000',
+        target: apiTarget,
         changeOrigin: true,
         // SSE 长连接：禁用 proxyTimeout，防止 ERR_INCOMPLETE_CHUNKED_ENCODING
         timeout: 0,
         proxyTimeout: 0,
       },
       '/feed': {
-        target: 'http://127.0.0.1:8000',
+        target: apiTarget,
         changeOrigin: true
       },
       '/kkfileview': {
@@ -53,5 +58,6 @@ export default defineConfig({
     },
     // 分块大小警告阈值
     chunkSizeWarningLimit: 500
+  }
   }
 })

@@ -173,9 +173,13 @@ def delete_session(
 
 
 @router.post("/sessions/{session_id}/stop")
-def stop_session(session_id: str, user: User = Depends(get_current_user)):
-    """停止正在执行的会话（暂时是 no-op stub，等 async POST/EventSource 落地后再实现）。"""
-    return {"success": True, "session_id": session_id}
+async def stop_session(session_id: str, user: User = Depends(get_current_user)):
+    """停止正在执行的会话：取消后台任务 + 向 EventSource 消费者广播 cancelled 事件。"""
+    from lea_server.services.sse_bus import get_event_bus
+
+    bus = get_event_bus()
+    cancelled = await bus.cancel(session_id)
+    return {"success": True, "session_id": session_id, "was_running": cancelled}
 
 
 @router.post("/tools/result")

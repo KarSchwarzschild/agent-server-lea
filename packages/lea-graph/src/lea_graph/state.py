@@ -34,3 +34,14 @@ class PlatformState(TypedDict):
     # 上下文管理
     context: dict[str, Any]
     user_memories: list[str]
+
+    # 安全护栏：security_precheck 节点的裁决 —— "" | "allow" | "block"
+    # 条件边据此决定继续路由还是短路到 END
+    security_action: str
+
+    # 多 Skill 循环计数（方案 B：单轮内连续执行多个 skill）
+    skill_loop_count: int
+    _skill_loop_done: bool
+
+    # 专家团并行执行结果
+    team_subtask_results: list[dict[str, Any]]

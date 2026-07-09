@@ -1,17 +1,5 @@
 <template>
-  <!-- 折叠态：面板关闭但有 artifact 时，显示浮动卡片 -->
-  <div
-    v-if="!artifactStore.panelVisible && artifactStore.artifactCount > 0"
-    class="artifact-inline-card"
-    @click="reopenPanel"
-  >
-    <div class="inline-card-icon">📄</div>
-    <div class="inline-card-info">
-      <div class="inline-card-title">{{ latestArtifactTitle }}</div>
-      <div class="inline-card-meta">{{ latestArtifactMeta }}</div>
-    </div>
-    <div class="inline-card-action">打开 →</div>
-  </div>
+  <!-- （右下角浮动折叠卡片已移除；多 artifact 场景下气泡内联卡片是唯一入口） -->
 
   <div
     v-if="artifactStore.panelVisible"
@@ -76,7 +64,10 @@
           </div>
         </div>
 
-        <!-- 正常文档内容 -->
+        <!-- Slides 类型 artifact（走 SlidesPresenter 渲染） -->
+        <SlideArtifactViewer v-else-if="isSlidesArtifact" />
+
+        <!-- 正常文档内容（markdown / code） -->
         <ArtifactEditor
           v-else
           ref="editorRef"
@@ -86,15 +77,15 @@
         />
       </div>
 
-      <!-- 高亮工具栏（仅编辑模式下、选中文字时弹出） -->
+      <!-- 高亮工具栏（仅编辑模式下、选中文字时弹出，slides 类型不用） -->
       <HighlightToolbar
-        :visible="artifactStore.panelMode === 'editing' && !!selectionHighlight && !isAIProcessing && !isAIPreview"
+        :visible="artifactStore.panelMode === 'editing' && !!selectionHighlight && !isAIProcessing && !isAIPreview && !isSlidesArtifact"
         :position="selectionPosition"
         @rewrite="handleHighlightRewrite"
       />
 
-      <!-- 编辑模式底部区域（三态互斥） -->
-      <template v-if="artifactStore.panelMode === 'editing'">
+      <!-- 编辑模式底部区域（三态互斥；slides 走 Phase C 独立编辑，此处跳过） -->
+      <template v-if="artifactStore.panelMode === 'editing' && !isSlidesArtifact">
         <!-- AI 处理中提示（优先级最高） -->
         <div v-if="isAIProcessing" class="artifact-ai-processing-bar">
           <span class="ai-processing-dot" />
@@ -150,16 +141,19 @@
       </template>
 
       <div class="artifact-footer">
-        <span class="word-count" v-if="wordCount > 0">{{ wordCount }} 字</span>
+        <span class="word-count" v-if="wordCount > 0 && !isSlidesArtifact">{{ wordCount }} 字</span>
+        <span class="word-count" v-else-if="isSlidesArtifact">演示文稿 · {{ slidesPageCount }} 页</span>
         <div class="footer-actions">
-          <n-button size="small" quaternary @click="handleExport('docx:standard')" :disabled="exporting">
-            <template #icon><n-icon size="14"><DocumentText /></n-icon></template>
-            Word
-          </n-button>
-          <n-button size="small" quaternary @click="handleExport('pdf')" :disabled="exporting">
-            <template #icon><n-icon size="14"><Document /></n-icon></template>
-            PDF
-          </n-button>
+          <template v-if="!isSlidesArtifact">
+            <n-button size="small" quaternary @click="handleExport('docx:standard')" :disabled="exporting">
+              <template #icon><n-icon size="14"><DocumentText /></n-icon></template>
+              Word
+            </n-button>
+            <n-button size="small" quaternary @click="handleExport('pdf')" :disabled="exporting">
+              <template #icon><n-icon size="14"><Document /></n-icon></template>
+              PDF
+            </n-button>
+          </template>
           <n-button size="small" quaternary @click="handleCopy">
             <template #icon><n-icon size="14"><CopyOutline /></n-icon></template>
             复制
@@ -200,8 +194,25 @@ import { highlightRewrite, aiEdit } from '@/api/artifact'
 import ArtifactHeader from './ArtifactHeader.vue'
 import ArtifactEditor from './ArtifactEditor.vue'
 import HighlightToolbar from './HighlightToolbar.vue'
+import SlideArtifactViewer from './SlideArtifactViewer.vue'
 
 const artifactStore = useArtifactStore()
+
+const isSlidesArtifact = computed(
+  () => artifactStore.activeArtifact?.artifactType === 'slides',
+)
+
+const slidesPageCount = computed(() => {
+  if (!isSlidesArtifact.value) return 0
+  const s = artifactStore.currentContent?.content || artifactStore.streamingContent
+  if (!s) return 0
+  try {
+    const obj = JSON.parse(s)
+    return Array.isArray(obj?.slides) ? obj.slides.length : 0
+  } catch {
+    return 0
+  }
+})
 const message = useMessage()
 const bodyRef = ref<HTMLElement>()
 const editorRef = ref<InstanceType<typeof ArtifactEditor>>()

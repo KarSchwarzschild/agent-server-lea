@@ -100,7 +100,7 @@ export interface Artifact {
   sessionId: string
   userId: string
   title: string
-  artifactType: 'markdown' | 'code'
+  artifactType: 'markdown' | 'code' | 'slides'
   docCategory: DocCategory
   templateId?: string
   currentIndex: number

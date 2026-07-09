@@ -39,6 +39,7 @@ def _skill_to_dict(skill: Skill) -> dict:
 
 
 class UserSkillCreateRequest(BaseModel):
+    """创建 skill 元数据。skill 内容（system prompt / scripts / references）走 SG-5 bundle 上传 API 挂载。"""
     name: str = Field(min_length=1, max_length=100)
     display_name: str = Field(min_length=1, max_length=200)
     description: str = ""
@@ -46,7 +47,6 @@ class UserSkillCreateRequest(BaseModel):
     model_tier: str = "mid"
     allowed_tools: list[str] = []
     trigger_keywords: list[str] = []
-    system_prompt: str = ""
     resources: dict = {}
 
 
@@ -57,7 +57,6 @@ class UserSkillUpdateRequest(BaseModel):
     model_tier: str | None = None
     allowed_tools: list[str] | None = None
     trigger_keywords: list[str] | None = None
-    system_prompt: str | None = None
     resources: dict | None = None
 
 
@@ -70,10 +69,12 @@ async def list_available_skills(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """用户可用的 Skill 列表（system + public + 自己的 private）。"""
+    """用户可用的 Skill 列表（system + public + 自己的 private，角色白名单过滤）。"""
     svc = SkillService(db, redis_client=_get_redis(request))
+    user_role_codes = [r.code for r in (user.roles or [])]
     skills, total = svc.list_skills(
         user_id=user.user_id,
+        user_roles=user_role_codes,
         category=category,
         page=page,
         size=size,

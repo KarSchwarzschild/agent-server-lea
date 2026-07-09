@@ -121,6 +121,7 @@ def _build_candidates(configurable: dict) -> list[dict]:
     for item in configurable.get("skill_candidates", []):
         candidates.append({
             "name": item["name"],
+            "display_name": item.get("display_name") or item["name"],
             "type": "skill",
             "description": item.get("description", ""),
         })
@@ -130,6 +131,7 @@ def _build_candidates(configurable: dict) -> list[dict]:
         for agent_name in agents:
             candidates.append({
                 "name": f"{app_name}/{agent_name}",
+                "display_name": f"{app_name}/{agent_name}",
                 "type": "agent",
                 "app": app_name,
                 "agent": agent_name,
@@ -142,6 +144,15 @@ def _build_candidates(configurable: dict) -> list[dict]:
         "type": "fallback",
         "description": "通用对话问答，当其他候选都不匹配时使用",
     })
+
+    # Teams
+    for team_info in configurable.get("team_candidates", []):
+        candidates.append({
+            "name": f"team:{team_info['name']}",
+            "display_name": team_info.get("display_name") or team_info["name"],
+            "type": "team",
+            "description": team_info.get("description", ""),
+        })
 
     return candidates
 
@@ -182,9 +193,16 @@ async def _llm_route(text: str, candidates: list[dict]) -> dict:
 async def route_message(state: PlatformState, config: RunnableConfig) -> dict:
     """路由节点：分析意图，选择最合适的 Skill/Agent。
 
-    策略：ask_user 续接 → Artifact 编辑检测 → LLM 统一语义路由 → Fallback。
+    策略：预设快捷路径 → ask_user 续接 → Artifact 编辑检测 → LLM 统一语义路由 → Fallback。
     """
     writer = get_stream_writer()
+
+    # 快捷路径：chat.py 已预设 target_app（如 Team 直接选用），跳过 LLM 路由
+    if state.get("target_app") and state["target_app"] != "":
+        pre = state["target_app"]
+        logger.info("intent_preset", target_app=pre)
+        writer({"type": "intent", "app": pre, "skill_display_name": pre, "confidence": 1.0})
+        return {}
 
     text = _extract_user_text(state)
 
@@ -195,7 +213,8 @@ async def route_message(state: PlatformState, config: RunnableConfig) -> dict:
         if is_reply:
             logger.info("intent_continue_ask_user")
             writer({"type": "thinking", "content": "继续处理您的回复..."})
-            writer({"type": "intent", "app": "fallback", "agent": "qa", "confidence": 1.0})
+            writer({"type": "intent", "app": "fallback", "agent": "qa",
+                    "skill_display_name": "续接回复", "confidence": 1.0})
             return {"target_app": "fallback", "target_agent": "qa", "target_skill": ""}
         else:
             logger.info("intent_new_topic_after_ask_user", text=text[:50])
@@ -208,7 +227,8 @@ async def route_message(state: PlatformState, config: RunnableConfig) -> dict:
     artifact_id = state.get("session_metadata", {}).get("slides_artifact_id")
     if artifact_id and _is_slide_edit_intent(text):
         logger.info("intent_slide_edit", artifact_id=artifact_id)
-        writer({"type": "intent", "skill": "slide-editor", "confidence": 0.95})
+        writer({"type": "intent", "skill": "slide-editor",
+                "skill_display_name": "演示文稿编辑", "confidence": 0.95})
         return {"target_app": "skill", "target_agent": "", "target_skill": "slide-editor"}
 
     # 1. LLM 统一语义路由
@@ -225,21 +245,35 @@ async def route_message(state: PlatformState, config: RunnableConfig) -> dict:
     # 2. 解析路由结果
     chosen = next((c for c in candidates if c["name"] == chosen_name), None)
 
+    def _display(cand: dict | None, fallback: str) -> str:
+        return (cand or {}).get("display_name") or fallback
+
     if chosen and chosen["type"] == "skill":
         logger.info("intent_routed", target=chosen_name, type="skill")
-        writer({"type": "intent", "skill": chosen_name, "confidence": 0.9})
+        writer({"type": "intent", "skill": chosen_name,
+                "skill_display_name": _display(chosen, chosen_name), "confidence": 0.9})
         return {"target_app": "skill", "target_agent": "", "target_skill": chosen_name}
 
     if chosen and chosen["type"] == "agent":
         app_name = chosen["app"]
         agent_name = chosen["agent"]
         logger.info("intent_routed", target=chosen_name, type="agent")
-        writer({"type": "intent", "app": app_name, "agent": agent_name, "confidence": 0.9})
+        writer({"type": "intent", "app": app_name, "agent": agent_name,
+                "skill_display_name": _display(chosen, f"{app_name}/{agent_name}"),
+                "confidence": 0.9})
         return {"target_app": app_name, "target_agent": agent_name, "target_skill": ""}
+
+    if chosen and chosen["type"] == "team":
+        team_name = chosen_name.removeprefix("team:")
+        logger.info("intent_routed", target=chosen_name, type="team")
+        writer({"type": "intent", "team": team_name,
+                "skill_display_name": _display(chosen, team_name), "confidence": 0.9})
+        return {"target_app": "team", "target_agent": "", "target_skill": ""}
 
     # 3. Fallback
     logger.info("intent_routed", target="fallback_qa", type="fallback")
-    writer({"type": "intent", "app": "fallback", "agent": "qa", "confidence": 0.5})
+    writer({"type": "intent", "app": "fallback", "agent": "qa",
+            "skill_display_name": "智能问答", "confidence": 0.5})
     return {"target_app": "fallback", "target_agent": "qa", "target_skill": ""}
 
 
@@ -248,6 +282,8 @@ def pick_agent(state: PlatformState) -> str:
     app = state.get("target_app", "fallback")
     agent = state.get("target_agent", "qa")
 
+    if app == "team":
+        return "team_executor"
     if app == "skill":
         return "skill_executor"
     if app == "fallback":

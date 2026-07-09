@@ -18,6 +18,14 @@ export async function getArtifact(artifactId: string): Promise<Artifact> {
   return await request.get(`${BASE}/${artifactId}`)
 }
 
+/**
+ * 按 artifact_id 从 MinIO 拉原始 payload（用于 store lazy-fetch）。
+ * 后端: GET /api/chat/artifacts/{artifact_id} —— slides JSON 全量
+ */
+export async function fetchArtifactById(artifactId: string): Promise<any> {
+  return await request.get(`/api/user/chat/artifacts/${artifactId}`)
+}
+
 export async function getSessionArtifacts(sessionId: string, includeVersions = false): Promise<Artifact[]> {
   return await request.get(`${BASE}/session/${sessionId}`, {
     params: includeVersions ? { include_versions: true } : {},

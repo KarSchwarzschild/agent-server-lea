@@ -9,6 +9,8 @@ from __future__ import annotations
 from langchain_core.tools import tool
 from langgraph.config import get_stream_writer
 
+from lea_graph.tools.sandbox_exec import sandbox_exec
+
 
 @tool
 def show_plan(steps: list[str]) -> str:
@@ -44,4 +46,4 @@ def ask_user(question: str) -> str:
     return f"已向用户提问：{question}。等待用户回复。"
 
 
-BUILTIN_TOOLS = [show_plan, ask_user]
+BUILTIN_TOOLS = [show_plan, ask_user, sandbox_exec]

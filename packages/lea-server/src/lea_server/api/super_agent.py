@@ -49,6 +49,32 @@ def _session_to_dict(s: ChatSession) -> dict:
     }
 
 
+def _message_to_dict(m: ChatMessage) -> dict:
+    """把 ChatMessage 平铺成前端 switchSession 的 message 形状。
+
+    extra JSON 里的字段（intent/skill/tool_calls/references/reasoning_blocks/plan）在这里展开成
+    顶层字段，与前端 SuperAgent.vue 里 rawMessages.map 的读法一致（m.tool_calls / m.references 等）。
+    """
+    extra = m.extra or {}
+    intent_obj = extra.get("intent") or {}
+    skill_obj = extra.get("skill") or {}
+    return {
+        "message_id": str(m.id),
+        "role": m.role,
+        "content": m.content or "",
+        "artifact_id": m.artifact_id,  # 前端气泡卡片入口
+        "created_at": m.created_at.isoformat() if m.created_at else "",
+        # 从 extra 展开的可视化字段（缺省 None，前端 optional-chain 处理）
+        "intent": intent_obj.get("skill") or intent_obj.get("agent"),
+        "skill": skill_obj.get("name"),
+        "tool_calls": extra.get("tool_calls"),
+        "references": extra.get("references"),
+        "reasoning_blocks": extra.get("reasoning_blocks"),
+        "execution_plan": extra.get("plan"),
+        "sandbox_calls": extra.get("sandbox_calls"),
+    }
+
+
 @router.get("/health")
 def health():
     """SuperAgent 健康检查（前端启动时探活）。"""
@@ -140,16 +166,7 @@ def get_session_detail(
     return {
         "session_id": session.id,
         "title": session.title,
-        "messages": [
-            {
-                "message_id": str(m.id),
-                "role": m.role,
-                "content": m.content or "",
-                "created_at": m.created_at.isoformat() if m.created_at else "",
-            }
-            for m in msgs
-            if m.content
-        ],
+        "messages": [_message_to_dict(m) for m in msgs if m.content],
     }
 
 

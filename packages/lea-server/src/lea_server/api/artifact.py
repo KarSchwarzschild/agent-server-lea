@@ -12,6 +12,26 @@ router = APIRouter(prefix="/api/chat/artifacts", tags=["artifacts"])
 logger = structlog.get_logger(__name__)
 
 
+@router.get("/{artifact_id}")
+async def get_artifact(artifact_id: str):
+    """按 artifact_id 从 MinIO 加载完整数据 —— 前端换会话回来 lazy 补拉用。
+
+    返回值形状（对齐 slide_generator 保存时的 payload）：
+    {version, theme, metadata, slides, artifact_id, type, session_id}
+    """
+    from lea_server.services.object_storage import get_object_storage
+
+    storage = get_object_storage()
+    try:
+        data = _find_artifact(storage, artifact_id)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    except Exception as e:
+        logger.error("artifact_load_failed", artifact_id=artifact_id, error=str(e))
+        raise HTTPException(status_code=500, detail="Artifact load failed")
+    return data
+
+
 @router.post("/{artifact_id}/export")
 async def export_artifact(
     artifact_id: str,

@@ -1039,10 +1039,12 @@ async function switchSession(sessionId: string) {
     scrollToBottom()
 
     // 加载会话关联的 Artifact
+    // 先无条件 reset —— 换会话必须清掉旧 session 的 artifact，
+    // 否则 getSessionArtifacts 若 404/失败会残留跨会话状态
+    artifactStore.resetForSession()
     try {
       const { getSessionArtifacts } = await import('@/api/artifact')
       const artifacts = await getSessionArtifacts(sessionId, true)
-      artifactStore.resetForSession()
       if (artifacts.length > 0) {
         artifactStore.loadArtifacts(artifacts)
         // 不自动打开面板（ChatGPT Canvas 风格：对话中显示卡片，用户点击才展开）
@@ -1353,7 +1355,7 @@ function onMentionSelect(skill: MentionSkill) {
  * 生产环境走 nginx 代理（相对路径）。
  */
 const SSE_BASE_URL = import.meta.env.DEV
-  ? (import.meta.env.VITE_SSE_BASE_URL || 'http://localhost:8100')
+  ? (import.meta.env.VITE_SSE_BASE_URL || 'http://127.0.0.1:8100')
   : ''
 
 const SSE_EVENT_TYPES = [
@@ -1383,6 +1385,8 @@ const SSE_EVENT_TYPES = [
   'skill_state',
   // Perplexica 迁移新增事件
   'suggestions', 'query_rewrite', 'phase',
+  // Pipeline Skill 阶段推进（slide-generator 等）
+  'progress',
   // Aggregation@N 聚合增强事件
   'aggregation_progress', 'synthesis_content',
   // plan_step 内容重置
@@ -1599,12 +1603,44 @@ function getArtifactStreamingPreviewHtml(artifactId: string, references?: Refere
   return getArtifactPreviewHtml(artifactId, references)
 }
 
+/** 判断是否 slides artifact（按 id 前缀，不依赖 store 缓存） */
+function isSlideArtifact(artifactId: string): boolean {
+  return !!artifactId && artifactId.startsWith('slides_')
+}
+
+/** slides artifact 的页数（气泡卡片副标题用；store 无缓存时返回 0） */
+function getSlideCount(artifactId: string): number {
+  void artifactStore.artifactCount
+  const art = artifactStore.artifacts.get(artifactId)
+  if (!art) return 0
+  const content = art.contents?.[art.contents.length - 1]?.content || ''
+  if (!content) return 0
+  try {
+    const obj = JSON.parse(content)
+    return Array.isArray(obj?.slides) ? obj.slides.length : 0
+  } catch {
+    return 0
+  }
+}
+
 /** 获取 artifact 标题（用于对话中的内联卡片） */
 function getArtifactTitle(artifactId: string): string {
   void artifactStore.artifactCount
   const art = artifactStore.artifacts.get(artifactId)
+  // slides：优先从 JSON 里读 metadata.title
+  if (isSlideArtifact(artifactId)) {
+    if (art) {
+      const content = art.contents?.[art.contents.length - 1]?.content || ''
+      try {
+        const obj = JSON.parse(content)
+        if (obj?.metadata?.title) return String(obj.metadata.title).slice(0, 40)
+      } catch { /* ignore */ }
+      return art.title?.slice(0, 40) || '演示文稿'
+    }
+    return '演示文稿'
+  }
   if (!art) return '查看文档'
-  // 从内容提取标题
+  // markdown / code：从内容提取标题
   const content = art.contents?.[art.contents.length - 1]?.content || ''
   const match = content.match(/^#{1,3}\s+(.+)/m)
   if (match) return match[1].trim().slice(0, 40)
@@ -1805,6 +1841,17 @@ async function handleSwitchVersion(targetMessageId: string) {
 /** 重新加载当前会话 */
 async function reloadCurrentSession() {
   if (currentSessionId.value) {
+    // 保留内存中的 thinkingSteps（DB 不持久化过程 step，reload 会清空导致过程折叠区消失）
+    // 匹配策略：messageId 优先、index 兜底（首轮消息还没拿到 messageId 前的情况）
+    const stepsByMessageId = new Map<string, ChatMessage['thinkingSteps']>()
+    const stepsByIndex: (ChatMessage['thinkingSteps'] | undefined)[] = []
+    messages.value.forEach((prev, i) => {
+      if (prev.thinkingSteps?.length) {
+        if (prev.messageId) stepsByMessageId.set(prev.messageId, prev.thinkingSteps)
+        stepsByIndex[i] = prev.thinkingSteps
+      }
+    })
+
     const res = await getSessionDetail(currentSessionId.value)
     sessionRevision.value = res.context?.revision ?? 0
     const rawMessages = res.messages || []
@@ -1827,6 +1874,7 @@ async function reloadCurrentSession() {
       stageOutputs: m.stage_outputs as ChatMessage['stageOutputs'] | undefined,
       reasoningBlocks: (m.reasoning_blocks as ChatMessage['reasoningBlocks'] | undefined)?.map(b => ({ ...b, isCollapsed: true })),
       nextSkillSuggestions: m.next_skill_suggestions as ChatMessage['nextSkillSuggestions'] | undefined,
+      thinkingSteps: (m.message_id && stepsByMessageId.get(m.message_id as string)) || stepsByIndex[index],
       // Classroom 关联：从持久化 extra 恢复 classroomData.sessionId
       ...(m.classroom_session_id ? { classroomData: { sessionId: m.classroom_session_id as string, status: 'ready', events: [], scenes: [] } } : {}),
       timestamp: m.timestamp as string | undefined,
@@ -3209,9 +3257,7 @@ watch(
                 :msg="msg"
                 :view-mode="viewMode"
                 :current-skill="currentSkill"
-                :current-phase="currentPhase"
                 :is-skill-executing="isSkillExecuting"
-                :skill-execution-time="skillExecutionTime"
                 :latest-event-type="latestEventType"
                 :latest-event-data="latestEventData"
                 :connection-health="connectionHealth"
@@ -3268,17 +3314,24 @@ watch(
                   >
                     <div class="preview-card-header">
                       <div class="preview-card-title-row">
-                        <span class="preview-card-icon">📄</span>
+                        <span class="preview-card-icon">{{ isSlideArtifact(msg.artifactId) ? '📊' : '📄' }}</span>
                         <span class="preview-card-title">{{ getArtifactTitle(msg.artifactId) }}</span>
+                        <span
+                          v-if="isSlideArtifact(msg.artifactId) && getSlideCount(msg.artifactId) > 0"
+                          class="preview-card-meta"
+                        >· {{ getSlideCount(msg.artifactId) }} 页</span>
                         <span v-if="artifactStore._isBackgroundStreaming && artifactStore.activeArtifactId === msg.artifactId" class="preview-card-streaming-badge">生成中...</span>
                       </div>
-                      <div v-if="!artifactStore._isBackgroundStreaming || artifactStore.activeArtifactId !== msg.artifactId" class="preview-card-actions" @click.stop>
+                      <!-- 非 slides 才显示这些按钮（Word/复制 markdown 对 PPT 无意义，Phase C 换成 PPTX 导出） -->
+                      <div v-if="!isSlideArtifact(msg.artifactId) && (!artifactStore._isBackgroundStreaming || artifactStore.activeArtifactId !== msg.artifactId)" class="preview-card-actions" @click.stop>
                         <button class="pca-btn" @click="handleArtifactCopy(msg.artifactId)" title="复制">复制</button>
                         <button class="pca-btn" @click="artifactStore.openPanel(msg.artifactId, msg.references)" title="编辑">编辑</button>
                         <button class="pca-btn" @click="handleArtifactExport(msg.artifactId, 'docx')" title="下载">下载</button>
                       </div>
                     </div>
+                    <!-- slides 不渲染 preview body（JSON 内容当 markdown 展示会露出源码） -->
                     <div
+                      v-if="!isSlideArtifact(msg.artifactId)"
                       class="preview-card-body"
                       :class="{ 'is-streaming': artifactStore._isBackgroundStreaming && artifactStore.activeArtifactId === msg.artifactId }"
                       :ref="(el: any) => { if (el && artifactStore._isBackgroundStreaming && artifactStore.activeArtifactId === msg.artifactId) streamingPreviewRef = el as HTMLElement }"
@@ -3434,7 +3487,8 @@ watch(
           </div>
         </div>
         </div>
-        <!-- Artifact 面板（overlay 模式，覆盖对话区右侧空白，不挤压） -->
+        <!-- Artifact 面板（overlay 模式）：只在展开态挂载。
+             收起态入口在气泡内联卡片（每条 assistant 消息一张） -->
         <ArtifactPanel v-if="artifactStore.panelVisible" />
       </n-layout-content>
     </n-layout>
@@ -3553,9 +3607,7 @@ watch(
               :msg="msg"
               :view-mode="viewMode"
               :current-skill="currentSkill"
-              :current-phase="currentPhase"
               :is-skill-executing="isSkillExecuting"
-              :skill-execution-time="skillExecutionTime"
               :latest-event-type="latestEventType"
               :latest-event-data="latestEventData"
               :connection-health="connectionHealth"
@@ -3612,12 +3664,18 @@ watch(
                 >
                   <div class="preview-card-header">
                     <div class="preview-card-title-row">
-                      <span class="preview-card-icon">📄</span>
+                      <span class="preview-card-icon">{{ isSlideArtifact(msg.artifactId) ? '📊' : '📄' }}</span>
                       <span class="preview-card-title">{{ getArtifactTitle(msg.artifactId) }}</span>
+                      <span
+                        v-if="isSlideArtifact(msg.artifactId) && getSlideCount(msg.artifactId) > 0"
+                        class="preview-card-meta"
+                      >· {{ getSlideCount(msg.artifactId) }} 页</span>
                       <span v-if="artifactStore._isBackgroundStreaming && artifactStore.activeArtifactId === msg.artifactId" class="preview-card-streaming-badge">生成中...</span>
                     </div>
                   </div>
+                  <!-- slides 不渲染 preview body -->
                   <div
+                    v-if="!isSlideArtifact(msg.artifactId)"
                     class="preview-card-body"
                     :class="{ 'is-streaming': artifactStore._isBackgroundStreaming && artifactStore.activeArtifactId === msg.artifactId }"
                     :ref="(el: any) => { if (el && artifactStore._isBackgroundStreaming && artifactStore.activeArtifactId === msg.artifactId) streamingPreviewRef = el as HTMLElement }"
@@ -3702,7 +3760,7 @@ watch(
             </button>
           </div>
 
-          <!-- 移动端 Artifact 抽屉 -->
+          <!-- 移动端 Artifact 抽屉：只在展开态挂载 -->
           <MobileArtifactDrawer v-if="artifactStore.panelVisible" />
 
           <!-- 移动端输入区 -->

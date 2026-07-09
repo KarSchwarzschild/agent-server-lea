@@ -1,6 +1,9 @@
-"""SlideGeneratorPipeline — 首次生成 SVG 演示文稿。
+"""SlideGeneratorPipeline — 生成 SlideData JSON 格式的演示文稿。
 
-流程: 用户主题 → LLM 大纲规划 → 逐页 SVG 生成 → MinIO 持久化。
+流程: 用户主题 → LLM 一次性产出完整 SlideData JSON → 通过 artifact_* 事件推给前端
+
+输出格式对齐 frontend-user/src/components/super-agent/SlideRenderer.vue 的
+6 种 legacy layout：title / content / two_column / image_left / comparison / blank
 """
 
 from __future__ import annotations
@@ -15,11 +18,10 @@ import structlog
 
 from lea_graph.skills.pipeline import SkillEvent, SkillPipeline
 from lea_graph.skills.pipelines.slide_prompts import (
-    OUTLINE_PROMPT,
-    SYSTEM_PROMPT,
-    build_slide_prompt,
-    extract_svg,
-    validate_svg,
+    SLIDE_JSON_SYSTEM_PROMPT,
+    SLIDES_JSON_USER_PROMPT,
+    extract_json_object,
+    normalize_slide_data,
 )
 
 logger = structlog.get_logger(__name__)
@@ -28,7 +30,7 @@ MAX_RETRIES = 2
 
 
 class SlideGeneratorPipeline(SkillPipeline):
-    """SVG 演示文稿生成 Pipeline。"""
+    """演示文稿生成 Pipeline（JSON 模式）。"""
 
     async def run(
         self,
@@ -42,119 +44,136 @@ class SlideGeneratorPipeline(SkillPipeline):
         if llm_factory is None:
             from lea_graph.llm import get_chat_model
             llm_factory = lambda purpose="chat": get_chat_model(
-                purpose=purpose, streaming=False, max_tokens=4096, timeout=300.0,
+                purpose=purpose, streaming=False, max_tokens=8000, timeout=300.0,
             )
 
-        yield SkillEvent("progress", {"content": "正在规划演示文稿内容..."})
-        messages = kwargs.get("messages")
-        outline = await self._plan_outline(message, llm_factory, messages=messages)
-        total = len(outline)
-        yield SkillEvent("progress", {"content": f"大纲完成，共 {total} 页，正在并发生成..."})
+        artifact_id = f"slides_{uuid.uuid4().hex[:12]}"
+        title_snippet = message.strip()[:40] or "演示文稿"
 
-        # 并发生成所有页的 SVG
-        import asyncio
-        tasks = [self._generate_slide_svg(page, llm_factory) for page in outline]
-        slides = await asyncio.gather(*tasks)
+        yield SkillEvent("progress", {"content": "正在设计演示文稿..."})
 
-        for i, svg in enumerate(slides):
-            yield SkillEvent("content", {
-                "type": "slide",
-                "index": i,
-                "svg": svg,
-                "title": outline[i].get("title", ""),
-            })
+        # 1) 骨架：面板/预览卡片立即弹出
+        # 注意 seq 从 1 开始（前端 artifact store 的 lastSeq 初始 0，用 `<=` 做去重）
+        yield SkillEvent("artifact_create", {
+            "artifact_id": artifact_id,
+            "title": title_snippet,
+            "artifact_type": "slides",
+            "doc_category": "presentation",
+            "version_index": 1,
+            "seq": 1,
+        })
 
-        artifact_id = await self._save_artifact(slides, outline, kwargs)
+        # 2) LLM 一次性生成完整 JSON
+        slides_data = await self._generate_slides_json(
+            message, llm_factory, messages=kwargs.get("messages")
+        )
+        json_str = json.dumps(slides_data, ensure_ascii=False)
+        total_pages = len(slides_data["slides"])
+        deck_title = slides_data.get("metadata", {}).get("title") or title_snippet
+        summary_text = (
+            f"已为你生成《{deck_title}》共 {total_pages} 页演示文稿，"
+            "点击右下角卡片查看和编辑。"
+        )
+
+        # 3) 聊天气泡文字（避免气泡为空 / DB 侧被 reload 覆盖丢失）
+        yield SkillEvent("content", {"text": summary_text})
+
+        # 4) delta 全推（B1 一次推整包）
+        yield SkillEvent("artifact_delta", {
+            "artifact_id": artifact_id,
+            "delta": json_str,
+            "seq": 2,
+            "version_index": 1,
+        })
+
+        # 5) done
+        yield SkillEvent("artifact_done", {
+            "artifact_id": artifact_id,
+            "content": json_str,
+            "version_index": 1,
+            "seq": 3,
+        })
+
+        # 6) 持久化（MinIO；DB artifact 双源问题留到 Phase C）
+        try:
+            await self._save_artifact(artifact_id, slides_data, kwargs)
+        except Exception as e:
+            logger.warning("slides_artifact_persist_failed", error=str(e))
+
+        # 7) result 事件供 supervisor 落 session_metadata + AIMessage 内容
         yield SkillEvent("result", {
             "type": "slides_created",
             "artifact_id": artifact_id,
-            "total_pages": total,
-            "slides": slides,
+            "total_pages": total_pages,
+            "summary_text": summary_text,
         })
 
-    async def _plan_outline(self, message: str, llm_factory, messages=None) -> list[dict]:
-        """LLM 生成大纲 JSON。如果有对话历史，会作为上下文传入。"""
+    async def _generate_slides_json(
+        self, message: str, llm_factory, messages=None
+    ) -> dict:
+        """调用 LLM 产出完整 SlideData JSON；失败时重试并归一。"""
         llm = llm_factory("chat")
-        prompt = OUTLINE_PROMPT.format(topic=message)
 
-        # 构建 LLM 消息列表，带入对话上下文
-        llm_messages = [{"role": "system", "content": "你是演示文稿内容规划专家。只输出 JSON。"}]
+        llm_messages: list[dict[str, str]] = [
+            {"role": "system", "content": SLIDE_JSON_SYSTEM_PROMPT},
+        ]
         if messages:
             from langchain_core.messages import AIMessage, HumanMessage
-            # 取最近几轮对话作为上下文（避免太长）
             recent = messages[-10:] if len(messages) > 10 else messages
             for msg in recent:
                 if isinstance(msg, HumanMessage):
                     llm_messages.append({"role": "user", "content": msg.content})
                 elif isinstance(msg, AIMessage) and msg.content:
-                    llm_messages.append({"role": "assistant", "content": msg.content[:500]})
-        llm_messages.append({"role": "user", "content": prompt})
-
-        resp = await llm.ainvoke(llm_messages)
-        text = resp.content.strip()
-        text = self._extract_json(text)
-        try:
-            outline = json.loads(text)
-        except json.JSONDecodeError:
-            logger.warning("outline_parse_failed", raw=text[:200])
-            outline = [
-                {"title": "封面", "layout": "title_page", "points": [message]},
-                {"title": "核心内容", "layout": "bento_grid", "points": ["要点1", "要点2", "要点3", "要点4"]},
-                {"title": "总结", "layout": "closing", "points": ["谢谢"]},
-            ]
-        return outline
-
-    async def _generate_slide_svg(self, page: dict, llm_factory) -> str:
-        """生成单页 SVG，失败时重试。"""
-        llm = llm_factory("chat")
-        layout = page.get("layout", "bento_grid")
-        title = page.get("title", "")
-        points = page.get("points", [])
-        user_prompt = build_slide_prompt(layout, title, points)
+                    llm_messages.append(
+                        {"role": "assistant", "content": msg.content[:500]}
+                    )
+        llm_messages.append(
+            {
+                "role": "user",
+                "content": SLIDES_JSON_USER_PROMPT.replace("{topic}", message),
+            }
+        )
 
         for attempt in range(MAX_RETRIES + 1):
-            resp = await llm.ainvoke([
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ])
-            svg = extract_svg(resp.content)
-            valid, err = validate_svg(svg)
-            if valid:
-                return svg
-            logger.warning("svg_validation_failed", attempt=attempt, error=err)
+            try:
+                resp = await llm.ainvoke(llm_messages)
+                raw = resp.content if isinstance(resp.content, str) else str(resp.content)
+                json_text = extract_json_object(raw)
+                data = json.loads(json_text)
+                normalized = normalize_slide_data(data, topic=message)
+                if normalized["slides"]:
+                    return normalized
+                logger.warning("slides_json_empty", attempt=attempt)
+            except json.JSONDecodeError as e:
+                logger.warning(
+                    "slides_json_parse_failed",
+                    attempt=attempt,
+                    error=str(e),
+                    raw_head=raw[:200] if "raw" in locals() else "",
+                )
+            except Exception as e:
+                logger.warning("slides_json_llm_failed", attempt=attempt, error=str(e))
 
-        return svg  # 返回最后一次结果即使校验失败
+        logger.error("slides_generation_all_retries_failed", topic=message[:80])
+        return normalize_slide_data({}, topic=message)  # 触发 fallback
 
     async def _save_artifact(
-        self, slides: list[str], outline: list[dict], kwargs: dict
-    ) -> str:
-        """将 slides 状态持久化到 MinIO。"""
+        self, artifact_id: str, slides_data: dict, kwargs: dict
+    ) -> None:
+        """将 slides JSON 持久化到 MinIO。"""
         from lea_server.services.object_storage import get_object_storage
 
         session_id = kwargs.get("session_id") or uuid.uuid4().hex
-        # MinIO key 不允许特殊字符，清理 session_id
         safe_session_id = re.sub(r"[^a-zA-Z0-9_\-]", "_", session_id)
-        artifact_id = f"slides_{uuid.uuid4().hex[:12]}"
-        artifact = {
+        payload = {
             "artifact_id": artifact_id,
             "type": "slides",
-            "slides": slides,
-            "outline": outline,
             "session_id": session_id,
+            **slides_data,
         }
         key = f"artifacts/{safe_session_id}/{artifact_id}.json"
-        data = json.dumps(artifact, ensure_ascii=False).encode()
+        data = json.dumps(payload, ensure_ascii=False).encode()
         get_object_storage().put_object(key, data, "application/json")
-        logger.info("artifact_saved", key=key, pages=len(slides))
-        return artifact_id
-
-    @staticmethod
-    def _extract_json(text: str) -> str:
-        """从 LLM 输出中提取 JSON（处理 markdown 代码块）。"""
-        if text.startswith("["):
-            return text
-        start = text.find("[")
-        end = text.rfind("]")
-        if start >= 0 and end > start:
-            return text[start : end + 1]
-        return text
+        logger.info(
+            "slides_artifact_saved", key=key, pages=len(slides_data["slides"])
+        )

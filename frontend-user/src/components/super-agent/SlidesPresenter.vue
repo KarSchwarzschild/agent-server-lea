@@ -60,17 +60,15 @@ function onKeyDown(e: KeyboardEvent) {
     tabindex="0"
     @keydown="onKeyDown"
   >
-    <!-- 幻灯片主区域 -->
+    <!-- 幻灯片主区域（去掉 Transition，避免 component 卸载重挂载出问题） -->
     <div class="sp-slide-area">
-      <Transition name="sp-slide" mode="out-in">
-        <SlideRenderer
-          v-if="currentSlide"
-          :key="currentSlide.id || currentIndex"
-          :slide="currentSlide"
-          :theme="slidesData.theme"
-          mode="full"
-        />
-      </Transition>
+      <SlideRenderer
+        v-if="currentSlide"
+        :key="currentIndex"
+        :slide="currentSlide"
+        :theme="slidesData.theme"
+        mode="full"
+      />
     </div>
 
     <!-- 讲稿（如果有） -->

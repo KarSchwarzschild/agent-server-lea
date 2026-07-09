@@ -163,6 +163,210 @@ def validate_svg(svg: str) -> tuple[bool, str]:
     return True, ""
 
 
+# ═════════════════════════════════════════════════════════════════
+# JSON 输出模式 —— 对齐前端 SlideRenderer.vue 的 SlideData schema
+# 6 种 legacy layout：title / content / two_column / image_left / comparison / blank
+# ═════════════════════════════════════════════════════════════════
+
+SLIDE_JSON_SYSTEM_PROMPT = """\
+你是资深教育课件设计专家，擅长将知识点转化为逻辑清晰、层次分明的演示文稿。
+
+# 输出规范
+必须输出严格的 JSON 对象（且仅 JSON，无任何解释、无 markdown 包裹），根字段：
+{
+  "version": 1,
+  "theme": {"id": "edu-warm", "primary": "#1a73e8", "secondary": "#fbbc04",
+            "background": "#ffffff", "text": "#202124"},
+  "metadata": {"title": "演示文稿总标题", "total_pages": N},
+  "slides": [ ... ]
+}
+
+# 每张 slide 结构
+{
+  "layout": "title" | "content" | "two_column" | "image_left" | "comparison" | "blank",
+  "title": "本页标题",
+  "subtitle": "副标题（可选）",
+  "elements": [ ... ],
+  "column_labels": {"L": "左栏标签", "R": "右栏标签"},
+  "speaker_notes": "演讲者备注（50-100 字讲授脚本）"
+}
+
+# elements 数组内的对象类型
+- {"type": "heading", "content": "小标题", "level": 2}
+- {"type": "text",    "content": "段落文本"}
+- {"type": "list",    "items": ["要点1", "要点2"], "ordered": false}
+- {"type": "callout", "content": "重要提示", "style": "info"}
+- two_column 布局下，元素额外带 "column": "L" 或 "R"
+- image_left 布局的 image 元素只需 {"type": "image", "caption": "图注", "alt": "描述"}
+  不要给 url 字段（前端占位）
+
+# Layout 使用规范
+| layout      | 用途                                        |
+|-------------|---------------------------------------------|
+| title       | 封面页（大标题 + 副标题）                   |
+| content     | 标准单栏正文，最常用                        |
+| two_column  | 双栏对比（如"传统方法 vs 新方法"）需 column_labels |
+| image_left  | 图文页（左图 + 右文）                       |
+| comparison  | 多维度结构化对比                            |
+| blank       | 过渡/思考题/开放提问                        |
+
+# 教育调性要求
+1. **信息密度**：每页 3-5 要点，禁止堆砌
+2. **叙事结构**：title → content 引入 → 2-3 页核心 (content/two_column) → 案例 (image_left/comparison) → 总结 (content 或 blank)
+3. **speaker_notes 必写**：每页 50-100 字，明确"想表达什么、怎么讲、可以问学生什么问题"
+4. **list.items 每条 ≤ 20 字**，多个短句而非一长段
+5. **禁用**：emoji / markdown 语法 (`**加粗**` 会被当字面字符) / 外部 URL
+
+# 严格禁令
+- 不要输出任何 JSON 之外的文字
+- 不要用 ```json 包裹
+- 第一个字符必须是 `{`，最后一个必须是 `}`
+"""
+
+
+SLIDES_JSON_USER_PROMPT = """\
+请根据以下主题设计一份完整的教学演示文稿：
+
+主题：{topic}
+
+要求：
+- 页数：如用户未指定，默认 5-7 页
+- 严格遵循 6 种 layout 白名单：title / content / two_column / image_left / comparison / blank
+- 首页必须是 title 布局，末页 content 或 blank 做总结
+- 每页必须包含 speaker_notes
+
+直接输出完整 JSON，第一个字符必须是 `{`。"""
+
+
+VALID_LAYOUTS = {"title", "content", "two_column", "image_left", "comparison", "blank"}
+
+DEFAULT_THEME = {
+    "id": "edu-warm",
+    "primary": "#1a73e8",
+    "secondary": "#fbbc04",
+    "background": "#ffffff",
+    "text": "#202124",
+}
+
+
+def extract_json_object(raw: str) -> str:
+    """从 LLM 输出中提取 JSON 对象。处理思考标签、markdown 包裹等干扰。"""
+    raw = raw.strip()
+
+    # qwen 的 </think>
+    think_end = raw.rfind("</think>")
+    if think_end >= 0:
+        raw = raw[think_end + 8:].strip()
+
+    # markdown 代码块
+    if raw.startswith("```"):
+        raw = raw.split("\n", 1)[1] if "\n" in raw else raw[3:]
+        if raw.endswith("```"):
+            raw = raw[:-3]
+        raw = raw.strip()
+        if raw.lower().startswith("json"):
+            raw = raw[4:].lstrip()
+
+    # 直接以 { 开头
+    if raw.startswith("{"):
+        return raw
+
+    # 找第一个 { 到最后一个 }
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start >= 0 and end > start:
+        return raw[start : end + 1]
+
+    return raw
+
+
+def normalize_slide_data(data: Any, topic: str = "") -> dict:
+    """校验并归一 LLM 输出。未知 layout 强制为 content，缺字段补默认。"""
+    if not isinstance(data, dict):
+        return _fallback_slide_data(topic)
+
+    slides = data.get("slides")
+    if not isinstance(slides, list) or not slides:
+        return _fallback_slide_data(topic)
+
+    normalized_slides = []
+    for i, s in enumerate(slides):
+        if not isinstance(s, dict):
+            continue
+        layout = s.get("layout", "content")
+        if layout not in VALID_LAYOUTS:
+            layout = "content"
+        elements = s.get("elements") or []
+        if not isinstance(elements, list):
+            elements = []
+        slide = {
+            "layout": layout,
+            "title": str(s.get("title", "")),
+            "elements": elements,
+            "speaker_notes": str(s.get("speaker_notes", "")),
+        }
+        if s.get("subtitle"):
+            slide["subtitle"] = str(s["subtitle"])
+        if s.get("column_labels") and isinstance(s["column_labels"], dict):
+            slide["column_labels"] = s["column_labels"]
+        normalized_slides.append(slide)
+
+    if not normalized_slides:
+        return _fallback_slide_data(topic)
+
+    theme = data.get("theme")
+    if not isinstance(theme, dict):
+        theme = DEFAULT_THEME.copy()
+    else:
+        for k, v in DEFAULT_THEME.items():
+            theme.setdefault(k, v)
+
+    metadata = data.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    metadata.setdefault("title", topic or "演示文稿")
+    metadata["total_pages"] = len(normalized_slides)
+
+    return {
+        "version": 1,
+        "theme": theme,
+        "metadata": metadata,
+        "slides": normalized_slides,
+    }
+
+
+def _fallback_slide_data(topic: str) -> dict:
+    """LLM 完全失败时的兜底 3 页演示文稿。"""
+    return {
+        "version": 1,
+        "theme": DEFAULT_THEME.copy(),
+        "metadata": {"title": topic or "演示文稿", "total_pages": 3},
+        "slides": [
+            {
+                "layout": "title",
+                "title": topic or "演示文稿",
+                "subtitle": "自动生成",
+                "elements": [],
+                "speaker_notes": "开场介绍主题",
+            },
+            {
+                "layout": "content",
+                "title": "核心内容",
+                "elements": [
+                    {"type": "text", "content": "内容生成失败，请重新生成"},
+                ],
+                "speaker_notes": "此页为兜底占位，请重新触发生成",
+            },
+            {
+                "layout": "blank",
+                "title": "总结",
+                "elements": [],
+                "speaker_notes": "总结与提问环节",
+            },
+        ],
+    }
+
+
 def extract_svg(raw: str) -> str:
     """从 LLM 输出中提取 SVG 代码（处理思考过程、markdown 代码块等干扰）。"""
     raw = raw.strip()

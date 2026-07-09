@@ -1,0 +1,19 @@
+{
+  "name": "demo_echo_tool__TS__",
+  "display_name": "Demo Echo 工具",
+  "description": "回显用户输入，用于演示 tool 层链路",
+  "category": "demo",
+  "source": "api",
+  "source_config": {
+    "endpoint": "https://httpbin.org/anything",
+    "method": "POST"
+  },
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "text": {"type": "string", "description": "要回显的文本"}
+    },
+    "required": ["text"]
+  },
+  "is_enabled": true
+}

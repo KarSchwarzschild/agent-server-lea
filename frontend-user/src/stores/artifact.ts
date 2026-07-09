@@ -119,7 +119,7 @@ export const useArtifactStore = defineStore('artifact', () => {
       sessionId: '',
       userId: '',
       title: event.title,
-      artifactType: (event.artifact_type || 'markdown') as 'markdown' | 'code',
+      artifactType: (event.artifact_type || 'markdown') as 'markdown' | 'code' | 'slides',
       docCategory: (event.doc_category || 'general') as DocCategory,
       currentIndex: event.version_index,
       contents: [],
@@ -222,12 +222,47 @@ export const useArtifactStore = defineStore('artifact', () => {
   // Actions — 面板控制
   // ========================
 
-  /** 打开面板查看指定 artifact */
-  function openPanel(artifactId: string, references?: Reference[]) {
+  /** 打开面板查看指定 artifact；若 store 里没有则从 MinIO 后端拉。 */
+  async function openPanel(artifactId: string, references?: Reference[]) {
     activeArtifactId.value = artifactId
     panelMode.value = 'readonly'
     if (references) {
       activeReferences.value = references
+    }
+    // 若已在内存，直接展示；否则从 MinIO lazy-fetch
+    if (!artifacts.value.has(artifactId)) {
+      try {
+        const { fetchArtifactById } = await import('@/api/artifact')
+        const data = await fetchArtifactById(artifactId)
+        // 后端返回的 payload 含 {version, theme, metadata, slides, artifact_id, type, session_id}
+        const jsonStr = JSON.stringify(data)
+        const artifact: Artifact = {
+          id: artifactId,
+          sessionId: (data as any).session_id || '',
+          userId: '',
+          title: (data as any).metadata?.title || '演示文稿',
+          artifactType: ((data as any).type === 'slides' ? 'slides' : 'markdown') as 'markdown' | 'code' | 'slides',
+          docCategory: 'general',
+          currentIndex: 1,
+          contents: [{
+            id: 0,
+            artifactId,
+            versionIndex: 1,
+            content: jsonStr,
+            title: (data as any).metadata?.title || '演示文稿',
+            source: 'ai_generate',
+            createdAt: new Date().toISOString(),
+          }],
+          isPinned: false,
+          isStandalone: false,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        }
+        artifacts.value.set(artifactId, artifact)
+        artifactCount.value++
+      } catch (e) {
+        console.warn('[artifact] lazy fetch failed:', e)
+      }
     }
   }
 

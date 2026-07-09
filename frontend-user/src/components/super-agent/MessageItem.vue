@@ -50,9 +50,7 @@ const props = defineProps<{
   msg: ChatMessage
   viewMode: ViewMode
   currentSkill: string
-  currentPhase: string
   isSkillExecuting: boolean
-  skillExecutionTime: number
   latestEventType: string
   latestEventData: Record<string, unknown>
   connectionHealth: string
@@ -109,6 +107,13 @@ const hasProcessInfo = computed(() => {
   const msg = props.msg
   const hasToolCalls = getVisibleToolSteps(msg.thinkingSteps).length > 0
   return hasToolCalls || (msg.subAgents && msg.subAgents.length > 0)
+})
+
+// Pipeline 类 skill 的过程 step（intent / progress / thinking 事件 push 进来）
+// 与 ExecutionSidebar 的 tool call 视图互补：这里只显示 !isToolCall 且有文本的步骤
+const pipelineSteps = computed(() => {
+  const steps = props.msg.thinkingSteps || []
+  return steps.filter((s: ThinkingStep) => !s.isToolCall && s.text)
 })
 
 const sidebarLocked = ref(false)
@@ -435,13 +440,9 @@ const {
         </n-tag>
       </div>
 
-      <!-- 执行阶段进度（仅 simple 模式，professional/debug 有侧栏替代） -->
+      <!-- Aggregation@N 多路增强进度（仅在真的有多路时显示） -->
       <ExecutionProgress
-        v-if="msg.isStreaming && currentSkill && viewMode === 'simple'"
-        :skill-name="currentSkill"
-        :current-phase="currentPhase"
-        :is-completed="!msg.isStreaming && skillExecutionTime > 0"
-        :execution-time="skillExecutionTime"
+        v-if="msg.isStreaming && msg.aggregationProgress && msg.aggregationProgress.total > 1"
         :aggregation-progress="msg.aggregationProgress"
         class="execution-progress-wrapper"
         :class="{ 'mobile-progress': isMobile }"
@@ -462,6 +463,25 @@ const {
           class="status-text-wrapper"
         />
       </div>
+
+      <!-- Pipeline 过程折叠区（对齐 Claude "Thought for X seconds"）
+           生成中隐藏（status-row 已在滚动显示），生成完成后留档可展开 -->
+      <details
+        v-if="!msg.isStreaming && pipelineSteps.length > 0"
+        class="pipeline-timeline"
+      >
+        <summary class="pipeline-timeline-summary">
+          <span class="pipeline-timeline-icon">✨</span>
+          <span>过程 · {{ pipelineSteps.length }} 步</span>
+          <span class="pipeline-timeline-chevron">▸</span>
+        </summary>
+        <ol class="pipeline-timeline-list">
+          <li v-for="s in pipelineSteps" :key="s.step" class="pipeline-timeline-item">
+            <span class="pipeline-timeline-dot" />
+            <span class="pipeline-timeline-text">{{ s.text }}</span>
+          </li>
+        </ol>
+      </details>
 
       <!-- 辩论专家标签 -->
       <div v-if="msg.experts && msg.experts.length > 0" class="experts-section">
@@ -1807,6 +1827,74 @@ const {
 
 .status-text-wrapper {
   flex: 1;
+}
+
+/* Pipeline 过程折叠时间线（对齐 Claude "Thought for X seconds"） */
+.pipeline-timeline {
+  margin: 0 0 12px 0;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  background: #f9fafb;
+  overflow: hidden;
+  font-size: 13px;
+}
+
+.pipeline-timeline-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  cursor: pointer;
+  color: #6b7280;
+  user-select: none;
+  list-style: none;
+}
+.pipeline-timeline-summary::-webkit-details-marker { display: none; }
+
+.pipeline-timeline-summary:hover {
+  background: #f3f4f6;
+  color: #374151;
+}
+
+.pipeline-timeline-icon { font-size: 14px; }
+
+.pipeline-timeline-chevron {
+  margin-left: auto;
+  transition: transform 0.2s ease;
+  font-size: 12px;
+}
+.pipeline-timeline[open] .pipeline-timeline-chevron {
+  transform: rotate(90deg);
+}
+
+.pipeline-timeline-list {
+  margin: 0;
+  padding: 4px 12px 10px 12px;
+  list-style: none;
+  border-top: 1px solid #e5e7eb;
+}
+
+.pipeline-timeline-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 0;
+  color: #4b5563;
+  line-height: 1.5;
+}
+
+.pipeline-timeline-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #9ca3af;
+  margin-top: 7px;
+  flex-shrink: 0;
+}
+
+.pipeline-timeline-text {
+  flex: 1;
+  word-break: break-word;
 }
 
 /* 连接健康状态点（调试模式） */

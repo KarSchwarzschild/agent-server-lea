@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text, func
+from sqlalchemy import JSON, Boolean, Column, DateTime, Integer, String, Text, func
 
 from lea_server.core.tenant import TenantMixin
 from lea_server.database import Base
@@ -42,6 +42,10 @@ class ChatMessage(Base):
     role = Column(String(20))
     content = Column(Text)
     token_count = Column(Integer, nullable=True)
+    # 关联的 artifact（如 slides / markdown 文档）—— 前端气泡渲染卡片入口
+    artifact_id = Column(String(80), nullable=True, index=True)
+    # 可视化附加字段（intent/skill/tool_calls/references/plan/parallel_subtasks/...）—— 前端 switchSession 恢复用
+    extra = Column(JSON, nullable=True)
     created_at = Column(DateTime, server_default=func.now())
 
 

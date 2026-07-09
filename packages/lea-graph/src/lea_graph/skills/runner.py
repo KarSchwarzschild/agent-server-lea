@@ -89,9 +89,24 @@ async def _run_react(
     if thread_id:
         config["configurable"] = {"thread_id": f"skill:{thread_id}"}
 
+    # SG-6: 显式 skill 执行路径也需要 push bundle 上下文
+    from lea_graph.skills.runtime_context import enter_skill_context, exit_skill_context
     from lea_graph.streaming import stream_graph_as_sse
-    async for chunk in stream_graph_as_sse(agent, input_state, config):
-        yield chunk
+
+    token = None
+    if definition.bundle_dir and definition.scripts_paths:
+        token = enter_skill_context(
+            skill_name=definition.name,
+            bundle_dir=definition.bundle_dir,
+            bundle_hash=definition.bundle_hash or "",
+            scripts_paths=definition.scripts_paths,
+        )
+    try:
+        async for chunk in stream_graph_as_sse(agent, input_state, config):
+            yield chunk
+    finally:
+        if token is not None:
+            exit_skill_context(token)
 
 
 async def _run_pipeline(

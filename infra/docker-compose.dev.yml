@@ -11,6 +11,7 @@ services:
     environment:
       DB_HOST: mysql
       DB_PORT: 3306
+      DB_PASSWORD: lea-dev-password  # 与 mysql 容器 MYSQL_ROOT_PASSWORD 一致，覆盖 .env
       REDIS_URL: redis://redis:6379/0
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       MINIO_ENDPOINT: http://minio:9000
@@ -73,6 +74,7 @@ services:
     environment:
       DB_HOST: mysql
       DB_PORT: 3306
+      DB_PASSWORD: lea-dev-password  # 与 mysql 容器 MYSQL_ROOT_PASSWORD 一致，覆盖 .env
       REDIS_URL: redis://redis:6379/0
       MINIO_ENDPOINT: http://minio:9000
       LEA_MILVUS_URI: http://milvus:19530

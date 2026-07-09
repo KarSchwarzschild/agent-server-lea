@@ -277,7 +277,8 @@ export function useSSEHandler(options: UseSSEHandlerOptions) {
     switch (event) {
       case 'thinking': {
         currentPhase.value = 'intent'
-        const thinkingText = data.text || data.thought
+        // 后端契约不统一：Claude extended 用 text/thought，supervisor/pipeline 用 content
+        const thinkingText = data.text || data.thought || data.content
         if (thinkingText) {
           if (!msg.thinkingSteps) msg.thinkingSteps = []
 
@@ -305,6 +306,27 @@ export function useSSEHandler(options: UseSSEHandlerOptions) {
             isToolCall: false,
             status: isWaitingHint ? 'pending' : 'success',
           })
+        }
+        break
+      }
+
+      // Pipeline Skill 阶段推进（slide-generator 等）
+      // 追加到 thinkingSteps，让完成后可通过 ExecutionSidebar 折叠重看
+      case 'progress': {
+        currentPhase.value = 'skill'
+        const progressText = (data.content as string) || (data.message as string)
+        if (progressText) {
+          if (!msg.thinkingSteps) msg.thinkingSteps = []
+          // 幂等：连续两条相同文案不重复入列（backend 可能重发相同阶段）
+          const last = msg.thinkingSteps[msg.thinkingSteps.length - 1]
+          if (!last || last.text !== progressText) {
+            msg.thinkingSteps.push({
+              text: progressText,
+              step: msg.thinkingSteps.length + 1,
+              isToolCall: false,
+              status: 'success',
+            })
+          }
         }
         break
       }
@@ -621,9 +643,12 @@ export function useSSEHandler(options: UseSSEHandlerOptions) {
         break
       }
 
-      case 'intent':
+      case 'intent': {
         currentPhase.value = 'intent'
         currentIntent.value = data.type || ''
+        // Router 契约：skill=技术名，skill_display_name=中文名；老逻辑读 skill_name 兜底
+        const intentSkillName = (data.skill as string) || (data.skill_name as string) || ''
+        const intentDisplayName = (data.skill_display_name as string) || intentSkillName
         if (data.type === 'context_qa') {
           // Follow-up REFINE: 不触发 skill 执行面板
           msg.intent = 'context_qa'
@@ -633,11 +658,21 @@ export function useSSEHandler(options: UseSSEHandlerOptions) {
             msg.skillName = data.original_skill
           }
         } else {
-          if (data.skill_name) {
-            currentSkill.value = data.skill_name
-            msg.skillName = data.skill_name
+          if (intentSkillName) {
+            currentSkill.value = intentSkillName
+            msg.skillName = intentSkillName
           }
           msg.intent = data.type
+        }
+        // 追加到 thinkingSteps，让完成后可通过 ExecutionSidebar 折叠回看
+        if (intentDisplayName) {
+          if (!msg.thinkingSteps) msg.thinkingSteps = []
+          msg.thinkingSteps.push({
+            text: `已识别为「${intentDisplayName}」`,
+            step: msg.thinkingSteps.length + 1,
+            isToolCall: false,
+            status: 'success',
+          })
         }
         if (data.followup_type) {
           msg.followupType = data.followup_type as 'refine' | 'continuation' | 'acknowledge'
@@ -655,6 +690,7 @@ export function useSSEHandler(options: UseSSEHandlerOptions) {
           }
         }
         break
+      }
 
       case 'intent_confirm':
         // P1b: 低置信度意图确认 — 暂停流式，等待用户选择

@@ -1,7 +1,13 @@
 """公共 Tool: 知识库搜索。
 
-自动搜索当前用户可见的所有知识库（private + shared + public）。
-也支持通过 RunnableConfig 传入指定 kb_ids（如智能笔记场景）。
+优先级链（从高到低）：
+    1. config["kb_ids"]         智能笔记/单文档场景显式指定（保留能力）
+    2. config["agent_kb_ids"]   agent 侧权限白名单（Ph1 · Skill v2）
+    3. tenant/user 可见 KB       兜底（旧行为，Ph1 迁移期保留）
+
+未来 KB 服务化替换点（→ 独立 lea-kb-service HTTP 服务后）：
+    只需替换 `search_knowledge_base(...)` 一处调用为 httpx.AsyncClient
+    调用远端 POST /v1/search；其余 SSE 事件 / 参数处理保持不变。
 """
 
 from __future__ import annotations
@@ -13,14 +19,21 @@ from langgraph.config import get_stream_writer
 from lea_graph.services.knowledge_base import search_knowledge_base
 
 
+_NO_KB_HINT = (
+    "该助手未配置知识库权限，无法执行知识检索。"
+    "如需检索文献，请联系管理员将知识库挂到当前 Agent 上。"
+)
+
+
 @tool
 async def kb_search(query: str, limit: int = 5, *, config: RunnableConfig = None) -> str:
-    """搜索知识库中的文献资料。根据查询关键词从用户可见的所有知识库中检索。"""
+    """搜索知识库中的文献资料。根据查询关键词从当前 Agent 已绑定的知识库中检索。"""
     writer = get_stream_writer()
     writer({"type": "action", "tool": "kb-search", "input": {"query": query, "limit": limit}})
 
-    kb_ids = None
-    document_ids = None
+    kb_ids: list[int] | None = None
+    document_ids: list[int] | None = None
+    agent_kb_ids: list[int] | None = None
     tenant_id = ""
     user_id = ""
 
@@ -28,15 +41,25 @@ async def kb_search(query: str, limit: int = 5, *, config: RunnableConfig = None
         cfg = config["configurable"]
         kb_ids = cfg.get("kb_ids")
         document_ids = cfg.get("document_ids")
+        agent_kb_ids = cfg.get("agent_kb_ids")
 
+    # 优先级：显式 kb_ids > agent 绑定白名单 > tenant/user 兜底
     if not kb_ids and not document_ids:
-        try:
-            from lea_server.core.tenant import get_tenant
-            ctx = get_tenant()
-            tenant_id = ctx.tenant_id
-            user_id = ctx.extra.get("user_id", "")
-        except Exception:
-            pass
+        if agent_kb_ids is not None:
+            # agent_id 已解析场景 —— 严格走白名单
+            if not agent_kb_ids:
+                writer({"type": "observation", "tool": "kb-search", "status": "no_kb_bound", "count": 0})
+                return _NO_KB_HINT
+            kb_ids = agent_kb_ids
+        else:
+            # 老兜底：tenant/user 可见 KB（例如智能笔记直调、无 agent 上下文的场景）
+            try:
+                from lea_server.core.tenant import get_tenant
+                ctx = get_tenant()
+                tenant_id = ctx.tenant_id
+                user_id = ctx.extra.get("user_id", "")
+            except Exception:
+                pass
 
     results = await search_knowledge_base(
         query, limit,

@@ -81,11 +81,14 @@ const TOOL_DISPLAY_NAMES: Record<string, string> = {
 
 const STATUS_TEXT_MAP: Record<string, (data: Record<string, unknown>) => string> = {
   // 思考/意图识别
-  'thinking': (data) => data.text as string || '正在分析您的问题...',
+  'thinking': (data) => (data.text as string) || (data.content as string) || (data.thought as string) || '正在分析您的问题...',
   'intent': (data) => {
-    const skillName = data.skill_display_name || data.skill_name || '智能问答'
+    const skillName = data.skill_display_name || data.skill || data.skill_name || '智能问答'
     return `已识别为「${skillName}」`
   },
+
+  // Pipeline 阶段推进（透传后端文案）
+  'progress': (data) => (data.content as string) || (data.message as string) || '处理中...',
 
   // 技能执行
   'skill_start': (data) => `开始执行「${data.display_name || data.skill || '技能'}」`,
@@ -164,6 +167,7 @@ const statusIcon = computed(() => {
   const iconMap: Record<string, string> = {
     'thinking': '🎯',
     'intent': '🎯',
+    'progress': '⚙️',
     'skill_start': '⚡',
     'action': '📡',
     'tool_call': '📡',
@@ -195,7 +199,7 @@ const statusText = computed(() => {
 /** 是否显示旋转加载 */
 const showLoading = computed(() => {
   if (!props.showSpinner) return false
-  const loadingTypes = ['thinking', 'action', 'tool_call', 'answering', 'content', 'skill_start', 'expert_speaking', 'final_summary']
+  const loadingTypes = ['thinking', 'action', 'tool_call', 'answering', 'content', 'skill_start', 'progress', 'expert_speaking', 'final_summary']
   return loadingTypes.includes(props.eventType)
 })
 

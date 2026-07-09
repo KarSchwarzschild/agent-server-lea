@@ -23,16 +23,16 @@ class LLMSettings(BaseSettings):
     tenant_api_base: str = "https://tenantapi-ai.ouchn.edu.cn"
     tenant_api_key: str = ""
 
-    model_chat: str = "qwen-max-latest"
-    model_routing: str = "glm-4-plus"
-    model_fallback: str = "glm-4-flash"
+    model_chat: str = "qwen3-max"
+    model_routing: str = "qwen3-max"
+    model_fallback: str = "qwen3-max"
 
     # 本地模型（自部署 Ollama/vLLM，降级用）
     local_api_base: str = ""
     local_api_key: str = "sk-local"
     local_model: str = "qwen3:32b"
 
-    model_config = {"env_prefix": "LEA_", "extra": "ignore"}
+    model_config = {"env_prefix": "LEA_", "env_file": ".env", "extra": "ignore"}
 
 
 @lru_cache

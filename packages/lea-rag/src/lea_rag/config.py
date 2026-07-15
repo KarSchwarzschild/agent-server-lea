@@ -8,19 +8,26 @@ from pydantic_settings import BaseSettings
 class MilvusSettings(BaseSettings):
     uri: str = "http://localhost:19530"
     token: str = ""
-    default_collection: str = "lea_documents"
-    dense_dim: int = 1024
+    default_collection: str = "lea_knowledge_v2"
+    dense_dim: int = 1536
 
     model_config = {"env_prefix": "LEA_MILVUS_"}
 
 
 class EmbeddingSettings(BaseSettings):
-    model: str = "bge-m3"
-    api_base: str = "http://localhost:11434/v1"
-    api_key: str = "EMPTY"
-    dimension: int = 1024
+    """Fallback 配置 — 仅当 retrieval_models 表为空时使用。"""
+    model: str = "bge-large-zh-v1.5"
+    api_base: str = "https://tenantapi-ai.ouchn.edu.cn/v1/embeddings"
+    api_key: str = ""
+    dimension: int = 1536
 
     model_config = {"env_prefix": "LEA_EMBEDDING_"}
+
+
+def get_tenant_api_key() -> str:
+    """获取中转平台 API key（embedding 和 LLM 共用）。"""
+    import os
+    return os.getenv("LEA_TENANT_API_KEY", "")
 
 
 class RerankerSettings(BaseSettings):
@@ -52,5 +59,7 @@ class RAGSettings(BaseSettings):
     chunk_overlap: int = 64
     retrieval_top_k: int = 10
     rerank_top_k: int = 5
+    query_optimize: bool = False
+    section_boost: bool = True
 
     model_config = {"env_prefix": "LEA_RAG_"}

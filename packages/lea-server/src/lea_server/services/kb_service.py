@@ -33,6 +33,10 @@ class KBService:
             retrieval_top_k=data.get("retrieval_top_k", 5),
             score_threshold=data.get("score_threshold", 0.5),
             visibility=data.get("visibility", "private"),
+            vlm_enabled=data.get("vlm_enabled", True),
+            vlm_model=data.get("vlm_model", ""),
+            multimodal=data.get("multimodal", False),
+            embedding_dim=data.get("embedding_dim", 1024),
             owner=owner,
             tenant_id=tenant_id,
         )

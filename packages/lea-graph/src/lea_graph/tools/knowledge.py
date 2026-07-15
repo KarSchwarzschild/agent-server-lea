@@ -76,10 +76,13 @@ async def kb_search(query: str, limit: int = 5, *, config: RunnableConfig = None
                 {
                     "index": i,
                     "title": r.get("title") or f"文档 {r.get('document_id') or '?'}",
+                    "section_title": r.get("section_title", ""),
                     "score": round(float(r.get("score", 0.0)), 4),
                     "kb_id": r.get("kb_id"),
                     "document_id": r.get("document_id"),
                     "page": r.get("page"),
+                    "chunk_type": r.get("chunk_type", "text"),
+                    "source_url": r.get("source_url", ""),
                     "snippet": (r.get("content") or "")[:200],
                 }
                 for i, r in enumerate(results, 1)

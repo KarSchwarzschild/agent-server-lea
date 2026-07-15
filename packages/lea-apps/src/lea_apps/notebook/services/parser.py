@@ -1,24 +1,28 @@
-"""PDF 解析服务 — MinerU 优先，PyMuPDF fallback。"""
+"""PDF 解析服务 — MinerU 云端 API (mineru.net) 优先，PyMuPDF fallback。"""
 
 from __future__ import annotations
 
+import io
 import json
+import os
 import re
+import time
+import zipfile
 
 import httpx
 import structlog
 
 logger = structlog.get_logger()
 
-_MINERU_URL = None
+_MINERU_API_BASE = "https://mineru.net/api/v4"
+_MINERU_TOKEN: str | None = None
 
 
-def _get_mineru_url() -> str:
-    global _MINERU_URL
-    if _MINERU_URL is None:
-        from lea_server.config import get_settings
-        _MINERU_URL = getattr(get_settings(), "mineru_url", "http://localhost:8001")
-    return _MINERU_URL
+def _get_mineru_token() -> str:
+    global _MINERU_TOKEN
+    if _MINERU_TOKEN is None:
+        _MINERU_TOKEN = os.getenv("MINERU_TOKEN", "")
+    return _MINERU_TOKEN
 
 
 def _html_table_to_text(html: str) -> str:
@@ -153,23 +157,105 @@ def chunk_text_blocks(text_blocks: list[dict], chunk_size: int = 200) -> list[di
     return chunks
 
 
-def parse_pdf_mineru(file_path: str) -> dict:
-    """用 MinerU 解析 PDF，返回 md_content + text_chunks + image_items。"""
-    url = f"{_get_mineru_url()}/file_parse"
+def _poll_batch_done(batch_id: str, token: str, timeout: int = 300) -> str:
+    """轮询 batch 状态直到完成，返回第一个文件的 task_id。"""
+    headers = {"Authorization": f"Bearer {token}"}
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        resp = httpx.get(
+            f"{_MINERU_API_BASE}/extract-results/batch/{batch_id}",
+            headers=headers, timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code") != 0:
+            raise RuntimeError(f"MinerU poll error: {data}")
+        extract_data = data.get("data", {})
+        results = extract_data.get("extract_result", [])
+        if not results:
+            # v4 API 可能用 file_results 字段
+            results = extract_data.get("file_results", [])
+        logger.info("mineru_poll", batch_id=batch_id, keys=list(extract_data.keys()), results_len=len(results), first=results[0] if results else None)
+        if results and results[0].get("state") == "done":
+            # v4 API 直接返回 full_zip_url，不需要二次请求
+            zip_url = results[0].get("full_zip_url")
+            if zip_url:
+                return zip_url
+            task_id = results[0].get("task_id") or results[0].get("id") or results[0].get("file_id") or batch_id
+            return task_id
+        if results and results[0].get("state") == "failed":
+            raise RuntimeError(f"MinerU 解析失败: {results[0]}")
+        time.sleep(3)
+    raise RuntimeError(f"MinerU 解析超时 ({timeout}s)")
 
+
+def _download_and_parse_zip(task_id_or_url: str, token: str) -> dict:
+    """下载解析结果 zip，提取 md / content_list / images。"""
+    if task_id_or_url.startswith("http"):
+        zip_url = task_id_or_url
+    else:
+        headers = {"Authorization": f"Bearer {token}"}
+        resp = httpx.get(
+            f"{_MINERU_API_BASE}/extract/task/{task_id_or_url}",
+            headers=headers, timeout=30,
+        )
+        resp.raise_for_status()
+        task_data = resp.json()["data"]
+        zip_url = task_data.get("full_zip_url", "")
+        if not zip_url:
+            md_content = task_data.get("md_content", "")
+            return {"md_content": md_content, "text_chunks": _chunk_md_fallback(md_content), "image_items": []}
+
+    zip_resp = httpx.get(zip_url, timeout=120)
+    zip_resp.raise_for_status()
+
+    md_content = ""
+    content_list_raw = None
+    images_dict: dict[str, str] = {}
+
+    with zipfile.ZipFile(io.BytesIO(zip_resp.content)) as zf:
+        for name in zf.namelist():
+            if name.endswith(".md") and not md_content:
+                md_content = zf.read(name).decode("utf-8", errors="ignore")
+            elif name.endswith("content_list.json") and "_v2" not in name:
+                content_list_raw = json.loads(zf.read(name))
+            elif "images/" in name and not name.endswith("/"):
+                import base64
+                img_name = name.split("/")[-1]
+                images_dict[img_name] = base64.b64encode(zf.read(name)).decode()
+
+    if content_list_raw:
+        parsed = _parse_content_list(content_list_raw, images_dict)
+        text_chunks = chunk_text_blocks(parsed["text_blocks"])
+        return {"md_content": md_content, "text_chunks": text_chunks, "image_items": parsed["image_items"]}
+
+    text_chunks = _chunk_md_fallback(md_content)
+    return {"md_content": md_content, "text_chunks": text_chunks, "image_items": []}
+
+
+def parse_pdf_mineru(file_path: str) -> dict:
+    """MinerU 解析入口 — 自动选择本地或云端模式。"""
+    local_url = os.getenv("MINERU_URL", "")
+    if local_url:
+        return _parse_pdf_mineru_local(file_path, local_url)
+    return _parse_pdf_mineru_cloud(file_path)
+
+
+def _parse_pdf_mineru_local(file_path: str, base_url: str) -> dict:
+    """本地自部署 MinerU（同步 /file_parse 接口）。"""
     with open(file_path, "rb") as f:
-        filename = file_path.rsplit("/", 1)[-1] if "/" in file_path else file_path.rsplit("\\", 1)[-1]
+        filename = os.path.basename(file_path)
         files = {"files": (filename, f, "application/pdf")}
         data = {
-            "lang_list": ["ch"],
-            "return_md": True,
-            "return_content_list": True,
-            "return_images": True,
+            "lang_list": '["ch"]',
+            "return_md": "true",
+            "return_content_list": "true",
+            "return_images": "true",
         }
-        resp = httpx.post(url, files=files, data=data, timeout=300)
+        resp = httpx.post(f"{base_url.rstrip('/')}/file_parse", files=files, data=data, timeout=300)
 
     if resp.status_code != 200:
-        raise RuntimeError(f"MinerU 解析失败: {resp.text}")
+        raise RuntimeError(f"MinerU 本地解析失败: {resp.text}")
 
     result = resp.json()
     file_key = list(result["results"].keys())[0]
@@ -182,14 +268,41 @@ def parse_pdf_mineru(file_path: str) -> dict:
     if content_list_raw:
         parsed = _parse_content_list(content_list_raw, images_dict)
         text_chunks = chunk_text_blocks(parsed["text_blocks"])
-        return {
-            "md_content": md_content,
-            "text_chunks": text_chunks,
-            "image_items": parsed["image_items"],
-        }
+        return {"md_content": md_content, "text_chunks": text_chunks, "image_items": parsed["image_items"]}
 
     text_chunks = _chunk_md_fallback(md_content)
     return {"md_content": md_content, "text_chunks": text_chunks, "image_items": []}
+
+
+def _parse_pdf_mineru_cloud(file_path: str) -> dict:
+    """MinerU 云端 API（异步提交 → 轮询 → 下载 zip）。"""
+    token = _get_mineru_token()
+    if not token:
+        raise RuntimeError("MINERU_TOKEN 未配置")
+
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    filename = os.path.basename(file_path)
+
+    batch_resp = httpx.post(
+        f"{_MINERU_API_BASE}/file-urls/batch",
+        headers=headers,
+        json={"files": [{"name": filename, "is_ocr": False}], "model_version": "vlm"},
+        timeout=30,
+    )
+    batch_resp.raise_for_status()
+    batch_data = batch_resp.json()
+    if batch_data.get("code") != 0:
+        raise RuntimeError(f"MinerU batch create failed: {batch_data}")
+
+    batch_id = batch_data["data"]["batch_id"]
+    upload_url = batch_data["data"]["file_urls"][0]
+
+    with open(file_path, "rb") as f:
+        put_resp = httpx.put(upload_url, content=f.read(), timeout=120)
+    put_resp.raise_for_status()
+
+    task_id = _poll_batch_done(batch_id, token)
+    return _download_and_parse_zip(task_id, token)
 
 
 def parse_pdf_pymupdf(file_path: str) -> dict:

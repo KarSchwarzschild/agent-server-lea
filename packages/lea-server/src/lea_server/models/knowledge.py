@@ -14,6 +14,31 @@ from lea_server.core.tenant import TenantMixin
 from lea_server.database import Base
 
 
+class RetrievalModel(Base):
+    """模型注册表 — 管理 embedding / reranker / vlm / asr 模型。"""
+
+    __tablename__ = "retrieval_models"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(100), nullable=False, unique=True, index=True)
+    model_type = Column(String(20), nullable=False, index=True)
+    api_base = Column(String(500), nullable=False)
+    api_key = Column(String(200), default="")
+    model_name = Column(String(200), default="")
+    dimension = Column(Integer, nullable=True)
+    supports = Column(JSON, default=list)
+    tags = Column(JSON, default=list)
+    enabled = Column(Boolean, default=True)
+    is_default = Column(Boolean, default=False)
+    config = Column(JSON, default=dict)
+
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    def __repr__(self) -> str:
+        return f"<RetrievalModel {self.name} type={self.model_type}>"
+
+
 class KnowledgeBase(TenantMixin, Base):
     """知识库 — 文档集合的容器。"""
 
@@ -23,10 +48,18 @@ class KnowledgeBase(TenantMixin, Base):
     name = Column(String(200), nullable=False)
     description = Column(Text, default="")
 
-    embedding_model = Column(String(100), default="bge-m3")
+    embedding_model = Column(String(100), default="")
+    embedding_dim = Column(Integer, default=1024)
+    reranker_model = Column(String(100), default="")
+    vlm_model = Column(String(100), default="")
+    vlm_enabled = Column(Boolean, default=False)
+    reranker_enabled = Column(Boolean, default=True)
+    multimodal = Column(Boolean, default=False)
     retrieval_mode = Column(String(20), default="hybrid")
     retrieval_top_k = Column(Integer, default=5)
     score_threshold = Column(Float, default=0.5)
+
+    extra = Column("metadata", JSON, default=dict)
 
     owner = Column(String(100), nullable=False, index=True)
     visibility = Column(String(20), default="private", index=True)
@@ -67,6 +100,8 @@ class Document(TenantMixin, Base):
     chunk_count = Column(Integer, default=0)
     word_count = Column(Integer, default=0)
 
+    extra = Column("metadata", JSON, default=dict)
+
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
@@ -82,6 +117,7 @@ class DocumentChunk(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     document_id = Column(Integer, ForeignKey("kb_documents.id", ondelete="CASCADE"), nullable=False, index=True)
     kb_id = Column(Integer, nullable=False, index=True)
+    section_id = Column(Integer, ForeignKey("kb_document_sections.id", ondelete="SET NULL"), nullable=True, index=True)
 
     content = Column(Text, nullable=False)
     chunk_type = Column(String(20), default="text")
@@ -93,3 +129,22 @@ class DocumentChunk(Base):
 
     def __repr__(self) -> str:
         return f"<DocumentChunk doc={self.document_id} pos={self.position}>"
+
+
+class DocumentSection(Base):
+    """文档章节结构 — 树索引用于检索时 boost。"""
+
+    __tablename__ = "kb_document_sections"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    document_id = Column(Integer, ForeignKey("kb_documents.id", ondelete="CASCADE"), nullable=False, index=True)
+    kb_id = Column(Integer, nullable=False, index=True)
+    parent_id = Column(Integer, ForeignKey("kb_document_sections.id"), nullable=True)
+    level = Column(Integer, default=1)
+    title = Column(String(500), nullable=False)
+    page_start = Column(Integer, default=0)
+    page_end = Column(Integer, default=0)
+    position = Column(Integer, default=0)
+    summary = Column(Text, default="")
+
+    created_at = Column(DateTime, default=func.now())

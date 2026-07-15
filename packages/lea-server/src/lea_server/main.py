@@ -26,6 +26,9 @@ from lea_server.api.admin_knowledge import router as admin_knowledge_router
 from lea_server.api.admin_mcp_servers import router as admin_mcp_servers_router
 from lea_server.api.admin_skills import router as admin_skills_router
 from lea_server.api.admin_teams import router as admin_teams_router
+from lea_server.api.admin_memories import router as admin_memories_router
+from lea_server.api.admin_models import router as admin_models_router
+from lea_server.api.memories import router as memories_router
 from lea_server.api.admin_tools import router as admin_tools_router
 from lea_server.api.admin_users import router as admin_users_router
 from lea_server.api.agents import router as agents_router
@@ -42,7 +45,7 @@ from lea_server.config import LEA_ENV, get_settings
 from lea_server.core.middleware import RequestTraceMiddleware, TenantMiddleware
 from lea_server.core.tenant import enable_tenant_filter
 from lea_server.database import Base, SessionLocal, engine
-from lea_server.models.knowledge import Document, DocumentChunk, KnowledgeBase  # noqa: F401
+from lea_server.models.knowledge import Document, DocumentChunk, DocumentSection, KnowledgeBase, RetrievalModel  # noqa: F401
 from lea_server.models.attachment import ChatAttachment  # noqa: F401
 from lea_server.models.chat_session import ChatMessage, ChatSession, UserMemory  # noqa: F401
 from lea_server.models.skill import Skill, SkillVersion, SkillTestRun  # noqa: F401
@@ -52,6 +55,7 @@ from lea_server.models.mcp_server import MCPServer  # noqa: F401
 from lea_server.models.tool import Tool  # noqa: F401
 from lea_server.models.audit_log import AuditLog  # noqa: F401
 from lea_server.models.agent_team import AgentTeam, AgentTeamMember  # noqa: F401
+from lea_server.models.memory_config import MemoryConfig  # noqa: F401
 from lea_server.engine.app_registry import AppRegistry
 from lea_graph.memory import create_redis_checkpointer
 from lea_graph.orchestrator.supervisor import build_supervisor_graph
@@ -114,6 +118,55 @@ def _ensure_agents_new_columns() -> None:
                     logger.info("agents_column_added", column=col_name)
     except Exception as e:
         logger.warning("agents_migrate_skipped", error=str(e))
+
+
+def _ensure_user_memories_new_columns() -> None:
+    """dev 环境无痛升级：user_memories 表缺记忆服务新列时补上。"""
+    from sqlalchemy import inspect, text
+
+    new_cols = {
+        "tenant_id": "VARCHAR(64) DEFAULT 'default'",
+        "category": "VARCHAR(32) DEFAULT 'fact'",
+        "importance": "INT DEFAULT 5",
+        "access_count": "INT DEFAULT 0",
+        "last_accessed_at": "DATETIME",
+        "source_session_id": "VARCHAR(64)",
+        "embedding_synced": "BOOLEAN DEFAULT FALSE",
+    }
+    try:
+        inspector = inspect(engine)
+        if "user_memories" not in inspector.get_table_names():
+            return
+        existing = {c["name"] for c in inspector.get_columns("user_memories")}
+        with engine.begin() as conn:
+            for col_name, col_def in new_cols.items():
+                if col_name not in existing:
+                    conn.execute(text(
+                        f"ALTER TABLE user_memories ADD COLUMN {col_name} {col_def}"
+                    ))
+                    logger.info("user_memories_column_added", column=col_name)
+    except Exception as e:
+        logger.warning("user_memories_migrate_skipped", error=str(e))
+
+
+def _ensure_document_chunks_section_id() -> None:
+    """dev 环境无痛升级：kb_document_chunks 缺 section_id 列时补上。"""
+    from sqlalchemy import inspect, text
+
+    try:
+        inspector = inspect(engine)
+        if "kb_document_chunks" not in inspector.get_table_names():
+            return
+        existing = {c["name"] for c in inspector.get_columns("kb_document_chunks")}
+        if "section_id" in existing:
+            return
+        with engine.begin() as conn:
+            conn.execute(text(
+                "ALTER TABLE kb_document_chunks ADD COLUMN section_id INT NULL"
+            ))
+            logger.info("document_chunks_section_id_added")
+    except Exception as e:
+        logger.warning("document_chunks_section_id_skipped", error=str(e))
 
 
 def _seed_roles() -> None:
@@ -463,6 +516,8 @@ async def lifespan(app: FastAPI):
             Base.metadata.create_all(bind=engine)
             _ensure_chat_messages_extra_column()
             _ensure_agents_new_columns()
+            _ensure_user_memories_new_columns()
+            _ensure_document_chunks_section_id()
             enable_tenant_filter(SessionLocal)
         except Exception as e:
             logger.error("database_init_failed", error=str(e))
@@ -573,6 +628,9 @@ app.include_router(admin_agent_bindings_router, prefix="/api")
 app.include_router(admin_mcp_servers_router, prefix="/api")
 app.include_router(admin_users_router, prefix="/api")
 app.include_router(admin_teams_router, prefix="/api")
+app.include_router(admin_memories_router, prefix="/api")
+app.include_router(admin_models_router, prefix="/api")
+app.include_router(memories_router, prefix="/api")
 app.include_router(knowledge_router, prefix="/api")
 app.include_router(user_skills_router, prefix="/api")
 app.include_router(super_agent_router, prefix="/api")

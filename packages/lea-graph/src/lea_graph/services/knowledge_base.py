@@ -1,7 +1,7 @@
 """知识库检索服务 — 统一检索入口。
 
-从本地 Milvus 向量数据库检索，自动过滤用户可见的知识库。
-替代旧版的智能基座外部 API 调用。
+使用 Jina v5 Omni dense + Milvus BM25 双路混合检索。
+支持 remote 模式（走统一检索服务 HTTP）和 embedded 模式（直接 import）。
 """
 
 from __future__ import annotations
@@ -35,91 +35,112 @@ async def search_knowledge_base(
     if not query.strip():
         return []
 
-    filters = _build_filters(kb_ids, document_ids, tenant_id, user_id)
+    from lea_graph.services.retrieval_client import is_remote_mode, kb_search
+
+    if is_remote_mode():
+        try:
+            return await kb_search(
+                query, limit,
+                kb_ids=kb_ids, document_ids=document_ids,
+                tenant_id=tenant_id, user_id=user_id,
+            )
+        except Exception as exc:
+            logger.error("remote_kb_search_error", error=str(exc))
+            return []
+
+    effective_kb_ids = _resolve_kb_ids(kb_ids, document_ids, tenant_id, user_id)
 
     try:
-        results = await _search_milvus(query, limit, filters)
+        results = await _search_v2(query, limit, effective_kb_ids, document_ids, tenant_id)
         return results
     except Exception as exc:
         logger.error("kb_search_error", error=str(exc))
         return []
 
 
-async def _search_milvus(
+async def _search_v2(
     query: str,
     limit: int,
-    filters: dict[str, Any],
+    kb_ids: list[int] | None,
+    document_ids: list[int] | None,
+    tenant_id: str,
 ) -> list[dict[str, Any]]:
-    """从 Milvus 向量数据库检索。"""
+    """使用 HybridRetrieverV2 检索。"""
     try:
-        from lea_rag.index.vector_index import MilvusRAGIndex
-        from lea_rag.retrieval.hybrid import HybridRetriever
+        from lea_rag.retrieval.hybrid_v2 import HybridRetrieverV2
     except ImportError:
         logger.warning("lea_rag_not_available")
         return []
 
-    index = MilvusRAGIndex(collection_name="lea_knowledge")
-    retriever = HybridRetriever(index)
+    retriever = HybridRetrieverV2()
 
+    hits = await retriever.search(
+        query,
+        top_k=limit,
+        kb_ids=kb_ids,
+        document_ids=document_ids,
+        tenant_id=tenant_id,
+    )
+
+    output = []
+    for hit in hits[:limit]:
+        output.append({
+            "content": hit.content,
+            "title": hit.source_filename,
+            "score": hit.score,
+            "kb_id": str(hit.kb_id),
+            "document_id": str(hit.document_id),
+            "section_id": hit.section_id or 0,
+            "page": hit.page,
+            "chunk_type": hit.chunk_type,
+            "source_url": hit.source_url,
+        })
+
+    if output:
+        _enrich_section_titles(output)
+
+    return output
+
+
+def _enrich_section_titles(results: list[dict[str, Any]]) -> None:
+    """补充 section_title 字段。"""
+    section_ids = [r["section_id"] for r in results if r.get("section_id")]
+    if not section_ids:
+        return
     try:
-        metadata_filters = None
-        kb_ids = filters.get("kb_ids")
-        document_ids = filters.get("document_ids")
+        from lea_server.database import SessionLocal
+        from lea_server.models.knowledge import DocumentSection
 
-        if kb_ids or document_ids:
-            from llama_index.core.vector_stores import MetadataFilter, FilterOperator
-            metadata_filters = []
-            if document_ids:
-                str_ids = [str(did) for did in document_ids]
-                metadata_filters.append(
-                    MetadataFilter(key="document_id", value=str_ids, operator=FilterOperator.IN),
-                )
-            elif kb_ids:
-                str_ids = [str(kid) for kid in kb_ids]
-                metadata_filters.append(
-                    MetadataFilter(key="kb_id", value=str_ids, operator=FilterOperator.IN),
-                )
+        db = SessionLocal()
+        try:
+            sections = (
+                db.query(DocumentSection.id, DocumentSection.title)
+                .filter(DocumentSection.id.in_(section_ids))
+                .all()
+            )
+            title_map = {s.id: s.title for s in sections}
+        finally:
+            db.close()
 
-        result = await retriever.aretrieve(
-            query, top_k=limit, metadata_filters=metadata_filters,
-        )
-        nodes = result.nodes
-
-        output = []
-        for node in nodes[:limit]:
-            text = node.text if hasattr(node, "text") else str(node)
-            metadata = node.metadata if hasattr(node, "metadata") else {}
-            score = node.score if hasattr(node, "score") else 0.0
-            output.append({
-                "content": text,
-                "title": metadata.get("source_filename", ""),
-                "score": score,
-                "kb_id": metadata.get("kb_id", ""),
-                "document_id": metadata.get("document_id", ""),
-                "page": metadata.get("page", 0),
-            })
-        return output
-
-    except Exception as exc:
-        logger.error("milvus_search_error", error=str(exc))
-        return []
+        for r in results:
+            r["section_title"] = title_map.get(r.get("section_id", 0), "")
+    except Exception:
+        for r in results:
+            r.setdefault("section_title", "")
 
 
-def _build_filters(
+def _resolve_kb_ids(
     kb_ids: list[int] | None,
     document_ids: list[int] | None,
     tenant_id: str,
     user_id: str,
-) -> dict[str, Any]:
-    """构建检索过滤条件。"""
-    if document_ids:
-        return {"document_ids": document_ids}
-
-    if kb_ids:
-        return {"kb_ids": kb_ids}
+) -> list[int] | None:
+    """解析用户可见的知识库 ID 列表。"""
+    if document_ids or kb_ids:
+        return kb_ids
 
     if not tenant_id and not user_id:
-        return {}
+        return None
 
     try:
         from lea_server.database import SessionLocal
@@ -129,9 +150,9 @@ def _build_filters(
         try:
             svc = KBService(db)
             visible_ids = svc.get_visible_kb_ids(user_id, tenant_id)
-            return {"kb_ids": visible_ids} if visible_ids else {}
+            return visible_ids if visible_ids else None
         finally:
             db.close()
     except Exception as exc:
         logger.warning("kb_filter_fallback", error=str(exc))
-        return {}
+        return None

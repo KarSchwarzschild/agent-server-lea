@@ -55,6 +55,14 @@ class UserMemory(Base):
     __tablename__ = "user_memories"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String(64), default="default", index=True)
     user_id = Column(String(64), index=True, nullable=False)
     content = Column(Text, nullable=False)
+    category = Column(String(32), default="fact")
+    scope = Column(String(100), default="global", index=True)
+    importance = Column(Integer, default=5)
+    access_count = Column(Integer, default=0)
+    last_accessed_at = Column(DateTime, nullable=True)
+    source_session_id = Column(String(64), nullable=True)
+    embedding_synced = Column(Boolean, default=False)
     created_at = Column(DateTime, server_default=func.now())

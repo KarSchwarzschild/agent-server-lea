@@ -56,3 +56,12 @@ uv.lock
 
 # scratch curl bodies
 .lea-*.json
+
+# 真机调试的落脚处：curl 请求体、SSE 抓包、探针脚本、临时二进制。
+# 里面会有现铸的 JWT（tok*.txt）和登录凭据（login.json），必须整目录挡住 ——
+# 单点忽略挡不住下一个随手加进来的文件。
+.local/
+
+# 编译产物。lea-agent 是单文件二进制、~28MB，反复重建，不进库。
+*.exe
+packages/lea-agent/lea-agent

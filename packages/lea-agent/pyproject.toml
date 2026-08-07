@@ -1,0 +1,6 @@
+[project]
+name = "lea-agent"
+version = "0.1.0"
+description = "Go agent service (placeholder for workspace)"
+requires-python = ">=3.11"
+dependencies = []

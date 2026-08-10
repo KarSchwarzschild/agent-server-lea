@@ -447,14 +447,19 @@ func (s *AgentSession) runChain(ctx context.Context, message string) (turn.Resul
 			"durationMs":   leg.Usage.DurationMs,
 		}})
 	}
-	if chain.DivertedToExit {
-		// 被兜底过就说出来。链跑完了，但这个团的 worker 不知道下一棒该给谁 ——
-		// 不播的话运维只能看到一条正常完成的对话。
+	// 兜底和迭代耗尽分开记：两者都表现为"没走到验收就被送过去了"，但要改的东西不同 ——
+	// 前者是提示词问题（worker 不知道下一棒给谁），后者是预算问题（那个专家的 max_turns
+	// 不够，或者派给它的活该拆）。混在一条日志里会让人调错地方。
+	if len(chain.CutOffLegs) > 0 {
+		log.Printf("chain_legs_cut_off session=%s experts=%v (迭代预算耗尽，产物已交验收员报告；考虑调高该专家的 max_turns 或拆活)",
+			s.id, chain.CutOffLegs)
+	}
+	if chain.DivertedToExit && len(chain.CutOffLegs) == 0 {
 		log.Printf("chain_diverted_to_exit session=%s legs=%d (worker 没指定下一棒或指定了不存在的专家)",
 			s.id, len(chain.Legs))
 	}
-	log.Printf("chain_done session=%s legs=%d diverted=%v stopped=%v",
-		s.id, len(chain.Legs), chain.DivertedToExit, chain.Stopped)
+	log.Printf("chain_done session=%s legs=%d diverted=%v cutOff=%v stopped=%v",
+		s.id, len(chain.Legs), chain.DivertedToExit, chain.CutOffLegs, chain.Stopped)
 
 	return result, err
 }

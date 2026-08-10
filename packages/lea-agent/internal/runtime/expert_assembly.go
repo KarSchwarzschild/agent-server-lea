@@ -118,6 +118,10 @@ func buildExpert(ctx context.Context, memberAgentID int, tenantID, userID, sessi
 		Prompt:      c.SystemPrompt,
 		// 专家可以用不同的模型 —— 便宜的干粗活。空则继承团长的。
 		Model: c.Model,
+		// 专家自己的 max_turns。不填的话它继承团长的，而那个数是按团长的活配的 ——
+		// 真机首轮就是这么断的：文档处理专家库里配了 30，实际跑在团长的 12 上，
+		// 编译到第三页被截断。
+		MaxIterations: c.MaxTurns,
 		// 必须非 nil：nil 在引擎里是"扫磁盘"，而专家会话的 CWD 同样是 /tmp。
 		Skills: ToEngineSkills(c.Skills),
 		// **Tools 留空。**

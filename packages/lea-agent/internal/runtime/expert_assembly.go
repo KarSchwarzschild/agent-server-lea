@@ -80,11 +80,17 @@ func BuildExperts(ctx context.Context, cfg *AgentConfig, tenantID, userID, sessi
 			log.Printf("expert_assembly_failed agent=%d err=%v (跳过该专家)", m.MemberAgentID, err)
 			continue
 		}
-		// 团里配的 role/name 覆盖 agent 自己的名字 —— 同一个 agent 可以在不同团里
+		// 团里配的 name 覆盖 agent 自己的名字 —— 同一个 agent 可以在不同团里
 		// 担任不同角色，名字取团里那份对团长更有意义。
 		if m.Name != "" {
 			e.Name = m.Name
 		}
+		// role 是**团里的**位置，不是 agent 自己的属性：同一个"文档处理专家"在一个团里
+		// 干活、在另一个团里验收。所以取自 member 行而不是 agent 配置。
+		//
+		// 星型完全不读它（引擎侧 Config.TeamMode 为空时 Role 是惰性的），所以这里无条件
+		// 填不会影响现有的团。
+		e.Role = EngineRole(m.Role, e.Name)
 		experts = append(experts, e)
 	}
 	if len(experts) == 0 {

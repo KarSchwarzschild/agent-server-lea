@@ -12,7 +12,9 @@ import (
 	"github.com/google/uuid"
 	engine "gitlab.ouc-online.com.cn/aibase/agentloop"
 	"gitlab.ouc-online.com.cn/aibase/agentloop/llm"
+	"gitlab.ouc-online.com.cn/aibase/agentloop/team"
 	"gitlab.ouc-online.com.cn/aibase/agentloop/tool"
+	"gitlab.ouc-online.com.cn/aibase/agentloop/turn"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/persistence"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/runtime"
 )
@@ -23,8 +25,18 @@ type AgentSession struct {
 	userID   string
 	agentID  int
 	cfg      *runtime.AgentConfig
-	engine   *engine.Session
-	memory   *runtime.MemoryMiddleware
+	// engine 是常驻的引擎会话，星型和单 agent 都用它 —— 历史留在里面，所以多轮对话
+	// 连得上。
+	//
+	// handoff 模式下它是 nil：那条链每一棒都是引擎自己建的独立会话（engine.RunChain），
+	// 没有一个"当前会话"可以持有。判断用哪条路看 chainCfg 而不是看它是否为 nil，
+	// 这样"没建起来"和"这个团是 handoff"不会长得一样。
+	engine *engine.Session
+	// chainCfg / chainOpts 非零表示这是 handoff 团：每次 Send 用它们跑一整条链。
+	// 存 Config 而不是 Session，因为链的会话生命周期在引擎手里。
+	chainCfg  *engine.Config
+	chainOpts engine.Options
+	memory    *runtime.MemoryMiddleware
 
 	mu          sync.RWMutex
 	subscribers map[chan SSEEvent]struct{}
@@ -113,13 +125,25 @@ func NewAgentSession(ctx context.Context, cfg *runtime.AgentConfig, p Params) (*
 	// （internal.py 按团长 agent_id 查团，members 只给到 member_agent_id 这个数字），
 	// 所以放在 engineCfg 之前。
 	experts := runtime.BuildExperts(ctx, cfg, p.TenantID, p.UserID, sessionID)
+	// 拓扑由库里的 strategy 决定。解析失败（库里写了 "pipeline" 之类）退回星型并记日志：
+	// 星型是这个字段有值以来一直的实际行为（strategy 之前压根没被消费过），所以对已有
+	// 的团来说这不是变更；而静默当成 handoff 会让一个从没验证过的拓扑上线。
+	teamMode := team.ModeStar
+	if cfg.Team != nil {
+		if m, err := team.ParseMode(cfg.Team.Strategy); err != nil {
+			log.Printf("unknown_team_strategy session=%s strategy=%q err=%v (按星型运行)",
+				sessionID, cfg.Team.Strategy, err)
+		} else {
+			teamMode = m
+		}
+	}
 	if len(experts) > 0 {
 		names := make([]string, 0, len(experts))
 		for _, e := range experts {
-			names = append(names, e.Name)
+			names = append(names, fmt.Sprintf("%s/%s", e.Name, team.RoleOf(e)))
 		}
-		log.Printf("team_assembled session=%s strategy=%s experts=%v",
-			sessionID, cfg.Team.Strategy, names)
+		log.Printf("team_assembled session=%s strategy=%s mode=%s experts=%v",
+			sessionID, cfg.Team.Strategy, modeLabel(teamMode), names)
 	}
 
 	engineCfg := engine.Config{
@@ -145,6 +169,8 @@ func NewAgentSession(ctx context.Context, cfg *runtime.AgentConfig, p Params) (*
 		Skills:  runtime.ToEngineSkills(cfg.Skills),
 		Agents:  runtime.BuildAgentRoster(),
 		Experts: experts,
+		// 星型时是零值，也就是引擎的默认 —— 现有团走的代码路径一个字没变。
+		TeamMode: teamMode,
 	}
 
 	// H2: 请求 AgentID 可能是 0（前端硬编码 super-agent），
@@ -197,6 +223,22 @@ func NewAgentSession(ctx context.Context, cfg *runtime.AgentConfig, p Params) (*
 		SkillTool: runtime.NewGatewaySkillDiscloser(true),
 	}
 
+	if teamMode == team.ModeHandoff {
+		// handoff 团没有常驻会话：链上每一棒都是引擎按 role 建的独立会话，用完就关。
+		// 所以这里只存配置，真正的装配发生在每次 Send。
+		//
+		// 代价是**不建会话就没人校验 roster**（引擎在 Build 里查 ValidateChain）。缺
+		// entry/exit 的团要等到第一次 Send 才报错，那时用户已经在等回答了 —— 所以现在
+		// 主动查一次，让配错的团在建会话时就失败，跟星型一样。
+		if err := team.ValidateChain(team.NewSet(experts)); err != nil {
+			return nil, fmt.Errorf("handoff 团配置不可用: %w", err)
+		}
+		s.chainCfg = &engineCfg
+		s.chainOpts = opts
+		go s.forwardToolEvents(toolEvents)
+		return s, nil
+	}
+
 	sess, err := engine.Build(engineCfg, opts)
 	if err != nil {
 		return nil, err
@@ -206,6 +248,15 @@ func NewAgentSession(ctx context.Context, cfg *runtime.AgentConfig, p Params) (*
 	go s.forwardToolEvents(toolEvents)
 
 	return s, nil
+}
+
+// modeLabel 把引擎的 team.Mode 渲染成日志里能读的字符串。ModeStar 是空串，直接打会
+// 出现 `mode=` 这种看不出是星型还是没设的输出。
+func modeLabel(m team.Mode) string {
+	if m == team.ModeStar {
+		return "star"
+	}
+	return string(m)
 }
 
 func (s *AgentSession) ID() string { return s.id }
@@ -282,10 +333,20 @@ func (s *AgentSession) Send(message string, attachmentIDs []int64) error {
 			}
 		}
 
-		// ── Phase 2: 执行引擎 RunTurn ──
+		// ── Phase 2: 执行 ──
+		//
+		// 两条拓扑在这里分岔，往下的收尾（历史、用量、SSE、落库）完全共用：runChain 把
+		// 一条链的结果整形成 turn.Result 的形状，因为下游关心的东西两者都有 —— 最终
+		// 文本、逐轮用量、迭代数。分岔只在"谁跑"，不在"跑完怎么处理"。
 		var assistantText string
 		var runErr error
-		result, err := s.engine.RunTurn(ctx, message)
+		var result turn.Result
+		var err error
+		if s.chainCfg != nil {
+			result, err = s.runChain(ctx, message)
+		} else {
+			result, err = s.engine.RunTurn(ctx, message)
+		}
 		switch {
 		case err != nil && errors.Is(err, context.Canceled):
 			// 用户主动停：不是错误。已经流出去的 delta 就是这轮的成果，
@@ -346,6 +407,56 @@ func (s *AgentSession) Send(message string, attachmentIDs []int64) error {
 		s.broadcast(SSEEvent{Type: "done", Data: nil})
 	}()
 	return nil
+}
+
+// runChain 跑一条 handoff 链，把结果整形成 turn.Result 的形状。
+//
+// 整形而不是让上面分两套收尾逻辑：下游要的三样东西（最终文本、逐轮用量、迭代数）两种
+// 拓扑都有，只是来源不同 —— 星型来自一个会话的多轮，handoff 来自多个会话各自的多轮。
+// 用量按 leg 顺序拼接，所以 sumUsages / peakInputTokens / perRoundUsage 不用改：
+// peak 仍然是"单次请求最大的那一次"，跨 leg 取最大恰好是对的。
+//
+// FinalAssistant 只填文本块。链的最终答案是验收专家的最后一条消息，而它的工具调用块
+// 属于那个 leg 的会话历史（已经随 leg 关闭而消失），带过来会让 extractText 之外的
+// 消费者看到指向不存在会话的 tool_use。
+func (s *AgentSession) runChain(ctx context.Context, message string) (turn.Result, error) {
+	chain, err := engine.RunChain(ctx, *s.chainCfg, s.chainOpts, message)
+
+	result := turn.Result{
+		Usages:  chain.Usages,
+		Stopped: chain.Stopped,
+		// 迭代数 = 全链所有请求次数。它回答的是"这一次对话花了多少轮模型调用"，
+		// 跟星型同义；leg 数另外单独播（chain_hop），两个数不该混。
+		Iterations: len(chain.Usages),
+		FinalAssistant: llm.Message{
+			Role:    llm.RoleAssistant,
+			Content: []llm.ContentBlock{{Type: llm.ContentBlockTypeText, Text: chain.Final}},
+		},
+	}
+
+	// 每一棒播一条事件。没有它前端只能看到一堆工具卡而不知道换过人 —— 链是平的，
+	// 事件里没有父子关系可以让前端推断出分段（见 collector 的 parentToolUseID）。
+	for i, leg := range chain.Legs {
+		s.broadcast(SSEEvent{Type: "chain_hop", Data: map[string]any{
+			"index":        i + 1,
+			"expert":       leg.Expert,
+			"role":         string(leg.Role),
+			"handedTo":     leg.HandedTo,
+			"inputTokens":  leg.Usage.InputTokens,
+			"outputTokens": leg.Usage.OutputTokens,
+			"durationMs":   leg.Usage.DurationMs,
+		}})
+	}
+	if chain.DivertedToExit {
+		// 被兜底过就说出来。链跑完了，但这个团的 worker 不知道下一棒该给谁 ——
+		// 不播的话运维只能看到一条正常完成的对话。
+		log.Printf("chain_diverted_to_exit session=%s legs=%d (worker 没指定下一棒或指定了不存在的专家)",
+			s.id, len(chain.Legs))
+	}
+	log.Printf("chain_done session=%s legs=%d diverted=%v stopped=%v",
+		s.id, len(chain.Legs), chain.DivertedToExit, chain.Stopped)
+
+	return result, err
 }
 
 // Stop 掐断当前 turn。返回 false 表示当轮已经结束（没什么可停）。

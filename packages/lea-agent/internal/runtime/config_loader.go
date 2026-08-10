@@ -4,9 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
+
+	"gitlab.ouc-online.com.cn/aibase/agentloop/team"
 )
 
 var configServiceURL = getEnv("LEA_CONFIG_URL", "http://localhost:8500")
@@ -38,6 +42,28 @@ type TeamMemberDef struct {
 	MemberAgentID int    `json:"member_agent_id"`
 	Role          string `json:"role"`
 	Name          string `json:"name"`
+}
+
+// EngineRole 把库里的 role 字符串映射成引擎的 team.Role。
+//
+// 库里那列是自由字符串（models/team.py 的 `String(50)`，默认 "worker"），所以映射要
+// 认识的才认、不认识的当 worker。这一层留在 lea-agent 而不是引擎里：这套词汇是我们
+// 数据库的，引擎只接受 team.Role。
+//
+// 不认识的值记一行日志。它在星型下完全无害（引擎不读 Role），但在 handoff 下会让
+// ValidateChain 报"没有 entry/exit"—— 那条报错本身是清楚的（会列出全部专家名），
+// 日志是为了让人能一眼看出根因是拼错而不是漏配。
+func EngineRole(role string, expertName string) team.Role {
+	switch r := team.Role(strings.ToLower(strings.TrimSpace(role))); r {
+	case team.RoleEntry, team.RoleWorker, team.RoleExit:
+		return r
+	case "":
+		return team.RoleWorker
+	default:
+		log.Printf("unknown_team_role expert=%q role=%q (按 worker 处理；handoff 模式下 entry/exit 缺失会在 Build 期报错)",
+			expertName, role)
+		return team.RoleWorker
+	}
 }
 
 // TeamDef 是"这个 agent 是一个专家团"的配置。字段对齐 lea-config 的

@@ -56,6 +56,10 @@ type messageCollector struct {
 	// 累计输入是 N 轮历史的叠加，同一份内容被重复计了很多次。逐轮数据才能看出
 	// 载荷是第几轮进的上下文、之后被重传了多少次。见 perRoundUsage 的说明。
 	mainRounds []map[string]any
+	// chainMode 标记这轮是 handoff 链，于是 main 里的 token 全零**是真实的**而不是
+	// 没测到。不标的话落库数据里两者长得一样，而 setMainUsage 的注释专门讲过这件事
+	// 要避免。
+	chainMode bool
 }
 
 // setMainUsage 记主会话本轮的用量。RunTurn 返回后调一次。
@@ -63,6 +67,8 @@ type messageCollector struct {
 // peak 单独记：累计和衡量花多少钱，峰值衡量离撞上下文窗口还有多远。委派类改动的收益
 // 主要体现在峰值下降，而累计反而会上升（多了子会话的启动开销），只看一个数会得出
 // 相反结论。
+//
+// **handoff 链不要调这个**，调 setChainUsage —— 理由见那边。
 func (c *messageCollector) setMainUsage(in, out, peak, iterations int, rounds []map[string]any) {
 	c.mu.Lock()
 	c.mainInputTokens = in
@@ -70,6 +76,36 @@ func (c *messageCollector) setMainUsage(in, out, peak, iterations int, rounds []
 	c.mainPeakInput = peak
 	c.mainIterations = iterations
 	c.mainRounds = rounds
+	c.mu.Unlock()
+}
+
+// setChainUsage 记一条 handoff 链的形状：轮数和 leg 的峰值，**不记 token**。
+//
+// 因为 handoff 下没有"主会话"这个东西。星型有：团长自己跑若干轮、读专家的报告、
+// 决定下一步，那些轮次是团长的开销，跟专家的开销不重叠。链没有团长 —— 每条 leg
+// 都是独立会话，而它们各自结束时已经通过 bridge 发了 agent_usage 进 agentUsages。
+//
+// 所以把链的 usages 喂给 setMainUsage 会让**三条 leg 被计两次**。run3 实测：
+// main 87,995（三条 leg 之和）+ agents 555,538（含同样那三条）= 落库 643,533，
+// 真实开销是 555,538，账单虚高 16%。计费依据虚高比缺失更糟 —— 缺失查得出来，
+// 虚高看起来是个正常数字。
+//
+// 轮数和峰值仍然记，它们不是加法：
+//   - iterations 是"这次对话打了多少次模型"，跟星型同义，前端那个数要它
+//   - peak 是取最大值，幂等，重复取不会翻倍
+//
+// 但 peak 这里只是**各条 leg 里最高的那一次请求**，不是全链峰值：leg 的 usages 不含
+// 它派出去的子代理（子代理的用量走 bridge 单独进 agentUsages）。run3 里 leg 峰值
+// 5,729，而真正的全链峰值 32,920 在子代理身上 —— 想知道链离撞上下文窗口有多远，得
+// 看 agents 里每条的 peak，main 这个数答不了。
+func (c *messageCollector) setChainUsage(iterations, peak int, rounds []map[string]any) {
+	c.mu.Lock()
+	c.mainInputTokens = 0
+	c.mainOutputTokens = 0
+	c.mainPeakInput = peak
+	c.mainIterations = iterations
+	c.mainRounds = rounds
+	c.chainMode = true
 	c.mu.Unlock()
 }
 
@@ -500,6 +536,11 @@ func (c *messageCollector) toExtra() map[string]any {
 			"main":              main,
 			"totalInputTokens":  totalIn,
 			"totalOutputTokens": totalOut,
+		}
+		if c.chainMode {
+			// 让 main 里的零是自解释的：读这份数据的人（或月底对账的脚本）看到
+			// inputTokens=0 时，要能分清"这是链、开销全在 agents 里"和"用量没测到"。
+			usage["topology"] = "handoff"
 		}
 		if len(c.agentUsages) > 0 {
 			usage["agents"] = c.agentUsages

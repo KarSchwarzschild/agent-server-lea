@@ -359,7 +359,7 @@ func (s *AgentSession) Send(message string, attachmentIDs []int64) error {
 			)
 			s.mu.Unlock()
 			inTok, outTok := sumUsages(result.Usages)
-			s.currentCollector().setMainUsage(inTok, outTok, peakInputTokens(result.Usages), result.Iterations, perRoundUsage(result.Usages))
+			s.recordTurnUsage(result)
 			s.broadcast(SSEEvent{Type: "result", Data: map[string]any{
 				"text":            assistantText,
 				"iterations":      result.Iterations,
@@ -370,6 +370,12 @@ func (s *AgentSession) Send(message string, attachmentIDs []int64) error {
 			}})
 		case err != nil:
 			runErr = err
+			// 失败也要记用量 —— 花掉的钱不因为这轮失败而退回。此前这条分支不记，于是一轮
+			// 跑到一半失败的对话在库里 token_count 是空的，而它可能已经烧了几十万 token
+			// （handoff 链中途某棒预算耗尽就是这个形状：前面几棒全跑完了）。
+			//
+			// 这种丢失没有可见症状：前端照常显示错误，只有对账时才发现账单少了一笔。
+			s.recordTurnUsage(result)
 			s.broadcast(SSEEvent{Type: "error", Data: err.Error()})
 		default:
 			assistantText = extractText(result.FinalAssistant)
@@ -383,7 +389,7 @@ func (s *AgentSession) Send(message string, attachmentIDs []int64) error {
 			s.mu.Unlock()
 
 			inTok, outTok := sumUsages(result.Usages)
-			s.currentCollector().setMainUsage(inTok, outTok, peakInputTokens(result.Usages), result.Iterations, perRoundUsage(result.Usages))
+			s.recordTurnUsage(result)
 			s.broadcast(SSEEvent{Type: "result", Data: map[string]any{
 				"text":            assistantText,
 				"iterations":      result.Iterations,
@@ -407,6 +413,21 @@ func (s *AgentSession) Send(message string, attachmentIDs []int64) error {
 		s.broadcast(SSEEvent{Type: "done", Data: nil})
 	}()
 	return nil
+}
+
+// recordTurnUsage 把一轮的用量交给 collector，按拓扑走对应的那条路。
+//
+// 抽出来是因为两个调用点（正常结束、用户主动停）要做同样的判断，而漏掉一个的后果是
+// 静默的：账单虚高，看起来只是个正常数字。
+func (s *AgentSession) recordTurnUsage(result turn.Result) {
+	in, out := sumUsages(result.Usages)
+	if s.chainCfg != nil {
+		// 链没有主会话，每条 leg 的用量已经各自通过 bridge 进了 agentUsages。
+		// 再把 in/out 填进 main 就是把 leg 计两次 —— 见 setChainUsage。
+		s.currentCollector().setChainUsage(result.Iterations, peakInputTokens(result.Usages), perRoundUsage(result.Usages))
+		return
+	}
+	s.currentCollector().setMainUsage(in, out, peakInputTokens(result.Usages), result.Iterations, perRoundUsage(result.Usages))
 }
 
 // runChain 跑一条 handoff 链，把结果整形成 turn.Result 的形状。
@@ -447,19 +468,23 @@ func (s *AgentSession) runChain(ctx context.Context, message string) (turn.Resul
 			"durationMs":   leg.Usage.DurationMs,
 		}})
 	}
-	// 兜底和迭代耗尽分开记：两者都表现为"没走到验收就被送过去了"，但要改的东西不同 ——
-	// 前者是提示词问题（worker 不知道下一棒给谁），后者是预算问题（那个专家的 max_turns
-	// 不够，或者派给它的活该拆）。混在一条日志里会让人调错地方。
-	if len(chain.CutOffLegs) > 0 {
-		log.Printf("chain_legs_cut_off session=%s experts=%v (迭代预算耗尽，产物已交验收员报告；考虑调高该专家的 max_turns 或拆活)",
-			s.id, chain.CutOffLegs)
-	}
-	if chain.DivertedToExit && len(chain.CutOffLegs) == 0 {
+	if chain.DivertedToExit {
+		// 兜底过就说出来：链跑完了，但这个团的 worker 不知道下一棒该给谁（或者点了个
+		// 不存在的名字）。不记的话运维只看到一条正常完成的对话，而这是 roster 或提示词
+		// 该改的信号。
 		log.Printf("chain_diverted_to_exit session=%s legs=%d (worker 没指定下一棒或指定了不存在的专家)",
 			s.id, len(chain.Legs))
 	}
-	log.Printf("chain_done session=%s legs=%d diverted=%v cutOff=%v stopped=%v",
-		s.id, len(chain.Legs), chain.DivertedToExit, chain.CutOffLegs, chain.Stopped)
+	if err != nil {
+		// 中途失败：哪一棒、为什么。预算耗尽（max react iterations）是最常见的一种，
+		// 对应的动作是调高那个专家的 max_turns 或者把活拆小。
+		//
+		// 产物不会因此丢：leg 的工具事件已经沿 bridge 流出去落库了，workspace 里的文件
+		// 也还在，用户在历史记录里看得到做到哪一步 —— 只是没有人替他判断"这算不算完成"。
+		log.Printf("chain_failed session=%s legs=%d err=%v", s.id, len(chain.Legs), err)
+	}
+	log.Printf("chain_done session=%s legs=%d diverted=%v stopped=%v",
+		s.id, len(chain.Legs), chain.DivertedToExit, chain.Stopped)
 
 	return result, err
 }

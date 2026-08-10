@@ -372,6 +372,118 @@ func TestCollector_UsageTotalsMatchesExtra(t *testing.T) {
 	}
 }
 
+// ── handoff 链的用量不能重复计 ────────────────────────────────
+//
+// 链没有"主会话"：每条 leg 都是独立会话，各自结束时通过 bridge 发 agent_usage。把链的
+// 累计 usages 再填进 main 就是把每条 leg 计两次。
+//
+// run3 实测过这个 bug：main 87,995（三条 leg 之和）+ agents 555,538（含同样那三条）
+// = 落库 643,533，真实是 555,538，虚高 16%。**虚高比缺失更糟** —— 缺失查得出来
+// （token_count=0 很显眼），虚高看起来就是个正常数字，要到对账才发现。
+
+func TestChainUsageDoesNotDoubleCountLegs(t *testing.T) {
+	c := newCollector()
+	// 三条 leg 各自报自己的用量（真实链路里由引擎的 bridge 发出）。
+	for _, leg := range []struct {
+		name string
+		id   string
+		in   int
+		out  int
+	}{
+		{"调度员", "leg_1_调度员", 9_413, 457},
+		{"文档处理专家", "leg_2_文档处理专家", 20_877, 580},
+		{"验收员", "leg_3_验收员", 57_705, 672},
+	} {
+		c.onToolEvent(tool.Event{
+			Type: tool.EventTypeAgentUsage, ToolName: "handoff_leg", ToolUseID: leg.id,
+			AgentName: leg.name, InputTokens: leg.in, OutputTokens: leg.out,
+		})
+	}
+	// 子代理挂在第二条 leg 下 —— 它是这条链最大的一笔。
+	c.onToolEvent(tool.Event{
+		Type: tool.EventTypeAgentUsage, ToolName: "Task", ToolUseID: "call_b8de",
+		ParentToolUseID: "leg_2_文档处理专家",
+		AgentName:       "general-purpose", InputTokens: 467_543, OutputTokens: 7_723,
+	})
+	// 链的收尾：只记形状，不记 token。
+	c.setChainUsage(15, 5_729, nil)
+
+	u := c.toExtra()["usage"].(map[string]any)
+	wantIn := 9_413 + 20_877 + 57_705 + 467_543
+	if u["totalInputTokens"] != wantIn {
+		t.Errorf("totalInputTokens = %v, want %d —— leg 被重复计入 main 了", u["totalInputTokens"], wantIn)
+	}
+	main := u["main"].(map[string]any)
+	if main["inputTokens"] != 0 || main["outputTokens"] != 0 {
+		t.Errorf("链没有主会话，main 的 token 必须是 0，got %v", main)
+	}
+	// 但轮数要在 —— 前端那个"打了多少次模型"的数字读它，而它不是加法。
+	if main["iterations"] != 15 {
+		t.Errorf("iterations = %v, want 15", main["iterations"])
+	}
+	// 零必须是自解释的：读数据的人要能分清"这是链"和"用量没测到"。
+	if u["topology"] != "handoff" {
+		t.Errorf("链要标 topology，否则 main 里的 0 跟'没测到'长得一样: %v", u)
+	}
+	// token_count 列和 JSON 细账必须一致。
+	in, _ := c.usageTotals()
+	if in != wantIn {
+		t.Errorf("usageTotals=%d 与 extra=%d 不一致", in, wantIn)
+	}
+}
+
+// 中途失败的那轮也要落用量 —— 花掉的钱不因为失败而退回。
+//
+// handoff 链最容易长这个形状：前面几棒全跑完了，某一棒预算耗尽，整条链返错。此前
+// agent_session 的 err 分支不调 recordTurnUsage，于是那些已完成的 leg 一笔都不记。
+// 这种丢失没有可见症状：前端照常显示错误，只有对账时才发现账单少一笔。
+func TestChainUsagePersistsEvenWhenTheChainFailed(t *testing.T) {
+	c := newCollector()
+	// 两棒跑完了，第三棒预算耗尽 —— 前两棒的开销已经发生。
+	c.onToolEvent(tool.Event{
+		Type: tool.EventTypeAgentUsage, ToolName: "handoff_leg", ToolUseID: "leg_1_调度员",
+		AgentName: "调度员", InputTokens: 3_035, OutputTokens: 124,
+	})
+	c.onToolEvent(tool.Event{
+		Type: tool.EventTypeAgentUsage, ToolName: "handoff_leg", ToolUseID: "leg_2_文档处理专家",
+		AgentName: "文档处理专家", InputTokens: 77_047, OutputTokens: 2_700,
+	})
+	c.setChainUsage(14, 6_088, nil)
+
+	u, ok := c.toExtra()["usage"].(map[string]any)
+	if !ok {
+		t.Fatal("失败的链也必须落 usage —— 前面几棒的钱已经花了")
+	}
+	want := 3_035 + 77_047
+	if u["totalInputTokens"] != want {
+		t.Errorf("totalInputTokens = %v, want %d", u["totalInputTokens"], want)
+	}
+	in, _ := c.usageTotals()
+	if in != want {
+		t.Errorf("token_count 列要拿到同一个数: %d != %d", in, want)
+	}
+}
+
+// 星型一个字没变：main 有 token，没有 topology 标记，total 是两者之和。
+func TestStarUsageStillCountsMainPlusAgents(t *testing.T) {
+	c := newCollector()
+	c.setMainUsage(16_518, 879, 6_180, 3, nil)
+	c.onToolEvent(tool.Event{
+		Type: tool.EventTypeAgentUsage, ToolName: "ask_expert", ToolUseID: "ae-1",
+		AgentName: "文档处理专家", InputTokens: 455_680, OutputTokens: 3_790,
+	})
+	u := c.toExtra()["usage"].(map[string]any)
+	if u["totalInputTokens"] != 16_518+455_680 {
+		t.Errorf("星型 total 应当是 main+agents: %v", u["totalInputTokens"])
+	}
+	if u["main"].(map[string]any)["inputTokens"] != 16_518 {
+		t.Errorf("星型的团长开销必须留在 main: %v", u["main"])
+	}
+	if _, has := u["topology"]; has {
+		t.Errorf("星型不该带 topology 标记 —— 加字段会让前端以为拓扑变了: %v", u)
+	}
+}
+
 // ── 逐轮用量 ────────────────────────────────────────────────
 //
 // 合计答不了"钱花在哪"：一个 turn 的累计输入是 N 轮历史的叠加，第 k 轮的输入已经

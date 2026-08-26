@@ -4,14 +4,30 @@ version = "0.1.0"
 description = "终身教育AI Agent平台"
 requires-python = ">=3.11"
 dependencies = [
-    "lea-server",
+    "lea-agent",
+    "lea-rag",
+    "lea-config",
+    "lea-tools",
+    "lea-authkit",
 ]
 
 [tool.uv.sources]
-lea-server = { workspace = true }
+lea-agent = { workspace = true }
+lea-rag = { workspace = true }
+lea-config = { workspace = true }
+lea-tools = { workspace = true }
+lea-authkit = { workspace = true }
 
 [tool.uv.workspace]
-members = ["packages/*"]
+members = [
+    "packages/lea-agent",
+    "packages/lea-authkit",
+    "packages/lea-config",
+    "packages/lea-data",
+    "packages/lea-parser",
+    "packages/lea-rag",
+    "packages/lea-tools",
+]
 
 [dependency-groups]
 dev = [
@@ -22,7 +38,9 @@ dev = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-pythonpath = ["packages/lea-server/src", "packages/lea-graph/src", "packages/lea-apps/src", "packages/lea-rag/src", "packages/lea-data/src"]
+# workspace 成员由 uv 装成 editable，本来就 import 得到，所以这里只列**需要额外
+# 补路径**的。加 lea-tools / lea-config 是多余的（试过，加不加结果一样）。
+pythonpath = ["packages/lea-rag/src", "packages/lea-config/src", "packages/lea-tools/src", "packages/lea-authkit/src", "packages/lea-parser/src"]
 
 [tool.ruff]
 target-version = "py311"

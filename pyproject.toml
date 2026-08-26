@@ -40,7 +40,23 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 # workspace 成员由 uv 装成 editable，本来就 import 得到，所以这里只列**需要额外
 # 补路径**的。加 lea-tools / lea-config 是多余的（试过，加不加结果一样）。
-pythonpath = ["packages/lea-rag/src", "packages/lea-config/src", "packages/lea-tools/src", "packages/lea-authkit/src", "packages/lea-parser/src"]
+#
+# 后两个是**归档包**，跟着 *-legacy 改名一起从 workspace 里摘出去了。它们的依赖
+# 还装着，所以只要补回路径，老测试照常能跑 —— tests/ 下有 4 个文件还 import
+# lea_server / lea_graph（conftest 的几个 fixture 也是），不补的话是 22 个
+# collection ERROR。
+#
+# ⚠️ 这两行跟 packages/*-legacy 同生共死：哪天真删掉那三个归档包，这两行和那 4 个
+# 测试文件要一起走，别让它们变成指向空目录的死路径。
+pythonpath = [
+    "packages/lea-rag/src",
+    "packages/lea-config/src",
+    "packages/lea-tools/src",
+    "packages/lea-authkit/src",
+    "packages/lea-parser/src",
+    "packages/lea-server-legacy/src",
+    "packages/lea-graph-legacy/src",
+]
 
 [tool.ruff]
 target-version = "py311"

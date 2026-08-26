@@ -32,10 +32,19 @@ frontend-admin/.vite/
 *.tsbuildinfo
 
 # Environment
+#
+# 白名单式：**一律不进库，只放行 *.example**。
+#
+# 原来是逐个列举（.env / .env.test / .env.production / .env.local），于是
+# `.env.bak-20260731-153007` 和 `.env.bak-t6` 两个真备份就大喇喇躺在仓库根目录、
+# 而且不被忽略 —— 里面有 DB_PASSWORD / JWT_SECRET / MINIO_SECRET_KEY /
+# LEA_TENANT_API_KEY / MINERU_TOKEN。只要有人 `git add -A` 就永久进历史了。
+#
+# 逐个列举的名单永远追不上下一个随手起的文件名（.bak / .old / .t6 / .备份），
+# 所以反过来写。MinerU token 已经因为同类事故进过一次历史，不来第二次。
 .env
-.env.test
-.env.production
-.env.local
+.env.*
+!.env*.example
 
 # OS
 .DS_Store
@@ -49,7 +58,13 @@ data/
 *.log
 
 # uv
-uv.lock
+#
+# uv.lock **要提交**，别再加回忽略名单。
+#
+# 库不提交 lockfile 是惯例，应用提交才是 —— 这个仓库是应用。而且四个 Dockerfile 都是
+#     COPY pyproject.toml uv.lock ./ && uv export --frozen
+# 干净克隆（CI / CCE 构建流水线 / 换台机器）没有 uv.lock 时 --frozen 直接失败，
+# 镜像就只在本机构建得出来。踩过这个。
 
 # Claude
 .claude/
@@ -65,3 +80,16 @@ uv.lock
 # 编译产物。lea-agent 是单文件二进制、~28MB，反复重建，不进库。
 *.exe
 packages/lea-agent/lea-agent
+
+# 迁移前的整表备份。是**真数据**不是样例 —— backup_mcp_servers_pre016.json 就是
+# mcp_servers 整表含 auth_config。留本地做回滚用，不进库。
+scripts/backup_*
+
+# 真机调试落下的临时产物（根目录限定，docs/ 下的同类扩展名不受影响）。
+# pptx 是 code_interpreter 冒烟测试的输出。
+/ws.txt
+/planrows.txt
+/*.pptx
+
+# 打包出来的包快照（packages/lea-config.zip 之类）。源码就在旁边，别提交副本。
+packages/*.zip

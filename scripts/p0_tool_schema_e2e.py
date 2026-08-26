@@ -26,6 +26,7 @@ HTTP 200。
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import sys
 import time
@@ -35,7 +36,9 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 import _dbconn as d
 
-AGENT_URL = "http://127.0.0.1:8100/api/chat/stream"
+# 默认打裸的 lea-agent。挂在 nginx 后面的验证台（infra/docker-compose.verify.yml）
+# 是 :8080，用 LEA_AGENT_URL 覆盖，不用改代码。
+AGENT_URL = os.getenv("LEA_AGENT_URL", "http://127.0.0.1:8100") + "/api/chat/stream"
 SECRET = d.env()["SECRET_KEY"]  # 从仓库根 .env 读，别写死 —— 写死就是把密钥提交进库
 TENANT = "default"
 USER = "p0-schema-user"

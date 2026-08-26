@@ -73,7 +73,6 @@ def test_validate_skill_binding_reports_missing_tools(db_session, seed_agent, se
         name="needs-web-search",
         display_name="X",
         description="",
-        system_prompt="",
         model_tier="mid",
         required_tools=["web_search", "kb_search"],
         pipeline_class="",

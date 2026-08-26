@@ -10,7 +10,22 @@ import os
 # ── 必须在 import lea_server 前设置 env ──────────────────────────
 os.environ.setdefault("LEA_ENV", "test")
 os.environ["DB_HOST"] = "sqlite"
-os.environ["DB_NAME"] = ":memory:"
+
+# ⚠️ 不能设成 ":memory:"。
+#
+# 各服务的 DatabaseSettings.url 在 host=="sqlite" 时返回 f"sqlite:///{name}.db"，
+# 也就是把 DB_NAME 当**文件名**用。传 ":memory:" 会拼出 "sqlite:///:memory:.db" ——
+# 一个字面上叫 ":memory:.db" 的文件，而 Windows 文件名不允许含冒号，于是
+# sqlite3.OperationalError: unable to open database file。
+#
+# 而且 get_settings() 带 lru_cache，所以这个值是**进程级**的：全量跑测试时，
+# 先 import 的模块把它缓存下来，后面用 lea_rag.db.engine 的测试（test_memory_scope）
+# 就拿到那个畸形 URL 报错 —— 单独跑那个文件却是绿的。典型的测试间污染。
+#
+# 用一个真实文件名。需要真 in-memory 的 fixture 自己 create_engine
+# ("sqlite:///:memory:")，那是合法写法（见下面 db_session）。
+os.environ["DB_NAME"] = "lea-test-scratch"
+
 os.environ.setdefault("SECRET_KEY", "test-secret")
 
 import pytest
@@ -32,6 +47,7 @@ def db_session():
         knowledge,
         models,
         skill,
+        tool,  # AgentToolBinding 外键指向 tools，不导入则 create_all 不建表
     )
 
     engine = create_engine(
@@ -77,7 +93,6 @@ def seed_skills(db_session):
             name="slide-generator",
             display_name="Slide Gen",
             description="Triggers: PPT, 演示文稿",
-            system_prompt="你是 PPT 专家",
             model_tier="high",
             required_tools=[],
             pipeline_class="lea_graph.skills.pipelines.slide_generator.X",
@@ -90,7 +105,6 @@ def seed_skills(db_session):
             name="slide-editor",
             display_name="Slide Edit",
             description="Triggers: 改PPT",
-            system_prompt="改 PPT 助手",
             model_tier="high",
             required_tools=[],
             pipeline_class="lea_graph.skills.pipelines.slide_editor.X",
@@ -103,7 +117,6 @@ def seed_skills(db_session):
             name="user-skill-x",
             display_name="用户创建的",
             description="",
-            system_prompt="",
             model_tier="mid",
             required_tools=[],
             pipeline_class="",

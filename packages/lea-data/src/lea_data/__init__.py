@@ -1,1 +1,1 @@
-"""LEA Data Pipeline — 反馈收集、质量评测、数据飞轮。"""
+"""LEA Data Pipeline — 日志、运行监控、质量评测和反馈飞轮。"""

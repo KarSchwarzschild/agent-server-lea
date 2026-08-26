@@ -1,10 +1,9 @@
 [project]
 name = "lea-rag"
-version = "0.1.0"
-description = "LEA Platform RAG引擎 + 统一检索服务（KB + Memory）"
+version = "0.2.0"
+description = "LEA 检索服务（KB + Memory）— 独立部署，内部依赖仅 lea-authkit"
 requires-python = ">=3.11"
 dependencies = [
-    "lea-graph",
     "llama-index-core>=0.12",
     "llama-index-vector-stores-milvus>=0.4",
     "llama-index-llms-openai-like>=0.3",
@@ -17,10 +16,23 @@ dependencies = [
     "uvicorn[standard]>=0.34",
     "structlog>=24.0",
     "celery[redis]>=5.4",
+    "sqlalchemy>=2.0",
+    "pymysql>=1.1",
+    "python-dotenv>=1.0",
+    "pydantic-settings>=2.0",
+    "python-multipart>=0.0.6",
+    "boto3>=1.34",
+    "python-docx>=1.1",
+    "python-pptx>=1.0",
+    "langchain-openai>=0.3",
+    "langchain-core>=0.3",
+    "langchain-text-splitters>=0.3",
+    # 服务间鉴权（被调方中间件）。见 packages/lea-authkit。
+    "lea-authkit",
 ]
 
 [tool.uv.sources]
-lea-graph = { workspace = true }
+lea-authkit = { workspace = true }
 
 [build-system]
 requires = ["hatchling"]

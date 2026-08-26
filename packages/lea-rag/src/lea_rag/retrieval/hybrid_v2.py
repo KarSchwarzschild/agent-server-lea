@@ -258,8 +258,8 @@ class HybridRetrieverV2:
             return hits
 
         try:
-            from lea_server.database import SessionLocal
-            from lea_server.models.knowledge import DocumentSection
+            from lea_rag.db import SessionLocal
+            from lea_rag.db.models import DocumentSection
 
             db = SessionLocal()
             try:

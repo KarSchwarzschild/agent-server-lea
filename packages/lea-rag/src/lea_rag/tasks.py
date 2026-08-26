@@ -39,8 +39,8 @@ def process_document(self, document_id: int) -> dict:
     logger = structlog.get_logger()
 
     try:
-        from lea_server.database import SessionLocal
-        from lea_server.services.kb_processor import DocumentProcessor
+        from lea_rag.db import SessionLocal
+        from lea_rag.services.kb_processor import DocumentProcessor
 
         db = SessionLocal()
         try:

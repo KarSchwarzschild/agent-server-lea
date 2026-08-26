@@ -30,8 +30,13 @@ import structlog
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from lea_authkit import install_internal_auth
+from lea_rag.server_admin_kb import router as admin_kb_router
+from lea_rag.server_admin_memory import router as admin_memory_router
 from lea_rag.server_kb import router as kb_router
 from lea_rag.server_memory import router as memory_router
+from lea_rag.server_user_kb import router as user_kb_router
+from lea_rag.server_user_memory import router as user_memory_router
 
 logger = structlog.get_logger()
 
@@ -47,11 +52,11 @@ async def lifespan(app: FastAPI):
 def _ensure_db_tables():
     """独立部署时确保 KB 相关表存在。"""
     try:
-        from lea_server.database import Base, engine
-        from lea_server.models.knowledge import (  # noqa: F401
+        from lea_rag.db import Base, engine
+        from lea_rag.db.models import (  # noqa: F401
             Document, DocumentChunk, DocumentSection, KnowledgeBase, RetrievalModel,
         )
-        from lea_server.models.chat_session import UserMemory  # noqa: F401
+        from lea_rag.db.models import UserMemory, UserProfile  # noqa: F401
 
         Base.metadata.create_all(bind=engine)
         logger.info("db_tables_ensured")
@@ -62,8 +67,8 @@ def _ensure_db_tables():
 
 def _seed_default_models():
     """首次启动时种入默认模型（如果 retrieval_models 表为空）。"""
-    from lea_server.database import SessionLocal
-    from lea_server.models.knowledge import RetrievalModel
+    from lea_rag.db import SessionLocal
+    from lea_rag.db.models import RetrievalModel
     from lea_rag.config import EmbeddingSettings, RerankerSettings, get_tenant_api_key
 
     db = SessionLocal()
@@ -138,13 +143,17 @@ app.add_middleware(
 
 app.include_router(kb_router)
 app.include_router(memory_router)
+app.include_router(admin_kb_router)
+app.include_router(admin_memory_router)
+app.include_router(user_kb_router)
+app.include_router(user_memory_router)
 
 
 @app.get("/models")
 async def list_available_models(model_type: str | None = None):
     """列出可用模型（供 Go 引擎创建 KB 时选择）。"""
-    from lea_server.database import SessionLocal
-    from lea_server.models.knowledge import RetrievalModel
+    from lea_rag.db import SessionLocal
+    from lea_rag.db.models import RetrievalModel
 
     db = SessionLocal()
     try:
@@ -171,3 +180,9 @@ async def list_available_models(model_type: str | None = None):
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "retrieval", "version": "0.1.0"}
+
+
+# 服务间鉴权挂在最后 —— 见 lea_authkit/internal_auth.py 顶部关于"为什么内网也要挡"。
+# 这个服务的接口面里除了 /kb /memory，还有 /admin/knowledge-bases/*（建库删库）和
+# /knowledge-bases、/memories（按 tenant_id 参数分租户，而那个参数是调用方说的）。
+install_internal_auth(app, service="lea-rag")

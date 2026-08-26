@@ -96,6 +96,7 @@ async def search_kb(body: KBSearchRequest):
         query_vector = vecs[0] if vecs else None
 
     all_hits: list = []
+    errors: list[str] = []
     for model_key, group_kb_ids in kb_groups.items():
         embedder = _get_embedder(model_key)
         retriever = HybridRetrieverV2(embedder=embedder)
@@ -111,7 +112,11 @@ async def search_kb(body: KBSearchRequest):
             )
             all_hits.extend(hits)
         except Exception as exc:
-            logger.error("kb_search_error", model=model_key, error=str(exc))
+            logger.error("kb_search_error", model=model_key, error=str(exc), exc_info=True)
+            errors.append(f"{model_key}: {exc}")
+
+    if not all_hits and errors:
+        raise HTTPException(500, f"检索失败: {'; '.join(errors)}")
 
     all_hits.sort(key=lambda h: h.score, reverse=True)
     all_hits = all_hits[:body.top_k]
@@ -137,8 +142,8 @@ def _get_visible_kb_ids(user_id: str, tenant_id: str) -> list[int] | None:
     if not user_id and not tenant_id:
         return None
     try:
-        from lea_server.database import SessionLocal
-        from lea_server.services.kb_service import KBService
+        from lea_rag.db import SessionLocal
+        from lea_rag.services.kb_service import KBService
 
         db = SessionLocal()
         try:
@@ -160,8 +165,8 @@ def _apply_metadata_filter(
     """根据 metadata JSON 条件在 DB 层过滤 KB 和 Document。"""
     try:
         from sqlalchemy import and_
-        from lea_server.database import SessionLocal
-        from lea_server.models.knowledge import KnowledgeBase, Document
+        from lea_rag.db import SessionLocal
+        from lea_rag.db.models import KnowledgeBase, Document
 
         db = SessionLocal()
         try:
@@ -193,8 +198,8 @@ def _group_kbs_by_model(kb_ids: list[int] | None) -> dict[str, list[int]]:
     if not kb_ids:
         return {"default": kb_ids or []}
     try:
-        from lea_server.database import SessionLocal
-        from lea_server.models.knowledge import KnowledgeBase
+        from lea_rag.db import SessionLocal
+        from lea_rag.db.models import KnowledgeBase
 
         db = SessionLocal()
         try:
@@ -235,8 +240,8 @@ def _get_embedder(model_key: str):
 def _get_model_info(model_name: str) -> dict | None:
     """从 DB 读取模型配置。"""
     try:
-        from lea_server.database import SessionLocal
-        from lea_server.models.knowledge import RetrievalModel
+        from lea_rag.db import SessionLocal
+        from lea_rag.db.models import RetrievalModel
 
         db = SessionLocal()
         try:
@@ -256,8 +261,8 @@ def _get_model_info(model_name: str) -> dict | None:
 def _get_default_embedding_model() -> str:
     """获取默认 embedding 模型名。"""
     try:
-        from lea_server.database import SessionLocal
-        from lea_server.models.knowledge import RetrievalModel
+        from lea_rag.db import SessionLocal
+        from lea_rag.db.models import RetrievalModel
 
         db = SessionLocal()
         try:
@@ -280,8 +285,8 @@ def _get_default_embedding_model() -> str:
 async def get_sections(body: SectionsRequest):
     """获取文档的章节树结构。"""
     try:
-        from lea_server.database import SessionLocal
-        from lea_server.models.knowledge import DocumentSection
+        from lea_rag.db import SessionLocal
+        from lea_rag.db.models import DocumentSection
 
         db = SessionLocal()
         try:
@@ -360,8 +365,8 @@ class KBOut(BaseModel):
 @router.post("/create", response_model=KBOut)
 async def create_kb(body: KBCreateRequest):
     """创建知识库。"""
-    from lea_server.database import SessionLocal
-    from lea_server.services.kb_service import KBService
+    from lea_rag.db import SessionLocal
+    from lea_rag.services.kb_service import KBService
 
     db = SessionLocal()
     try:
@@ -393,8 +398,8 @@ async def list_kbs(
     owner: str = "",
 ):
     """列出知识库。"""
-    from lea_server.database import SessionLocal
-    from lea_server.services.kb_service import KBService
+    from lea_rag.db import SessionLocal
+    from lea_rag.services.kb_service import KBService
 
     db = SessionLocal()
     try:
@@ -443,8 +448,8 @@ class KBConfigUpdateRequest(BaseModel):
 @router.get("/{kb_id}/config", response_model=KBConfigOut)
 async def get_kb_config(kb_id: int):
     """获取知识库检索配置。"""
-    from lea_server.database import SessionLocal
-    from lea_server.services.kb_service import KBService
+    from lea_rag.db import SessionLocal
+    from lea_rag.services.kb_service import KBService
 
     db = SessionLocal()
     try:
@@ -466,8 +471,8 @@ async def get_kb_config(kb_id: int):
 @router.put("/{kb_id}/config", response_model=KBConfigOut)
 async def update_kb_config(kb_id: int, body: KBConfigUpdateRequest):
     """更新知识库检索配置（策略、参数、可见性）。"""
-    from lea_server.database import SessionLocal
-    from lea_server.services.kb_service import KBService
+    from lea_rag.db import SessionLocal
+    from lea_rag.services.kb_service import KBService
 
     db = SessionLocal()
     try:
@@ -516,9 +521,9 @@ async def upload_document(
 ):
     """上传文档到知识库并启动后台处理。"""
     import json as _json
-    from lea_server.database import SessionLocal
-    from lea_server.services.kb_service import KBService
-    from lea_server.services.object_storage import ObjectStorage
+    from lea_rag.db import SessionLocal
+    from lea_rag.services.kb_service import KBService
+    from lea_rag.services.object_storage import ObjectStorage
 
     doc_metadata = {}
     try:
@@ -534,7 +539,8 @@ async def upload_document(
             raise HTTPException(404, "知识库不存在")
 
         file_ext = (file.filename or "file").rsplit(".", 1)[-1].lower()
-        if file_ext not in ("pdf", "txt", "md", "docx"):
+        allowed_ext = {"pdf", "txt", "md", "docx", "pptx", "png", "jpg", "jpeg", "webp", "gif", "bmp", "mp3", "wav", "m4a", "flac", "ogg"}
+        if file_ext not in allowed_ext:
             raise HTTPException(400, f"不支持的文件类型: {file_ext}")
 
         content = await file.read()
@@ -579,8 +585,8 @@ async def upload_document(
 @router.get("/{kb_id}/documents", response_model=list[DocumentOut])
 async def list_documents(kb_id: int):
     """列出知识库下的文档。"""
-    from lea_server.database import SessionLocal
-    from lea_server.services.kb_service import KBService
+    from lea_rag.db import SessionLocal
+    from lea_rag.services.kb_service import KBService
 
     db = SessionLocal()
     try:
@@ -602,8 +608,8 @@ async def list_documents(kb_id: int):
 @router.get("/{kb_id}/documents/{doc_id}", response_model=DocumentOut)
 async def get_document(kb_id: int, doc_id: int):
     """获取单个文档状态。"""
-    from lea_server.database import SessionLocal
-    from lea_server.services.kb_service import KBService
+    from lea_rag.db import SessionLocal
+    from lea_rag.services.kb_service import KBService
 
     db = SessionLocal()
     try:
@@ -623,8 +629,8 @@ async def get_document(kb_id: int, doc_id: int):
 @router.delete("/{kb_id}/documents/{doc_id}")
 async def delete_document(kb_id: int, doc_id: int):
     """删除文档及其向量。"""
-    from lea_server.database import SessionLocal
-    from lea_server.services.kb_service import KBService
+    from lea_rag.db import SessionLocal
+    from lea_rag.services.kb_service import KBService
 
     db = SessionLocal()
     try:

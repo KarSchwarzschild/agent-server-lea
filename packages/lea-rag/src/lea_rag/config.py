@@ -2,7 +2,55 @@
 
 from __future__ import annotations
 
+import os
+import urllib.parse
+from functools import lru_cache
+from pathlib import Path
+
+from dotenv import load_dotenv
+from pydantic import Field
 from pydantic_settings import BaseSettings
+
+_env_loaded = False
+
+
+def _ensure_env():
+    global _env_loaded
+    if not _env_loaded:
+        root = Path(__file__).parent.parent.parent.parent.parent
+        env_file = root / ".env"
+        if env_file.exists():
+            load_dotenv(env_file)
+        _env_loaded = True
+
+
+_ensure_env()
+
+
+class DatabaseSettings(BaseSettings):
+    host: str = Field(default="localhost", alias="DB_HOST")
+    port: int = Field(default=3306, alias="DB_PORT")
+    user: str = Field(default="root", alias="DB_USER")
+    password: str = Field(default="", alias="DB_PASSWORD")
+    name: str = Field(default="lea-platform-test", alias="DB_NAME")
+
+    model_config = {"env_file": ".env", "extra": "ignore"}
+
+    @property
+    def url(self) -> str:
+        if self.host in ("sqlite", ""):
+            return f"sqlite:///{Path(self.name).with_suffix('.db')}"
+        pwd = urllib.parse.quote_plus(self.password)
+        return f"mysql+pymysql://{self.user}:{pwd}@{self.host}:{self.port}/{self.name}?charset=utf8mb4"
+
+
+class StorageSettings(BaseSettings):
+    endpoint: str = Field(default="http://localhost:9000", alias="MINIO_ENDPOINT")
+    access_key: str = Field(default="minioadmin", alias="MINIO_ACCESS_KEY")
+    secret_key: str = Field(default="minioadmin", alias="MINIO_SECRET_KEY")
+    bucket: str = Field(default="lea-uploads", alias="MINIO_BUCKET")
+
+    model_config = {"env_file": ".env", "extra": "ignore"}
 
 
 class MilvusSettings(BaseSettings):
@@ -63,3 +111,13 @@ class RAGSettings(BaseSettings):
     section_boost: bool = True
 
     model_config = {"env_prefix": "LEA_RAG_"}
+
+
+@lru_cache
+def get_database_settings() -> DatabaseSettings:
+    return DatabaseSettings()
+
+
+@lru_cache
+def get_storage_settings() -> StorageSettings:
+    return StorageSettings()

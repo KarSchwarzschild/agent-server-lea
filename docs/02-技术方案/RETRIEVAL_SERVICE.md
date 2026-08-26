@@ -64,11 +64,12 @@
 | 输入 | 解析方式 | 产出文字 | 向量化 |
 |------|---------|---------|--------|
 | PDF | MinerU → text/image/table blocks | text 直接用；image → VLM | text embed |
-| DOCX/PPTX | python-docx/pptx 提取 | 文本 + 图片 → VLM | text embed |
+| DOCX | python-docx → 段落+表格+内嵌图片 | text 直接用；image → VLM | text embed |
+| PPTX | python-pptx → 逐 slide 文本+图片 | text 直接用；image → VLM | text embed |
+| 图片 (png/jpg/webp) | 直接读 base64 | VLM → 描述文字 | text embed |
 | TXT/MD | 直接读 | 原文 | text embed |
-| 图片 (png/jpg) | — | VLM → 描述文字 | text embed |
-| 音频 (mp3/wav) | — | ASR → 转写 | text embed (P2) |
-| 视频 (mp4) | 拆音频 + 关键帧 | ASR + VLM | text embed (P2) |
+| 音频 (mp3/wav/m4a) | — | ASR → 转写 | text embed |
+| 视频 (mp4) | 拆音频 + 关键帧 | ASR + VLM | text embed (待做) |
 
 ### 处理流程
 
@@ -330,7 +331,8 @@ POST /kb/search
 
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
-| `query` | string | ✅ | — | 检索关键词（min_length=1） |
+| `query` | string | * | "" | 文本检索关键词 |
+| `image` | string | * | null | 图片 base64（跨模态检索） |
 | `top_k` | int | — | 5 | 返回结果数 |
 | `kb_ids` | int[] | — | null | 指定知识库 ID；null 则按 visibility 自动过滤 |
 | `document_ids` | int[] | — | null | 精确到文档级过滤 |
@@ -338,6 +340,8 @@ POST /kb/search
 | `user_id` | string | — | "" | 用户 ID（用于 visibility 过滤） |
 | `strategy` | string | — | "hybrid" | hybrid / semantic / keyword |
 | `metadata_filter` | object | — | null | DB 层 JSON 过滤（如 `{"subject":"数学"}`) |
+
+> `*` query 和 image 至少提供一个。image 提供时自动走 semantic 模式。
 
 **返回** `SearchHitOut[]`：
 
@@ -579,7 +583,7 @@ DELETE /admin/retrieval/strategies/{id}   删除策略
 
 ---
 
-## 待实现
+## 实现状态
 
 | 优先级 | 项目 | 状态 |
 |--------|------|------|
@@ -589,11 +593,13 @@ DELETE /admin/retrieval/strategies/{id}   删除策略
 | P0 | 知识库 CRUD + 多级共享 + metadata 过滤 | ✅ |
 | P0 | Celery 异步文档处理 | ✅ |
 | P0 | 记忆系统 (CRUD + scope + 语义检索) | ✅ |
-| **P1** | **模型注册 + 策略模板 Admin API** | 待做 |
-| **P1** | **VLM 接入（图片 → 文字描述）** | 待做 |
-| **P1** | **DOCX/PPTX 解析器** | 待做 |
-| P2 | ASR 接入（音视频 → 文字） | 待做 |
-| P2 | 多模态 embed 增强 | 已有骨架 |
+| P0 | 模型注册表 (RetrievalModel) + per-KB 模型选择 | ✅ |
+| P0 | VLM 接入（qwen3-vl-plus → 图片描述 → text embed） | ✅ |
+| P0 | 跨模态检索（文搜图 — VLM caption 路径） | ✅ |
+| P0 | 多格式文档支持（DOCX/PPTX/图片） | ✅ |
+| P1 | 策略模板 Admin API | 待做 |
+| P1 | ASR 音频转写（骨架就绪，需部署 ASR 服务） | 骨架就绪 |
+| P2 | 多模态 embed 增强（Jina v5 Omni 等多模态模型就绪后启用） | 骨架就绪 |
 | P2 | 视频关键帧 + 分段处理 | 待做 |
 
 > **PageIndex** 已从检索服务中移出，作为独立服务设计（单独文档）。

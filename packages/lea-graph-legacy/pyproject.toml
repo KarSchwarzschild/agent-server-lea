@@ -1,7 +1,7 @@
 [project]
-name = "lea-graph"
+name = "lea-graph-legacy"
 version = "0.1.0"
-description = "LEA Platform Agent框架层（LangChain + LangGraph）"
+description = "LEGACY: retired LEA LangGraph agent framework layer"
 requires-python = ">=3.11"
 dependencies = [
     "langchain-core>=0.3",

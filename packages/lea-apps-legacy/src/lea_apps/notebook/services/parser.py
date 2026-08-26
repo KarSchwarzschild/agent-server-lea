@@ -346,6 +346,17 @@ def _chunk_md_fallback(md_content: str) -> list[dict]:
 
 def parse_document(file_path: str, parser: str = "mineru") -> dict:
     """统一入口。返回 {md_content, text_chunks, image_items}。"""
+    ext = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
+
+    if ext == "docx":
+        return parse_docx(file_path)
+    if ext == "pptx":
+        return parse_pptx(file_path)
+    if ext in ("png", "jpg", "jpeg", "webp", "gif", "bmp"):
+        return parse_image(file_path)
+    if ext in ("mp3", "wav", "m4a", "flac", "ogg"):
+        return parse_audio(file_path)
+
     if parser == "mineru":
         try:
             return parse_pdf_mineru(file_path)
@@ -353,3 +364,132 @@ def parse_document(file_path: str, parser: str = "mineru") -> dict:
             logger.warning("mineru_fallback", error=str(exc))
             return parse_pdf_pymupdf(file_path)
     return parse_pdf_pymupdf(file_path)
+
+
+def parse_docx(file_path: str) -> dict:
+    """DOCX 解析 — python-docx 提取段落 + 表格 + 内嵌图片。"""
+    import base64
+
+    from docx import Document as DocxDocument
+
+    doc = DocxDocument(file_path)
+    text_blocks: list[dict] = []
+    image_items: list[dict] = []
+
+    for i, para in enumerate(doc.paragraphs):
+        text = para.text.strip()
+        if text:
+            text_blocks.append({"text": text, "page_idx": 0})
+
+    for table in doc.tables:
+        rows_text = []
+        for row in table.rows:
+            cells = [cell.text.strip() for cell in row.cells]
+            rows_text.append(" | ".join(cells))
+        table_text = "\n".join(rows_text)
+        if table_text.strip():
+            text_blocks.append({"text": f"表格：\n{table_text}", "page_idx": 0})
+
+    for rel in doc.part.rels.values():
+        if "image" in rel.reltype:
+            try:
+                img_data = rel.target_part.blob
+                b64 = base64.b64encode(img_data).decode()
+                image_items.append({
+                    "base64": b64,
+                    "page_idx": 0,
+                    "caption": "",
+                    "img_path": rel.target_ref,
+                })
+            except Exception:
+                pass
+
+    md_content = "\n\n".join(b["text"] for b in text_blocks)
+    text_chunks = chunk_text_blocks(text_blocks)
+    return {"md_content": md_content, "text_chunks": text_chunks, "image_items": image_items}
+
+
+def parse_pptx(file_path: str) -> dict:
+    """PPTX 解析 — python-pptx 逐 slide 提取文本 + 图片。"""
+    import base64
+
+    from pptx import Presentation
+    from pptx.enum.shapes import MSO_SHAPE_TYPE
+
+    prs = Presentation(file_path)
+    text_blocks: list[dict] = []
+    image_items: list[dict] = []
+
+    for slide_idx, slide in enumerate(prs.slides):
+        slide_texts: list[str] = []
+        for shape in slide.shapes:
+            if shape.has_text_frame:
+                for para in shape.text_frame.paragraphs:
+                    text = para.text.strip()
+                    if text:
+                        slide_texts.append(text)
+            if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                try:
+                    img_data = shape.image.blob
+                    b64 = base64.b64encode(img_data).decode()
+                    image_items.append({
+                        "base64": b64,
+                        "page_idx": slide_idx,
+                        "caption": "",
+                        "img_path": f"slide_{slide_idx + 1}.png",
+                    })
+                except Exception:
+                    pass
+            if shape.has_table:
+                rows_text = []
+                for row in shape.table.rows:
+                    cells = [cell.text.strip() for cell in row.cells]
+                    rows_text.append(" | ".join(cells))
+                table_text = "\n".join(rows_text)
+                if table_text.strip():
+                    slide_texts.append(f"表格：\n{table_text}")
+
+        if slide_texts:
+            combined = "\n".join(slide_texts)
+            text_blocks.append({"text": combined, "page_idx": slide_idx})
+
+    md_content = "\n\n".join(b["text"] for b in text_blocks)
+    text_chunks = chunk_text_blocks(text_blocks)
+    return {"md_content": md_content, "text_chunks": text_chunks, "image_items": image_items}
+
+
+def parse_image(file_path: str) -> dict:
+    """图片文件直接入库 — 不做文本提取，由 kb_processor 走 VLM/multimodal 路径。"""
+    import base64
+
+    with open(file_path, "rb") as f:
+        img_data = f.read()
+
+    b64 = base64.b64encode(img_data).decode()
+    filename = os.path.basename(file_path)
+    image_items = [{
+        "base64": b64,
+        "page_idx": 0,
+        "caption": "",
+        "img_path": filename,
+    }]
+    return {"md_content": "", "text_chunks": [], "image_items": image_items}
+
+
+def parse_audio(file_path: str) -> dict:
+    """音频文件解析骨架 — 需要 ASR 服务就绪后启用。
+
+    当前行为：返回空文本 + 音频元信息，由 kb_processor 调用 ASR 转写。
+    """
+    filename = os.path.basename(file_path)
+    file_size = os.path.getsize(file_path)
+    return {
+        "md_content": "",
+        "text_chunks": [],
+        "image_items": [],
+        "audio_items": [{
+            "file_path": file_path,
+            "filename": filename,
+            "file_size": file_size,
+        }],
+    }

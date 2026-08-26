@@ -45,6 +45,7 @@ class DocumentProcessor:
             parse_result = self._parse(file_path, doc.file_type)
             sections = self._extract_sections(doc, kb, parse_result)
             parse_result["sections"] = sections
+            self._process_audio(doc, kb, parse_result)
             chunks = self._save_chunks(doc, kb, parse_result)
             self._index_vectors(doc, kb, chunks)
             self._index_images(doc, kb, parse_result)
@@ -124,7 +125,7 @@ class DocumentProcessor:
         """解析文档，复用 Notebook 的 parser 逻辑。"""
         from lea_apps.notebook.services.parser import parse_document
 
-        if file_type in ("pdf",):
+        if file_type in ("pdf", "docx", "pptx", "png", "jpg", "jpeg", "webp", "gif", "bmp", "mp3", "wav", "m4a", "flac", "ogg"):
             return parse_document(file_path, parser="mineru")
 
         from lea_apps.notebook.services.parser import _chunk_md_fallback
@@ -361,4 +362,56 @@ class DocumentProcessor:
             return resp.json()["choices"][0]["message"]["content"]
         except Exception as exc:
             logger.warning("vlm_caption_failed", error=str(exc))
+            return ""
+
+    def _process_audio(self, doc: Document, kb: KnowledgeBase, parse_result: dict) -> None:
+        """处理音频：调用 ASR 将语音转为文字，追加到 text_chunks。"""
+        audio_items = parse_result.get("audio_items", [])
+        if not audio_items:
+            return
+
+        from lea_server.models.knowledge import RetrievalModel
+
+        m = self.db.query(RetrievalModel).filter(
+            RetrievalModel.model_type == "asr",
+            RetrievalModel.enabled == True,
+        ).first()
+        if not m:
+            logger.warning("asr_not_configured", document_id=doc.id)
+            return
+
+        for item in audio_items:
+            transcript = self._asr_transcribe(m, item.get("file_path", ""))
+            if transcript:
+                from lea_apps.notebook.services.parser import chunk_text_blocks
+                blocks = [{"text": transcript, "page_idx": 0}]
+                chunks = chunk_text_blocks(blocks)
+                for c in chunks:
+                    c["type"] = "audio_transcript"
+                parse_result.setdefault("text_chunks", []).extend(chunks)
+                parse_result["md_content"] = (parse_result.get("md_content", "") + "\n\n" + transcript).strip()
+                logger.info("asr_transcribed", document_id=doc.id, length=len(transcript))
+
+    def _asr_transcribe(self, model, file_path: str) -> str:
+        """调用 ASR 服务转写音频。"""
+        import httpx
+
+        if not file_path or not os.path.exists(file_path):
+            return ""
+        try:
+            headers = {}
+            if model.api_key:
+                headers["Authorization"] = f"Bearer {model.api_key}"
+            with open(file_path, "rb") as f:
+                resp = httpx.post(
+                    f"{model.api_base.rstrip('/')}/v1/audio/transcriptions",
+                    headers=headers,
+                    files={"file": (os.path.basename(file_path), f)},
+                    data={"model": model.model_name or model.name},
+                    timeout=120.0,
+                )
+            resp.raise_for_status()
+            return resp.json().get("text", "")
+        except Exception as exc:
+            logger.warning("asr_failed", error=str(exc))
             return ""

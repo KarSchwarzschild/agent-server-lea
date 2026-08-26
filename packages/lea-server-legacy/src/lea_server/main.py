@@ -20,27 +20,14 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from lea_server.api.admin import router as admin_router
-from lea_server.api.admin_agent_bindings import router as admin_agent_bindings_router
-from lea_server.api.admin_agents import router as admin_agents_router
-from lea_server.api.admin_knowledge import router as admin_knowledge_router
-from lea_server.api.admin_mcp_servers import router as admin_mcp_servers_router
-from lea_server.api.admin_skills import router as admin_skills_router
-from lea_server.api.admin_teams import router as admin_teams_router
-from lea_server.api.admin_memories import router as admin_memories_router
-from lea_server.api.admin_models import router as admin_models_router
-from lea_server.api.memories import router as memories_router
-from lea_server.api.admin_tools import router as admin_tools_router
-from lea_server.api.admin_users import router as admin_users_router
-from lea_server.api.agents import router as agents_router
 from lea_server.api.artifact import router as artifact_router
 from lea_server.api.attachment import router as attachment_router
 from lea_server.api.auth import router as auth_router
 from lea_server.api.chat import router as chat_router
 from lea_server.api.health import router as health_router
-from lea_server.api.knowledge import router as knowledge_router
+from lea_server.api.internal import router as internal_router
 from lea_server.api.session import router as session_router
 from lea_server.api.super_agent import router as super_agent_router
-from lea_server.api.user_skills import router as user_skills_router
 from lea_server.config import LEA_ENV, get_settings
 from lea_server.core.middleware import RequestTraceMiddleware, TenantMiddleware
 from lea_server.core.tenant import enable_tenant_filter
@@ -620,21 +607,8 @@ app.include_router(session_router, prefix="/api")
 app.include_router(attachment_router, prefix="/api")
 app.include_router(artifact_router)
 app.include_router(admin_router, prefix="/api")
-app.include_router(admin_knowledge_router, prefix="/api")
-app.include_router(admin_skills_router, prefix="/api")
-app.include_router(admin_tools_router, prefix="/api")
-app.include_router(admin_agents_router, prefix="/api")
-app.include_router(admin_agent_bindings_router, prefix="/api")
-app.include_router(admin_mcp_servers_router, prefix="/api")
-app.include_router(admin_users_router, prefix="/api")
-app.include_router(admin_teams_router, prefix="/api")
-app.include_router(admin_memories_router, prefix="/api")
-app.include_router(admin_models_router, prefix="/api")
-app.include_router(memories_router, prefix="/api")
-app.include_router(knowledge_router, prefix="/api")
-app.include_router(user_skills_router, prefix="/api")
 app.include_router(super_agent_router, prefix="/api")
-app.include_router(agents_router, prefix="/api")
+app.include_router(internal_router, prefix="/api")
 # 让 /api/super-agent/chat/stream 复用 chat_router 的 /chat/stream 实现
 app.include_router(chat_router, prefix="/api/super-agent")
 

@@ -32,6 +32,15 @@ class Agent(TenantMixin, Base):
     example_questions = Column(JSON, default=list)
     sort_order = Column(Integer, default=0)
 
+    # ── 运行时配置（Go 引擎读取）─────────────────────────────
+    model = Column(String(100), default="")  # LLM 模型名，空=使用租户默认
+    temperature = Column(Integer, default=7)  # x10 存储: 7 = 0.7
+    max_turns = Column(Integer, default=20)  # agent loop 最大轮次
+    max_tokens = Column(Integer, default=4096)  # 单轮最大输出 token
+    kb_mode = Column(String(20), default="tool")  # always / tool / off
+    memory_mode = Column(String(20), default="always")  # always / tool / off
+    timeout_seconds = Column(Integer, default=120)  # 整个 agent 执行超时
+
     # ── 生命周期 / 权限 ───────────────────────────────────────
     is_system = Column(Boolean, default=False, index=True)
     enabled = Column(Boolean, default=True, index=True)

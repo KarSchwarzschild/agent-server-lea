@@ -1,11 +1,11 @@
 [project]
-name = "lea-server"
+name = "lea-server-legacy"
 version = "0.1.0"
-description = "LEA Platform 服务层（FastAPI）"
+description = "LEGACY: retired LEA FastAPI monolith/service layer"
 requires-python = ">=3.11"
 dependencies = [
-    "lea-graph",
-    "lea-apps",
+    "lea-graph-legacy",
+    "lea-apps-legacy",
     "fastapi>=0.109",
     "uvicorn[standard]>=0.27",
     "sqlalchemy>=2.0",
@@ -21,8 +21,8 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-lea-graph = { workspace = true }
-lea-apps = { workspace = true }
+lea-graph-legacy = { workspace = true }
+lea-apps-legacy = { workspace = true }
 
 [build-system]
 requires = ["hatchling"]

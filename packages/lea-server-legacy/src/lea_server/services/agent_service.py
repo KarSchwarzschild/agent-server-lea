@@ -34,6 +34,13 @@ _SYSTEM_EDITABLE_COLS = {
     "category",
     "example_questions",
     "sort_order",
+    "model",
+    "temperature",
+    "max_turns",
+    "max_tokens",
+    "kb_mode",
+    "memory_mode",
+    "timeout_seconds",
 }
 
 # 普通 Agent 允许通过 PUT 编辑的字段
@@ -47,6 +54,13 @@ _UI_EDITABLE_COLS = {
     "category",
     "example_questions",
     "sort_order",
+    "model",
+    "temperature",
+    "max_turns",
+    "max_tokens",
+    "kb_mode",
+    "memory_mode",
+    "timeout_seconds",
 }
 
 
@@ -108,6 +122,13 @@ class AgentService:
         category: str = "general",
         example_questions: list[str] | None = None,
         sort_order: int = 0,
+        model: str = "",
+        temperature: int = 7,
+        max_turns: int = 20,
+        max_tokens: int = 4096,
+        kb_mode: str = "tool",
+        memory_mode: str = "always",
+        timeout_seconds: int = 120,
     ) -> Agent:
         agent = Agent(
             tenant_id=tenant_id,
@@ -122,6 +143,13 @@ class AgentService:
             category=category,
             example_questions=example_questions or [],
             sort_order=sort_order,
+            model=model,
+            temperature=temperature,
+            max_turns=max_turns,
+            max_tokens=max_tokens,
+            kb_mode=kb_mode,
+            memory_mode=memory_mode,
+            timeout_seconds=timeout_seconds,
         )
         self.db.add(agent)
         try:
@@ -254,6 +282,13 @@ class AgentService:
             "category": agent.category or "general",
             "example_questions": agent.example_questions or [],
             "sort_order": agent.sort_order or 0,
+            "model": agent.model or "",
+            "temperature": agent.temperature if agent.temperature is not None else 7,
+            "max_turns": agent.max_turns or 20,
+            "max_tokens": agent.max_tokens or 4096,
+            "kb_mode": agent.kb_mode or "tool",
+            "memory_mode": agent.memory_mode or "always",
+            "timeout_seconds": agent.timeout_seconds or 120,
             "is_system": agent.is_system,
             "enabled": agent.enabled,
             "created_by": agent.created_by,

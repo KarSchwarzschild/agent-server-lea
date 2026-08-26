@@ -175,8 +175,44 @@ func ExecuteRemoteTool(ctx context.Context, toolName string, params map[string]a
 		Status string          `json:"status"`
 		Result json.RawMessage `json:"result"`
 		Error  string          `json:"error"`
+		// FastAPI 的 HTTPException 走的是 `detail`，跟上面三个字段一个都不重合。
+		Detail json.RawMessage `json:"detail"`
 	}
 	json.Unmarshal(rawBody, &result)
+
+	// ⚠️ 状态码必须先看。
+	//
+	// 以前这里完全不看 resp.StatusCode，只看 body 里的 status/error/result。
+	// 而 lea-tools 的拒绝路径 raise 的是 HTTPException，body 形如
+	//
+	//     {"detail": "tool 'my__stock_lookup' not found"}
+	//
+	// 三个字段全是零值 → 不算 error → result 为 nil → 掉进最后那个分支，
+	// 返回 **Text:"ok" 且 IsError:false**。于是 403 / 404 / 429 / 500 一律以
+	// "工具调用成功、但没有内容" 的形式交给模型。
+	//
+	// 后果不是"报错难看"，是**模型会编**。实测：一个够不着的私有工具，模型收到
+	// "ok" 之后回了「该库位位于 B-12 区，现有库存 245 件」—— 上游真实返回的是
+	// 青鸾-7F / 2291，而这次调用根本没到上游。凭空捏造的数字，语气还很确定。
+	//
+	// 所以这里宁可把错误原样交给模型：它下一轮能自己纠正（换个工具、或者说查不到），
+	// 而"成功但空"这个信号会让它以为拿到了数据。
+	if resp.StatusCode >= 400 {
+		msg := strings.TrimSpace(detailText(result.Detail))
+		if msg == "" {
+			msg = strings.TrimSpace(result.Error)
+		}
+		if msg == "" {
+			// 兜底带上原始 body 的开头 —— 空错误信息比错误本身更难查。
+			msg = fmt.Sprintf("HTTP %d: %s", resp.StatusCode,
+				string(rawBody[:min(200, len(rawBody))]))
+		}
+		fmt.Printf("[gateway] %s denied status=%d msg=%s\n", toolName, resp.StatusCode, msg)
+		return tool.Result{
+			Content: []tool.ResultContent{{Type: tool.ResultContentTypeText, Text: msg}},
+			IsError: true,
+		}, nil
+	}
 
 	if result.Error != "" || result.Status == "error" {
 		errMsg := result.Error
@@ -197,4 +233,38 @@ func ExecuteRemoteTool(ctx context.Context, toolName string, params map[string]a
 	return tool.Result{
 		Content: []tool.ResultContent{{Type: tool.ResultContentTypeText, Text: "ok"}},
 	}, nil
+}
+
+// detailText 把 FastAPI 的 `detail` 摊平成一行给模型看的文字。
+//
+// 两种形状都要认，因为它们来自两条不同的路径：
+//
+//	"tool 'x' not found"                     HTTPException(404, "...")  ← 我们自己抛的
+//	[{"loc":[...],"msg":"field required"}]   422 请求体校验         ← pydantic 抛的
+//
+// 后一种以前根本到不了模型面前（整个错误分支都不走），所以"参数发错了"的表现是
+// 工具静默返回 ok。摊平成 msg 拼接，模型下一轮能照着改。
+func detailText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s
+	}
+	var items []struct {
+		Msg string `json:"msg"`
+	}
+	if json.Unmarshal(raw, &items) == nil {
+		msgs := make([]string, 0, len(items))
+		for _, it := range items {
+			if it.Msg != "" {
+				msgs = append(msgs, it.Msg)
+			}
+		}
+		if len(msgs) > 0 {
+			return strings.Join(msgs, "; ")
+		}
+	}
+	return string(raw) // 认不出来就原样给出去，总比丢掉强
 }

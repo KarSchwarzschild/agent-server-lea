@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -165,7 +166,16 @@ func TestProvisionCarriesPlatformToolsExceptMemoryAdd(t *testing.T) {
 	for _, tl := range ts.Tools() {
 		names[tl.Name()] = true
 	}
-	for _, want := range []string{"code_interpreter", "kb_search", "memory_search"} {
+	// get_plan 在这份里：转交链上执行第 3 步的专家，得看得到整体计划才不会跑偏。
+	//
+	// WebSearch / WebFetch 也在：它们是引擎自带的，但我们此前一个都没注册 ——
+	// build.go 一看到 opts.ToolRuntime 非 nil 就整个替换掉本地 runtime，于是
+	// tools.Builtins() 那批全没进来。规划态下它们是放行的（network 不算 mutating），
+	// 所以对一个只配了业务 API 的 agent，这是规划阶段唯一的外部信息来源。
+	for _, want := range []string{
+		"code_interpreter", "kb_search", "memory_search", "get_plan",
+		"WebSearch", "WebFetch",
+	} {
 		if !names[want] {
 			t.Errorf("Provision 的工具集里缺 %q —— 子代理会拿不到它", want)
 		}
@@ -173,15 +183,43 @@ func TestProvisionCarriesPlatformToolsExceptMemoryAdd(t *testing.T) {
 	if names["memory_add"] {
 		t.Error("memory_add 不该在 Provision 里 —— 子代理是临时的，不该写用户长期记忆")
 	}
-
-	// 而 memory_add 必须在主会话那份里，否则谁都写不了记忆
-	mainOnly := BuildMainSessionTools(cfg, "tenant-a", "user-a")
-	if len(mainOnly) != 1 || mainOnly[0].Name() != "memory_add" {
-		t.Errorf("主会话专属工具应只有 memory_add，实际 %v", toolNamesOf(mainOnly))
+	// 计划的两个写工具反过来：子代理拿到就能改用户批准过的计划、或者替一个没人
+	// 验收的产出标"完成"。
+	for _, forbidden := range []string{"save_plan", "update_plan_step"} {
+		if names[forbidden] {
+			t.Errorf("%q 不该在 Provision 里 —— 子代理不该改用户批准过的计划", forbidden)
+		}
 	}
-	// memory 关掉时两边都不该有
-	if got := BuildMainSessionTools(&AgentConfig{MemoryMode: "off"}, "t", "u"); len(got) != 0 {
-		t.Errorf("memory_mode=off 时不该有 memory_add，实际 %v", toolNamesOf(got))
+
+	// 而 memory_add 必须在主会话那份里，否则谁都写不了记忆。
+	//
+	// 计划的两个**写**工具（save_plan / update_plan_step）也在这里，且**始终注册** ——
+	// 计划模式是所有 agent 都支持的能力，没有按 agent 的开关。只读的 get_plan 在
+	// Provision 那份里，专家要看得到整体计划才不会跑偏 —— 上面的 want 列表钉着它。
+	mainOnly := BuildMainSessionTools(cfg, "tenant-a", "user-a", "sess-a")
+	if len(mainOnly) != 3 {
+		t.Fatalf("主会话专属工具应有 3 个 (save_plan + update_plan_step + memory_add)，实际 %d: %v",
+			len(mainOnly), toolNamesOf(mainOnly))
+	}
+	names = map[string]bool{}
+	for _, tl := range mainOnly {
+		names[tl.Name()] = true
+	}
+	if !names["save_plan"] {
+		t.Error("主会话专属工具应包含 save_plan")
+	}
+	if !names["update_plan_step"] {
+		t.Error("主会话专属工具应包含 update_plan_step")
+	}
+	if !names["memory_add"] {
+		t.Error("主会话专属工具应包含 memory_add")
+	}
+
+	// memory 关掉时只剩计划那两个 —— 它们的注册不跟着 memory 配置走，
+	// 计划持久化跟记忆是两回事。
+	got := toolNamesOf(BuildMainSessionTools(&AgentConfig{MemoryMode: "off"}, "t", "u", "s"))
+	if !reflect.DeepEqual(got, []string{"save_plan", "update_plan_step"}) {
+		t.Errorf("memory_mode=off 时应只剩 save_plan + update_plan_step，实际 %v", got)
 	}
 }
 

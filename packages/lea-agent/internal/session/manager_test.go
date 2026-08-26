@@ -53,9 +53,22 @@ func TestGetOrCreate_RefusesOtherUsersSession(t *testing.T) {
 	}
 }
 
-// session_id 不存在时不能走进归属校验、也不能直接报 forbidden —— 那会暴露
-// "这个 id 存在与否"。应该落到正常的新建流程（这里因为没有 config 服务会失败，
-// 但错误不该是 ErrForbidden）。
+// 库里不存在的 session_id 应该落到正常的新建流程，不能报 forbidden
+// （这里因为没有 config 服务会失败，但错误不该是 ErrForbidden）。
+//
+// ⚠️ 这条测试原本的注释还写着"不能走进归属校验"，现在**不成立了** —— 内存里没有
+// 这个 id 时会去查一次库，见 verifySessionOwner。改动的原因是那条路径上有一个实测
+// 到的跨用户历史泄漏（详见 ownership_test.go 顶部）。
+//
+// 原注释担心的"暴露 id 存在与否"确实被引入了：给一个别人的 id 会拿到 403，
+// 给一个不存在的 id 会走到新建（200 或配置错误）。这个存在性预言是**有意接受**的：
+//
+//   - session_id 是 UUIDv4，猜不出来，所以枚举不可行；预言只在"已经拿到某个具体
+//     id"时才给出一个比特的信息，而那种情况下"这不是你的"本来就必须告诉调用方。
+//   - 另一边的代价是确定的、已复现的数据泄漏（别人的对话历史进 LLM 上下文）。
+//
+// 两害相权很清楚。但如果哪天 session_id 变成可枚举的（自增、按时间戳派生等），
+// 这个取舍要重新算。
 func TestGetOrCreate_UnknownSessionIsNotForbidden(t *testing.T) {
 	m := newTestManager()
 	_, err := m.GetOrCreate(context.Background(), Params{

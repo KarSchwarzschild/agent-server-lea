@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"gitlab.ouc-online.com.cn/aibase/agentloop/tool"
+	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/persistence"
 )
 
 var ragServiceURL = getEnv("LEA_RAG_URL", "http://localhost:8300")
@@ -82,21 +83,18 @@ func BuildPlatformTools(cfg *AgentConfig, tenantID, userID, sessionID string) []
 		})
 	}
 
-	// activate_skill 已退役 —— skill 披露走引擎的 Skill 工具（见 skill_discloser.go）。
-	//
-	// 换掉它的理由不是文案，是**注册位置**：它在 ExtraTools 里，而那是在 build.go 的
-	// 子代理快照**之后**才 append 的，所以任何子代理和专家都拿不到它。而"专家把 skill
-	// 执行派给子代理"要求子代理必须能加载 skill。引擎的 Skill 工具注册在快照之前，
-	// 天然被继承。
-	//
-	// 两个不能并存：工具名不同（activate_skill / Skill）所以装配不会失败，但两个工具做
-	// 同一件事，模型会随机挑一个，而其中一个的引导指向拿不到的通路。
-	//
-	// ActivateSkillTool 的类型定义暂时保留（下面 builtins map 里也还挡着这个名字），
-	// 等真机验过 Skill 通路再删，免得回退时无处可退。
+	// get_plan 是只读的，**专家和子代理都该有**：转交链里执行第 3 步的那个专家，
+	// 得看得到整体计划才不会跑偏。写那两个（save_plan / update_plan_step）在
+	// BuildMainSessionTools —— 子代理改不了用户批准过的契约，标"完成"也轮不到一个
+	// 没人验收的产出来推进进度。
+	tools = append(tools, &GetPlanTool{tenantID: tenantID, sessionID: sessionID})
 
 	// 动态工具：从 lea-config 拿到的工具定义，执行走 lea-tools 网关
-	builtins := map[string]bool{"kb_search": true, "memory_search": true, "memory_add": true, "code_interpreter": true, "activate_skill": true}
+	builtins := map[string]bool{
+		"kb_search": true, "memory_search": true, "memory_add": true,
+		"save_plan": true, "get_plan": true, "update_plan_step": true,
+		"code_interpreter": true,
+	}
 	for _, td := range cfg.Tools {
 		if builtins[td.Name] {
 			continue
@@ -114,18 +112,284 @@ func BuildPlatformTools(cfg *AgentConfig, tenantID, userID, sessionID string) []
 // BuildMainSessionTools 返回**只有主会话该拿到**的平台工具，走 Options.ExtraTools
 // （快照之后 append，所以子代理拿不到）。
 //
-// 目前只有 memory_add。它写的是用户跨会话的长期记忆，而子代理是临时的 —— 它的历史
-// 用完即弃，让它往用户的长期记忆里写东西，语义上说不通：那条记忆的来由在子代理结束
-// 时就消失了，只剩一条没人能追溯的记录。
+// 目前有 save_plan 和 memory_add。memory_add 写的是用户跨会话的长期记忆，而子代理是
+// 临时的 —— 它的历史用完即弃，让它往用户的长期记忆里写东西，语义上说不通：那条记忆的
+// 来由在子代理结束时就消失了，只剩一条没人能追溯的记录。save_plan 同理：计划属于
+// 主会话的生命周期，子代理不该改它。
 //
 // 这跟引擎对自己的 Remember 工具的处理是同一条线：build.go 把它放在快照之后，注释写着
 // "sub-agents read memory but cannot write it — only the main session saves new
 // memories"。读走 BuildPlatformTools 的 memory_search，写留在这里。
-func BuildMainSessionTools(cfg *AgentConfig, tenantID, userID string) []tool.Tool {
-	if cfg == nil || cfg.MemoryMode == "off" {
-		return nil
+func BuildMainSessionTools(cfg *AgentConfig, tenantID, userID, sessionID string) []tool.Tool {
+	var tools []tool.Tool
+	// 计划的两个**写**工具。始终注册 —— 计划模式是所有 agent 都支持的能力，
+	// 不跟着 memory 配置走（计划持久化跟记忆是两回事），也没有按 agent 的开关：
+	// 要不要进规划态是**每次请求**带来的（SendRequest.plan_mode），不是配置出来的。
+	// 只读的 get_plan 在 BuildPlatformTools，专家也拿得到。
+	tools = append(tools,
+		&SavePlanTool{tenantID: tenantID, sessionID: sessionID},
+		&UpdatePlanStepTool{tenantID: tenantID, sessionID: sessionID},
+	)
+	// memory_add 只在 memory 开启时注册
+	if cfg != nil && cfg.MemoryMode != "off" {
+		tools = append(tools, &MemoryAddTool{tenantID: tenantID, userID: userID})
 	}
-	return []tool.Tool{&MemoryAddTool{tenantID: tenantID, userID: userID}}
+	return tools
+}
+
+// ── SavePlan Tool ─────────────────────────────────────────
+//
+// save_plan 是给 agent 的显式工具，也是计划的**唯一写入口**：用它提交或修订计划，
+// 不依赖 plan_mode 开关。这样执行中发现计划要改时，agent 可以直接调 save_plan 存
+// 修订版本，再调 AskUser 请用户重新批准——用户不需要手动切回 plan mode。
+//
+// AskUser 不再碰计划表。它以前在 plan_mode=true 时会顺手把追问的 question 当计划
+// 存进去，那是把"这是一份计划"和"停下来等用户"两个信号焊在了一个事件上：规划一轮
+// 里模型先调 save_plan(完整计划) 再调 AskUser("是否同意？")，收尾时后者**覆盖**掉
+// 前者，执行阶段注入的"计划"就成了那句追问。现网数据里能直接看到这个痕迹。
+//
+// 写的是 draft，不碰已批准的那份 —— 用户还没表态之前，正在执行的计划必须留着。
+// 见 persistence/plan_store.go 顶部和 migrations/009。
+
+type SavePlanTool struct {
+	tenantID  string
+	sessionID string
+}
+
+func (t *SavePlanTool) Name() string { return "save_plan" }
+func (t *SavePlanTool) Description() string {
+	return "保存或更新执行计划。在规划阶段提交计划供用户审批；执行中发现计划需要修改时也可调用以提交修订版本。保存后需要用户明确批准才会生效——在此之前，已批准的旧计划继续有效。调用后请用 AskUser 请用户审批。"
+}
+func (t *SavePlanTool) IsConcurrencySafe() bool { return true }
+func (t *SavePlanTool) InputSchema() tool.Schema {
+	return tool.Schema{
+		Type: tool.SchemaTypeObject,
+		Properties: map[string]tool.Schema{
+			"content": {Type: tool.SchemaTypeString, Description: "计划全文（目标、涉及的文件、风险、待确认的问题）"},
+			"steps": {
+				Type:        tool.SchemaTypeArray,
+				Description: "计划的步骤清单，按执行顺序。执行阶段用 update_plan_step 逐步标记进度，所以每一步应当是一件能明确说'做完了'的事。",
+				Items:       &tool.Schema{Type: tool.SchemaTypeString},
+			},
+		},
+		Required: []string{"content", "steps"},
+	}
+}
+func (t *SavePlanTool) Run(ctx context.Context, input json.RawMessage, tctx *tool.Context, out chan<- tool.Event) (tool.Result, error) {
+	var params struct {
+		Content string   `json:"content"`
+		Steps   []string `json:"steps"`
+	}
+	json.Unmarshal(input, &params)
+
+	db, err := persistence.DB()
+	if err != nil || db == nil {
+		return tool.Result{IsError: true, Content: []tool.ResultContent{
+			{Type: tool.ResultContentTypeText, Text: "计划持久化不可用（数据库未配置）"},
+		}}, nil
+	}
+
+	// 提交时一律 pending —— 谁都还没开始做。让模型在提交时就填状态只会得到一堆
+	// 它凭空断言的进度。
+	steps := make([]persistence.PlanStep, 0, len(params.Steps))
+	for _, title := range params.Steps {
+		if title = strings.TrimSpace(title); title != "" {
+			steps = append(steps, persistence.PlanStep{Title: title, Status: persistence.StepPending})
+		}
+	}
+
+	if err := persistence.SaveDraftPlan(ctx, db, t.tenantID, t.sessionID, params.Content, steps); err != nil {
+		return tool.Result{IsError: true, Content: []tool.ResultContent{
+			{Type: tool.ResultContentTypeText, Text: fmt.Sprintf("保存计划失败: %v", err)},
+		}}, nil
+	}
+
+	emitToolResult(out, t.Name(), tctx.ToolUseID,
+		fmt.Sprintf("已保存计划（%d 步），等待用户批准", len(steps)), nil)
+
+	return tool.Result{Content: []tool.ResultContent{
+		{Type: tool.ResultContentTypeText, Text: fmt.Sprintf(
+			"计划已保存，共 %d 步，等待用户批准（在此之前已批准的旧计划仍然有效）", len(steps))},
+	}}, nil
+}
+
+// ── GetPlan Tool ──────────────────────────────────────────
+//
+// 计划从"每轮推给模型"改成"模型按需来拉"。
+//
+// 推的代价是实打实的：引擎的 store 落的是它收到的那条 llm.Message，也就是**拼过
+// 前缀的那条**，所以每一轮的 user 消息都带一份计划全文，ReloadHistory 读回 20 轮
+// 就是 20 份。现网数据里能直接看到那个前缀被存进去。
+//
+// 拉的那一份为什么不会同样堆积 —— 靠下面的 ResultRetention：
+//
+//	Reproducible  这份结果模型随时能再调一次拿到 → 陈旧之后允许被脱水
+//	Identity      每次调用观察的都是"这个会话的计划"，所以带同一个 Identity。
+//	              后一次调用会让前一次的那份塌成一个指针，历史里只留最新一份。
+//
+// 两者都只在引擎的历史回收真的跑起来时才生效，而 MaxContextTokens 已经设上了
+// （agent_session.go 的 contextWindowFor）。
+
+type GetPlanTool struct {
+	tenantID  string
+	sessionID string
+}
+
+func (t *GetPlanTool) Name() string { return "get_plan" }
+func (t *GetPlanTool) Description() string {
+	return "查看当前会话已批准的执行计划全文与各步骤进度。每轮消息里只带一行计划摘要，需要具体内容时调它。"
+}
+func (t *GetPlanTool) IsConcurrencySafe() bool { return true }
+
+// InputSchema 故意是空对象。
+//
+// ⚠️ 不要加 session_id 参数。工具实例构造时就把租户和会话焊死了，所以模型**结构上
+// 够不到别人的计划**；开一个参数出来等于把它换成"每次调用都要记得校验"，而这个库
+// 刚因为同一类问题（按名字查工具不带 user_id）修了一整轮。
+func (t *GetPlanTool) InputSchema() tool.Schema {
+	return tool.Schema{Type: tool.SchemaTypeObject, Properties: map[string]tool.Schema{}}
+}
+
+// ResultRetention 让引擎知道这份结果可以随取随弃。见类型注释。
+//
+// Identity 不带调用参数（本来也没有参数）：每次调用观察的都是同一个东西——这个会话
+// 当前的计划。这正是 Identity 想表达的"同一个观察对象"，所以旧的那份该被新的取代。
+func (t *GetPlanTool) ResultRetention(json.RawMessage) tool.Retention {
+	return tool.Retention{
+		Reproducible: true,
+		Identity:     "get_plan:" + t.sessionID,
+		Recovery:     `get_plan()`,
+	}
+}
+
+func (t *GetPlanTool) Run(ctx context.Context, input json.RawMessage, tctx *tool.Context, out chan<- tool.Event) (tool.Result, error) {
+	db, err := persistence.DB()
+	if err != nil || db == nil {
+		return tool.Result{IsError: true, Content: []tool.ResultContent{
+			{Type: tool.ResultContentTypeText, Text: "计划不可用（数据库未配置）"},
+		}}, nil
+	}
+
+	plan, err := persistence.LoadPlan(ctx, db, t.tenantID, t.sessionID)
+	if err != nil {
+		return tool.Result{IsError: true, Content: []tool.ResultContent{
+			{Type: tool.ResultContentTypeText, Text: fmt.Sprintf("读取计划失败: %v", err)},
+		}}, nil
+	}
+	if plan.Approved == "" {
+		// 不是错误：还没有计划是一个正常状态，说清楚比报错有用。
+		return tool.Result{Content: []tool.ResultContent{
+			{Type: tool.ResultContentTypeText, Text: "当前没有已批准的执行计划。"},
+		}}, nil
+	}
+
+	done, total := plan.Progress()
+	emitToolResult(out, t.Name(), tctx.ToolUseID, fmt.Sprintf("计划进度 %d/%d", done, total), nil)
+
+	return tool.Result{Content: []tool.ResultContent{
+		{Type: tool.ResultContentTypeText, Text: renderPlan(plan)},
+	}}, nil
+}
+
+// renderPlan 把计划渲染成给模型看的文本。步骤带序号，因为 update_plan_step 用的就是
+// 这个序号——模型从这里读到"3."，标进度时才知道该传 3。
+func renderPlan(plan persistence.Plan) string {
+	var b strings.Builder
+	b.WriteString("【已批准的执行计划】\n")
+	b.WriteString(plan.Approved)
+
+	if len(plan.ApprovedSteps) > 0 {
+		done, total := plan.Progress()
+		fmt.Fprintf(&b, "\n\n【步骤进度】%d/%d 已完成\n", done, total)
+		for i, s := range plan.ApprovedSteps {
+			fmt.Fprintf(&b, "%d. [%s] %s\n", i+1, stepMark(s.Status), s.Title)
+		}
+		b.WriteString("\n用 update_plan_step(step=<序号>, status=in_progress|completed) 标记进度。")
+	}
+
+	if plan.Draft != "" {
+		// 有待批准的修订时要说清楚，否则模型会以为下面那份已经生效了。
+		b.WriteString("\n\n【待用户批准的修订版】（尚未生效，当前仍按上面的计划执行）\n")
+		b.WriteString(plan.Draft)
+	}
+	return b.String()
+}
+
+func stepMark(status string) string {
+	switch status {
+	case persistence.StepCompleted:
+		return "已完成"
+	case persistence.StepInProgress:
+		return "进行中"
+	default:
+		return "待办"
+	}
+}
+
+// ── UpdatePlanStep Tool ───────────────────────────────────
+//
+// 只给主会话（BuildMainSessionTools）。让子代理标"完成"意味着一个还没人验收的产出
+// 直接推进了用户批准过的计划；主会话本来就要收专家的结果，由它来标才对得上。
+
+type UpdatePlanStepTool struct {
+	tenantID  string
+	sessionID string
+}
+
+func (t *UpdatePlanStepTool) Name() string { return "update_plan_step" }
+func (t *UpdatePlanStepTool) Description() string {
+	return "更新已批准计划中某一步的状态。开始做某步时标 in_progress，做完标 completed。步骤序号见 get_plan 或每轮消息里的计划摘要。"
+}
+
+// IsConcurrencySafe 返回 false —— 它是读-改-写同一行 JSON。
+//
+// 返回 true 的话引擎会在同一轮里并行调它（DynamicTool 硬编码 true 就踩过这个），
+// 两次调用各自读到改前的步骤表，后写的把先写的覆盖掉：模型标了两步、库里只留一步。
+// 这种丢更新不会报错，只会表现为"进度偶尔少一格"。
+func (t *UpdatePlanStepTool) IsConcurrencySafe() bool { return false }
+
+func (t *UpdatePlanStepTool) InputSchema() tool.Schema {
+	return tool.Schema{
+		Type: tool.SchemaTypeObject,
+		Properties: map[string]tool.Schema{
+			"step":   {Type: tool.SchemaTypeInteger, Description: "步骤序号，从 1 开始"},
+			"status": {Type: tool.SchemaTypeString, Description: "pending / in_progress / completed"},
+		},
+		Required: []string{"step", "status"},
+	}
+}
+
+func (t *UpdatePlanStepTool) Run(ctx context.Context, input json.RawMessage, tctx *tool.Context, out chan<- tool.Event) (tool.Result, error) {
+	var params struct {
+		Step   int    `json:"step"`
+		Status string `json:"status"`
+	}
+	json.Unmarshal(input, &params)
+
+	db, err := persistence.DB()
+	if err != nil || db == nil {
+		return tool.Result{IsError: true, Content: []tool.ResultContent{
+			{Type: tool.ResultContentTypeText, Text: "计划不可用（数据库未配置）"},
+		}}, nil
+	}
+
+	plan, err := persistence.UpdateStepStatus(ctx, db, t.tenantID, t.sessionID, params.Step, params.Status)
+	if err != nil {
+		// 错误原文回给模型（越界、状态词拼错、没有计划）——它下一轮能自己纠正，
+		// 所以这里要说清是哪一种，而不是笼统一句"失败了"。
+		return tool.Result{IsError: true, Content: []tool.ResultContent{
+			{Type: tool.ResultContentTypeText, Text: fmt.Sprintf("更新步骤失败: %v", err)},
+		}}, nil
+	}
+
+	done, total := plan.Progress()
+	emitToolResult(out, t.Name(), tctx.ToolUseID,
+		fmt.Sprintf("第 %d 步 → %s（%d/%d）", params.Step, params.Status, done, total), nil)
+
+	return tool.Result{Content: []tool.ResultContent{
+		{Type: tool.ResultContentTypeText, Text: fmt.Sprintf(
+			"第 %d 步已标记为 %s。当前进度 %d/%d。", params.Step, params.Status, done, total)},
+	}}, nil
 }
 
 // ── KB Search Tool ──────────────────────────────────────────
@@ -385,7 +649,9 @@ func (t *DynamicTool) Run(ctx context.Context, input json.RawMessage, tctx *tool
 // summarizeToolResult 尽力从 tool.Result 里抽 (summary, full)。
 // summary: 200 字截断一行摘要 —— 时间线上快速看的"发生了什么"
 // full: 结构化 JSON 或短 Text 原文 —— 前端展开时看的完整值。
-//       长 Text (>1KB) 不落 full 避免 chat_messages.extra 撑爆。
+//
+//	长 Text (>1KB) 不落 full 避免 chat_messages.extra 撑爆。
+//
 // 都没有就返 ("", nil)。
 func summarizeToolResult(r tool.Result) (string, any) {
 	for _, c := range r.Content {
@@ -482,103 +748,6 @@ func jsonSchemaToToolSchema(m map[string]any) tool.Schema {
 	}
 
 	return s
-}
-
-// ── Activate Skill Tool ────────────────────────────────────
-
-type ActivateSkillTool struct {
-	skills    []SkillDef
-	tenantID  string
-	userID    string
-	sessionID string
-}
-
-func (t *ActivateSkillTool) Name() string { return "activate_skill" }
-func (t *ActivateSkillTool) Description() string {
-	var names []string
-	for _, s := range t.skills {
-		names = append(names, s.Name)
-	}
-	return "激活一个技能以获取完整指引。可用: " + strings.Join(names, ", ")
-}
-func (t *ActivateSkillTool) IsConcurrencySafe() bool { return true }
-func (t *ActivateSkillTool) InputSchema() tool.Schema {
-	enumVals := make([]any, 0, len(t.skills))
-	for _, s := range t.skills {
-		enumVals = append(enumVals, s.Name)
-	}
-	return tool.Schema{
-		Type: tool.SchemaTypeObject,
-		Properties: map[string]tool.Schema{
-			"skill_name": {
-				Type:        tool.SchemaTypeString,
-				Description: "要激活的技能名称",
-				Enum:        enumVals,
-			},
-		},
-		Required: []string{"skill_name"},
-	}
-}
-
-func (t *ActivateSkillTool) Run(ctx context.Context, input json.RawMessage, tctx *tool.Context, out chan<- tool.Event) (tool.Result, error) {
-	var params struct {
-		SkillName string `json:"skill_name"`
-	}
-	json.Unmarshal(input, &params)
-
-	var matched *SkillDef
-	for i := range t.skills {
-		if t.skills[i].Name == params.SkillName {
-			matched = &t.skills[i]
-			break
-		}
-	}
-	if matched == nil {
-		return tool.Result{IsError: true, Content: []tool.ResultContent{
-			{Type: tool.ResultContentTypeText, Text: fmt.Sprintf("未找到技能: %s", params.SkillName)},
-		}}, nil
-	}
-
-	// 返回完整 SKILL.md body 作为工具结果，LLM 将以此作为执行指南。
-	//
-	// SKILL.md 正文常用相对链接引用 references/*.md（页型定义、配色系统、API 手册）。
-	// 那些文件不注入 prompt（pptx-generator 一家就 56KB ≈ 1.7 万 token，且多数
-	// 单次任务用不到），而是靠 NFS RO 挂载让 LLM 按需读。所以这里必须给出可用的
-	// 绝对路径 —— 不明说路径，LLM 会拿相对链接去猜，猜不到就跳过依赖这些文件的
-	// 步骤（实测：pptx 的调研/配色/页型规划全被跳过，只剩 SKILL.md 正文里的步骤）。
-	//
-	// 试过在这儿加"缺内容就该读"的通用判据，想让模型补上被跳过的 Step 7 QA
-	// （SKILL.md 那步正文只有一个裸链接 `See [QA Process](references/pitfalls.md)`）。
-	// 实测无效且有害：pitfalls.md 照旧不读，反而多读了 13KB 用不上的 pptxgenjs.md。
-	// 原因是模型对那一步的误判不是"我判断不需要读"，而是"我以为我已经在做 QA 了"——
-	// 判据管不到一个它并不认为存在的缺口。明确说"按 Step 7 做 QA"时它第一件事就是
-	// 读 pitfalls.md，可见差别在有没有人点出这一步，不在有没有判断规则。
-	// 结论：这类跳过的根因在 SKILL.md 把整步内容全外置，得在 skill 侧修，工具提示
-	// 词这一层碰不到。
-	// 引导用 Read 而不是 code_interpreter：Read 走 lea-tools 直读共享存储，毫秒级、
-	// 不起沙箱（冷启动实测 >10s）、不占执行配额，读一个 md 文件本来就不该起一个
-	// Python executor。
-	//
-	// 前提是 skill 文件在会话创建时就已投递（ProvisionSessionSkills，见
-	// agent_session.go）。在那之前投递只发生在沙箱创建那一刻，于是"Read 读不读得到
-	// skill"取决于模型有没有恰好先调过一次 code_interpreter —— 旧引导用
-	// code_interpreter 顺带掩盖了这个隐式依赖，换成 Read 就必须把投递提前。
-	skillRoot := fmt.Sprintf("/opt/skills/%s", matched.Name)
-	response := fmt.Sprintf("[技能已激活: %s]\n\n"+
-		"以下是完整的技能执行规范，请严格按照此规范完成用户请求：\n\n---\n%s\n---\n\n"+
-		"技能文件在 `%s/`（只读），上述规范里 `references/xxx.md` 这类"+
-		"相对路径都在这个目录下。\n"+
-		"**规范里提到某个 reference 文件时，先用 Read 读它再继续**，例如：\n"+
-		"`Read(path=\"%s/references/slide-types.md\")`\n"+
-		"（换成当前步骤实际引用的文件名 —— 按上面规范里写的相对路径拼，不用先列目录）",
-		matched.Name, matched.SystemPrompt, skillRoot, skillRoot)
-
-	// activate_skill 的 result_full 是完整 SKILL.md，可能几千字 —— 不落 full 避免 DB 膨胀
-	emitToolResult(out, t.Name(), tctx.ToolUseID, fmt.Sprintf("已激活技能 %s（SKILL.md 已注入 LLM）", matched.Name), nil)
-
-	return tool.Result{Content: []tool.ResultContent{
-		{Type: tool.ResultContentTypeText, Text: response},
-	}}, nil
 }
 
 // prepareSandboxBundle 已删除。

@@ -11,9 +11,17 @@ import (
 func RegisterRoutes(api *gin.RouterGroup, mgr *session.Manager) {
 	chat := api.Group("/chat")
 	{
+		// 主链路：发消息 + 同连接回 SSE。多副本下唯一不需要会话亲和的形状。
+		chat.POST("/stream", handleSendStream(mgr))
+		// 断线重连入口。POST /stream 是单连接，断了没法重接（重发 POST 会真的再问
+		// 一遍），所以重连必须走这条：带 ?from=<最后收到的 id> 从事件日志补齐再接直播。
+		// 配了 REDIS_URL 时它不需要会话亲和；没配时退回内存订阅（单实例的正确行为）。
+		chat.GET("/stream/:session_id", handleStreamResume(mgr))
+		// 两段式链路的发送端，保留给尚未迁移的客户端。
 		chat.POST("/send", handleSend(mgr))
-		chat.GET("/stream/:session_id", handleStream(mgr))
 		chat.POST("/stop/:session_id", handleStop(mgr))
+		// 断流之后前端靠它判断"还在生成"还是"已经结束"。跨副本有效。
+		chat.GET("/status/:session_id", handleTurnStatus(mgr))
 		chat.POST("/attachments/upload", handleUploadAttachment())
 	}
 

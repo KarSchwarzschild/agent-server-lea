@@ -252,11 +252,14 @@ func (t *CodeInterpreterTool) execCode(ctx context.Context, code, language strin
 	return json.RawMessage(`{}`), nil
 }
 
-func (t *CodeInterpreterTool) Destroy(ctx context.Context) {
-	if !t.sandboxReady {
-		return
-	}
-	url := fmt.Sprintf("%s/sandbox/sessions/%s", toolsGatewayURL, t.sandboxSessID)
-	req, _ := http.NewRequestWithContext(ctx, "DELETE", url, nil)
-	httpClient.Do(req)
-}
+// 这里原本有个 Destroy(ctx)，DELETE /sandbox/sessions/<id>。删掉了 —— 它从来没被调用过：
+// agentloop 的 tool.Tool 没有析构这一说，lea-agent 自己也没调。留着一个"看起来在回收
+// 沙箱、实际不回收"的方法，比没有更糟：读代码的人会以为会话结束沙箱就没了，据此推断
+// 出错误的容量模型。
+//
+// 沙箱回收的真实位置在别处，分两层（都不在 Go 侧）：
+//   - Cube：闲置 15 分钟自动 pause（内存冻结，下次请求自动 resume，仍占 slot）
+//   - lea-tools：闲置 1 小时 kill（sandbox_session.py 的 IDLE_TIMEOUT，释放 slot）
+//
+// 这个分层是有意的 —— 用户走开十分钟回来接着问，不该重新装一遍依赖。所以这里
+// **不应该**在会话结束时主动 kill，即使把 Destroy 接上也不该。

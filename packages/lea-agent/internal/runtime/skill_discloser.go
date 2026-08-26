@@ -106,13 +106,9 @@ func (d *GatewaySkillDiscloser) currentSet() *skill.Set {
 
 // bulkSkillBodyBytes 是"专家自己别加载、派给子代理"的阈值。
 //
-// 阈值而不是一律派活：起一个子代理有固定成本（一次完整会话的 system prompt + 工具
-// schema，加上它自己也要重读一遍任务），小 skill 派下去是净亏。实测
-// internal-comms 的正文 1,543 字符（约 385 tok），专家自己读掉就完了；
-// pptx-generator 8,131 字符、pdf 8,349 字符（各约 2k tok），而且它们的 reference
-// 还要再读 30k+ 字符 —— 那一份进了专家上下文，之后二三十轮每轮重传。
-//
-// 4096 字节落在这两档中间，且离两边都远，不会因为某个 skill 改几行字就跨档。
+// 该阈值已废弃：专家现在总是加载完整 skill 正文，不再拦截后让派子代理。
+// 原因是拦截会让追问在子代理里发生，而子代理不能 AskUser，问题到不了用户。
+// 常量保留仅供未来参考。
 const bulkSkillBodyBytes = 4096
 
 // deferralNotice 是专家会话请求大 skill 时替代正文的回复。
@@ -132,27 +128,15 @@ func deferralNotice(name string, bodyBytes int) string {
 //
 // 失败结果不追加：那时模型要做的是换一个 skill 名字，不是去读文件。
 //
-// **专家会话请求大 skill 时不给正文**，改回一句"派给子代理"。这是规则而不是提示词
-// 引导 —— 实测提示词层面的判据对这类决策无效（见上面 Step 7 QA 那段）。
-//
-// 判定靠 tctx.ExpertSession()：引擎给专家会话的 tool.Context 打了标记，而
-// childToolContext 不复制 Metadata，所以专家派下去的子代理**拿不到**这个标记，它调
-// Skill 照常拿到完整正文。整套方案就落在这个不对称上。
+// 专家会话不再拦截大 skill 正文。此前超过 bulkSkillBodyBytes 的 skill 会被替换成
+// 一句"派给子代理执行"，但这让追问在子代理里发生，而子代理不能 AskUser，
+// 问题到不了用户。现在专家总是加载完整正文，自己决定什么时候派活。
+// 大 skill 的上下文开销由引擎的 context control 回收。
 func (d *GatewaySkillDiscloser) Run(ctx context.Context, input json.RawMessage, tctx *tool.Context, out chan<- tool.Event) (tool.Result, error) {
 	var in struct {
 		Name string `json:"name"`
 	}
 	nameOK := json.Unmarshal(input, &in) == nil && strings.TrimSpace(in.Name) != ""
-
-	// 拦在 d.Tool.Run 之前 —— 它一返回正文就已经在 Result 里了。
-	if nameOK && tctx.ExpertSession() {
-		if sk, ok := d.currentSet().Get(strings.TrimSpace(in.Name)); ok && len(sk.Body) > bulkSkillBodyBytes {
-			return tool.Result{Content: []tool.ResultContent{{
-				Type: tool.ResultContentTypeText,
-				Text: deferralNotice(sk.Name, len(sk.Body)),
-			}}}, nil
-		}
-	}
 
 	res, err := d.Tool.Run(ctx, input, tctx, out)
 	if err != nil || res.IsError || !d.canReadFiles {

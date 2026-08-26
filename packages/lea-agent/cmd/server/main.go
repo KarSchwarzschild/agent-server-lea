@@ -1,14 +1,42 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"log"
+	"net/http"
 	"os"
+	"os/signal"
+	"sync/atomic"
+	"syscall"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/control"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/middleware"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/router"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/session"
 )
+
+// drainTimeout 是收到 SIGTERM 后等在跑的 turn 收尾的上限。
+//
+// 3 分钟是照最长的一类任务估的（带沙箱的 PPT 生成实测几分钟）。等不完的那些 turn
+// 结果会丢，所以宁可长一点 —— 代价只是发版慢一点，而丢一个跑了三分钟的答案对用户
+// 是实打实的损失。
+//
+// k8s 那边 terminationGracePeriodSeconds 必须配得**比这个大**（比如 200s），
+// 否则 kubelet 会在我们排空完成之前直接 SIGKILL，这段逻辑就等于没写。
+const defaultDrainTimeout = 3 * time.Minute
+
+// preStopDelay 是翻掉健康检查之后、真正停止接收新请求之前的等待时间。
+//
+// 为什么需要这个空档：k8s 摘除 endpoint 不是原子的 —— 探针失败到 kube-proxy/ingress
+// 真的不再往这里转发之间有几秒延迟。这段时间里流量还在进来，如果此刻已经关了监听，
+// 那些请求收到的是连接被拒，而不是被优雅处理。先让探针红、再等一会儿、才关监听。
+//
+// 也可以改用 pod spec 里的 preStop: sleep，效果一样；放在进程里的好处是不依赖
+// 部署清单配对。
+const defaultPreStopDelay = 5 * time.Second
 
 func main() {
 	port := os.Getenv("LEA_AGENT_PORT")
@@ -17,7 +45,6 @@ func main() {
 	}
 
 	mgr := session.NewManager()
-	defer mgr.Close()
 
 	r := gin.Default()
 	r.Use(middleware.CORS())
@@ -28,21 +55,127 @@ func main() {
 	// /api/user/agents/* → lea-config:8500/agents/* （用户视角 Agent CRUD）
 	api.Any("/user/agents", router.UserAgentsProxy())
 	api.Any("/user/agents/*path", router.UserAgentsProxy())
+	// /api/user/skills/* → lea-config:8500/skills/* （技能市场）
+	api.Any("/user/skills", router.UserSkillsProxy())
+	api.Any("/user/skills/*path", router.UserSkillsProxy())
+	// /api/user/tools/* → lea-config:8500/tools/* （用户动态工具管理）
+	api.Any("/user/tools", router.UserToolsProxy())
+	api.Any("/user/tools/*path", router.UserToolsProxy())
 
 	router.RegisterRoutes(api, mgr)
 	router.RegisterDebugRoutes(api)
 
-	// 带上驻留会话数：CCE 的探针和监控靠它看内存压力，也能确认淘汰真的在工作。
-	r.GET("/health", func(c *gin.Context) {
-		c.JSON(200, gin.H{
-			"status":   "ok",
-			"service":  "lea-agent",
-			"sessions": mgr.Count(),
-		})
-	})
+	// draining 一旦置位，健康检查就开始返 503，让 k8s 把本 pod 从 Service
+	// endpoints 里摘掉。用 atomic 而不是普通 bool：写在信号处理那条 goroutine，
+	// 读在每个请求的 handler 里。
+	var draining atomic.Bool
 
-	log.Printf("lea-agent starting on :%s", port)
-	if err := r.Run(":" + port); err != nil {
-		log.Fatal(err)
+	r.GET("/health", healthHandler(mgr, &draining))
+
+	srv := &http.Server{Addr: ":" + port, Handler: r}
+
+	// NotifyContext 而不是自己开 signal.Notify + channel：它顺带管好了取消传播，
+	// 而 stop() 会恢复默认信号行为 —— 排空期间用户再按一次 Ctrl-C / 再来一个
+	// SIGTERM 就能强杀，不用干等 drainTimeout。
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		log.Printf("lea-agent starting on :%s", port)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("listen failed: %v", err)
+		}
+	}()
+
+	<-ctx.Done()
+	stop()
+	drain(srv, mgr, &draining)
+}
+
+// healthHandler 是探针和监控的入口。
+//
+// 带上驻留会话数和在跑的 turn 数：CCE 的探针靠前者看内存压力（也能确认淘汰真的在
+// 工作），排空期间靠后者看还剩几个 turn 没收尾。
+//
+// draining 置位后返 503 而不是 200 —— 这是让编排层把本 pod 从 Service endpoints
+// 里摘掉的唯一手段。返 200 的话新请求会继续被路由进来，而我们正在关监听，那些
+// 请求收到的是连接被拒。
+func healthHandler(mgr *session.Manager, draining *atomic.Bool) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		body := gin.H{
+			"service":      "lea-agent",
+			"sessions":     mgr.Count(),
+			"active_turns": mgr.ActiveTurns(),
+		}
+		if draining.Load() {
+			body["status"] = "draining"
+			c.JSON(503, body)
+			return
+		}
+		body["status"] = "ok"
+		c.JSON(200, body)
 	}
+}
+
+// drain 是优雅退出的全过程。顺序是有讲究的，每一步都在解决上一步留下的问题：
+//
+//  1. 翻掉健康检查并等一会儿 —— 让编排层停止往这里转发新流量（见 preStopDelay）。
+//  2. srv.Shutdown —— 关监听、等**还挂着连接**的请求跑完。SSE 是长连接，所以这一步
+//     天然会等到 turn 广播 done、pumpEvents 返回、连接关闭为止。
+//  3. mgr.WaitIdle —— 等客户端已经断开、但仍在后台跑的 turn。它们没有连接可等，
+//     第 2 步看不见它们，而它们的答案只存在于还没执行的 persistTurn 里。
+//  4. mgr.Close —— 关掉清理协程和所有会话的订阅 channel。
+//
+// 分布式锁顺带被这套流程修好了：turn 正常收尾会执行 defer handle.Release()，所以
+// 排空干净的 pod 不会留下没释放的锁。没有这段逻辑时进程被 SIGKILL，锁要等满 60s
+// TTL 才过期，那个会话在此期间发消息一直吃 409。
+func drain(srv *http.Server, mgr *session.Manager, draining *atomic.Bool) {
+	timeout := durationFromEnv("LEA_AGENT_DRAIN_TIMEOUT", defaultDrainTimeout)
+	preStop := durationFromEnv("LEA_AGENT_PRESTOP_DELAY", defaultPreStopDelay)
+
+	log.Printf("shutdown signal received —— 开始排空 active_turns=%d prestop=%s timeout=%s",
+		mgr.ActiveTurns(), preStop, timeout)
+
+	draining.Store(true)
+	if preStop > 0 {
+		time.Sleep(preStop)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	// Shutdown 出错（超时）不影响后面 —— 剩下的连接会被强断，但仍要给没挂客户端的
+	// turn 一次机会，它们可能马上就落库完了。
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("http_shutdown_incomplete err=%v (仍在等后台 turn)", err)
+	}
+	if err := mgr.WaitIdle(ctx); err != nil {
+		log.Printf("drain_incomplete err=%v", err)
+	} else {
+		log.Printf("drain_complete —— 所有 turn 已收尾并落库")
+	}
+
+	mgr.Close()
+	// 控制面的连接最后关。mgr.Close 已经退订（并等订阅 goroutine 退出），所以这里
+	// 只是把 TCP 连接还掉。放在最后是因为排空期间我们仍然想能收到跨 pod 的停止请求 ——
+	// 用户看到发版卡着，点一下停止应该管用。
+	if err := control.Shared().Close(); err != nil {
+		log.Printf("control_bus_close_failed err=%v", err)
+	}
+	log.Printf("lea-agent stopped")
+}
+
+// durationFromEnv 跟 session 包里那个同名函数是一份重复实现 —— 那个是 unexported，
+// 而为了两处共用就把它导出，等于把一个内部小工具塞进包的公开面。这里 8 行复制更划算。
+func durationFromEnv(key string, def time.Duration) time.Duration {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d < 0 {
+		log.Printf("%s=%q 解析失败，用默认值 %s", key, v, def)
+		return def
+	}
+	return d
 }

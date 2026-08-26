@@ -16,10 +16,44 @@ import (
 var configServiceURL = getEnv("LEA_CONFIG_URL", "http://localhost:8500")
 
 type ToolDef struct {
-	Name        string         `json:"name"`
-	DisplayName string         `json:"display_name"`
-	Description string         `json:"description"`
-	InputSchema map[string]any `json:"input_schema"`
+	Name        string `json:"name"`
+	DisplayName string `json:"display_name"`
+	Description string `json:"description"`
+
+	// InputSchema 的 tag 是 `schema_json`，**不是 `input_schema`**。
+	//
+	// 这一个词错了的代价：json.Decode 对不认识的键静默丢弃，于是 InputSchema 恒为
+	// nil，jsonSchemaToToolSchema(nil) 返回一个**空对象 schema** —— 模型看到的工具
+	// 没有任何参数声明。
+	//
+	// ⚠️ 症状不是"调不动"，是"全靠猜"。实测过 A/B（同一个中性提问「北京现在天气
+	// 怎么样？」，只换 tag 重编译）：
+	//
+	//	tag 错   get_weather({"latitude": "39.9042", "longitude": "116.4074"})
+	//	tag 对   get_weather({"latitude": 39.9042,   "longitude": 116.4074})
+	//
+	// **两次都答对了。** 模型从工具名和描述里把参数名猜了出来，而 open-meteo 收字符串
+	// 也认。所以这个 bug 在 get_weather 上只表现为类型退化 —— 它恰好是最好猜的那种
+	// 工具。真正吃亏的是参数名猜不出来的（q / sku_id / dept_code）、上游对类型严格的、
+	// 以及有必填项需要强制的：没有 schema 就没有 required，模型可以整个漏掉。
+	//
+	// 一句话：坏得不均匀，所以更难发现 —— 抽查几个"看起来能用"完全证明不了没问题。
+	//
+	// 只影响 api / mcp 两类：内置那批在 BuildPlatformTools 的 builtins map 里被跳过，
+	// schema 是 Go 代码里硬写的。也就是说**恰好只有用户自定义的工具受影响**，而那正是
+	// 没人天天回归的那一类。
+	//
+	// 来历：老的 lea-server 那版下发的键确实叫 input_schema（它的模型里有一列就叫这个
+	// 名字），这个结构体是照着它写的。lea-config 接手时把列统一成了执行器的词汇
+	// （见 lea_config/models/tool.py 头部记的那次改名 input_schema → schema_json），
+	// Go 侧没跟。LEA_CONFIG_URL 在 .env / k8s/config.yaml / 两个 compose 里全部指向
+	// lea-config，所以老服务那个键今天没有任何来源。
+	//
+	// ⚠️ 不要为了"兼容"两个键都认。这张表被三个服务各定义一遍、留下两组表达同一件事
+	// 的列，正是 migrations/006 花了一轮删掉的病；在下发契约上再造一组是同一个错误的
+	// 第二版。权威词汇只有一套 —— 运行时真正决定工具能不能调通的那一侧（执行器）的
+	// 那套。
+	InputSchema map[string]any `json:"schema_json"`
 }
 
 type SkillDef struct {
@@ -105,6 +139,19 @@ type AgentConfig struct {
 	SandboxEnabled bool       `json:"sandbox_enabled"`
 	ActiveSkillID  string     `json:"active_skill_id"`
 
+	// ModelContextWindow 是**模型的**上下文窗口，来自 llm_providers.model_limits。
+	//
+	// 跟上面的 MaxTokens 是两回事，非常容易看混：
+	//
+	//	MaxTokens            单轮最多**生成**多少 token —— 进 llm.Request，输出侧
+	//	ModelContextWindow   模型一次能吃下多少 token —— 客观事实，不进请求
+	//
+	// 一次请求 = [系统提示 + 历史 + 本轮输入] + [生成的回复]，窗口管的是这两段之和。
+	//
+	// 我们不直接用这个数，用的是它算出来的预算（session.contextBudget）。
+	// 0 = 配置里没给这个模型，走保守兜底，见 session.fallbackContextWindow。
+	ModelContextWindow int `json:"model_context_window"`
+
 	// Team 非 nil 表示这个 agent 是一个专家团（库里 agent_teams 有它的行）。
 	Team *TeamDef `json:"team"`
 }
@@ -140,6 +187,9 @@ func LoadAgentConfig(ctx context.Context, agentID int, tenantID string) (*AgentC
 		LLM    struct {
 			BaseURL string `json:"llm_base_url"`
 			APIKey  string `json:"llm_api_key"`
+			// 窗口跟 base_url / api_key 一起下发：它们都是"这个模型怎么调"的一部分，
+			// 而且都由 internal.py 里同一次 provider 匹配得出。
+			ModelContextWindow int `json:"model_context_window"`
 		} `json:"llm"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
@@ -165,6 +215,13 @@ func LoadAgentConfig(ctx context.Context, agentID int, tenantID string) (*AgentC
 	if raw.LLM.APIKey != "" {
 		cfg.LLMAPIKey = raw.LLM.APIKey
 	}
+	if raw.LLM.ModelContextWindow > 0 {
+		cfg.ModelContextWindow = raw.LLM.ModelContextWindow
+	}
+	// 这里**故意不兜底成某个常数**（不同于下面的 MaxTokens/MaxTurns）。兜底属于
+	// session.contextBudget，因为只有那边知道"没给窗口"和"给了个 0"要按同一条保守
+	// 路径处理，而且那个保守值跟引擎的触发线是一起推导的。在这里先填一个数，只会让
+	// 两处各有一个缺省，而它们迟早不一样。
 	if cfg.LLMBaseURL == "" {
 		cfg.LLMBaseURL = getEnv("LLM_BASE_URL", "https://api.openai.com/v1")
 	}

@@ -22,10 +22,10 @@ type DebugTraceRequest struct {
 }
 
 type traceStep struct {
-	Phase   string `json:"phase"`
-	Action  string `json:"action"`
-	Detail  any    `json:"detail,omitempty"`
-	Ms      int64  `json:"ms"`
+	Phase  string `json:"phase"`
+	Action string `json:"action"`
+	Detail any    `json:"detail,omitempty"`
+	Ms     int64  `json:"ms"`
 }
 
 // handleDebugTrace 跑一整轮并返回逐阶段耗时，用来定位"慢在哪"和"记忆注入了什么"。
@@ -37,6 +37,7 @@ type traceStep struct {
 //  2. 结束时 OnSessionEnd 还会把这轮对话**写进那个人的记忆**，污染他后续
 //     所有会话的注入内容（= 持久化投毒）；
 //  3. 顺带白跑平台的 LLM key，且能碰到沙箱。
+//
 // 现在两个身份都从 JWT claims 取，客户端传什么都不看。
 //
 // 另外整个端点默认关闭 —— 它会回显记忆正文和完整 prompt，属于只在排查时才
@@ -88,9 +89,9 @@ func handleDebugTrace(c *gin.Context) {
 		mem := runtime.NewMemoryMiddleware(tenantID, req.UserID, fmt.Sprintf("%d", req.AgentID))
 		memoryInjection = mem.PreTurn(ctx, req.Message)
 		addStep("pre_turn", "memory_inject", map[string]any{
-			"injected":   memoryInjection != "",
-			"chars":      len(memoryInjection),
-			"content":    truncate(memoryInjection, 500),
+			"injected": memoryInjection != "",
+			"chars":    len(memoryInjection),
+			"content":  truncate(memoryInjection, 500),
 		}, t1)
 	}
 
@@ -100,7 +101,7 @@ func handleDebugTrace(c *gin.Context) {
 		enrichedMsg = "[系统提示 - 用户相关信息]\n" + memoryInjection + "\n\n[用户消息]\n" + req.Message
 	}
 	addStep("pre_turn", "final_prompt", map[string]any{
-		"chars": len(enrichedMsg),
+		"chars":   len(enrichedMsg),
 		"preview": truncate(enrichedMsg, 800),
 	}, time.Now())
 
@@ -129,6 +130,9 @@ func handleDebugTrace(c *gin.Context) {
 		MaxIterations:  cfg.MaxTurns,
 		SystemPrompt:   buildSystemPrompt(cfg),
 		PermissionMode: "flight",
+		// 跟主链路同一个理由（见 agent_session.go 的说明）。排查端点更要关：它
+		// 跑的是真轮次，会真往那份进程级共享的 memory.md 里写。
+		DisableMemory: true,
 	}
 	opts := engine.Options{
 		ToolEvents: toolEvents,
@@ -155,11 +159,11 @@ func handleDebugTrace(c *gin.Context) {
 	} else {
 		assistantText = extractTextFromResult(result)
 		addStep("run_turn", "completed", map[string]any{
-			"iterations":  result.Iterations,
-			"stopped":     result.Stopped,
+			"iterations":   result.Iterations,
+			"stopped":      result.Stopped,
 			"output_chars": len(assistantText),
-			"output":      truncate(assistantText, 1000),
-			"tool_calls":  toolTrace,
+			"output":       truncate(assistantText, 1000),
+			"tool_calls":   toolTrace,
 		}, t3)
 	}
 
@@ -180,7 +184,7 @@ func handleDebugTrace(c *gin.Context) {
 	}
 
 	c.JSON(200, gin.H{
-		"trace": steps,
+		"trace":  steps,
 		"output": assistantText,
 	})
 }

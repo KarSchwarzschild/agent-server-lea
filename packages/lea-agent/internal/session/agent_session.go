@@ -2,19 +2,26 @@ package session
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log"
+	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"encoding/json"
 	"github.com/google/uuid"
 	engine "gitlab.ouc-online.com.cn/aibase/agentloop"
 	"gitlab.ouc-online.com.cn/aibase/agentloop/llm"
 	"gitlab.ouc-online.com.cn/aibase/agentloop/team"
 	"gitlab.ouc-online.com.cn/aibase/agentloop/tool"
 	"gitlab.ouc-online.com.cn/aibase/agentloop/turn"
+	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/control"
+	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/eventlog"
+	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/lock"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/persistence"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/runtime"
 )
@@ -36,6 +43,19 @@ type AgentSession struct {
 	// 存 Config 而不是 Session，因为链的会话生命周期在引擎手里。
 	chainCfg  *engine.Config
 	chainOpts engine.Options
+	// isHandoff 表示这个会话是 handoff 团——没有常驻 engine，plan mode 会 panic。
+	// 星型团有 engine，团长可以正常跑 plan mode（团长就是 Qoder 里的主 agent，
+	// ask_expert 就是 Agent tool）。只 handoff 需要拒服。
+	isHandoff bool
+
+	// ctxBudget 是 Build 时算出的上下文预算（见 contextBudget），同时喂给引擎的
+	// MaxContextTokens 和 EngineBackend 的 loadBudget。存成字段是因为 handoff 那条路
+	// 每轮现建 backend，够不到 Build 里的局部变量。
+	ctxBudget int
+	// lastChain 是最近一条链的结果，runChain 写、落库读。链的会话是引擎建的、跑完
+	// 就关，所以那段对话只在 ChainResult 里存在过一次 —— 不接住就没了。
+	// 受 mu 保护。
+	lastChain *engine.ChainResult
 	memory    *runtime.MemoryMiddleware
 
 	mu          sync.RWMutex
@@ -54,6 +74,27 @@ type AgentSession struct {
 	turnCancel  context.CancelFunc
 	turnEpoch   uint64
 	turnStopped bool
+
+	// locker 是跨 pod 的执行权。存成字段而不是每次调 lock.Shared()，是为了让测试
+	// 能在同一个二进制里同时覆盖"有 Redis"和"没 Redis"两条路 —— Shared() 是
+	// sync.Once，一个进程里只能初始化一次。
+	//
+	// nil 合法：那就是单实例部署（今天的现状），所有加锁调用退化成 no-op。
+	locker *lock.Locker
+
+	// control 是跨 pod 的控制面，用来请持锁的那个 pod 让位（见 acquireTurnLock）。
+	// nil 合法，但发布会如实返回 ErrUnavailable 而不是假装成功 —— 否则我们会去等
+	// 一个永远不会到的让位。
+	control *control.Bus
+
+	// eventSeq 是本会话事件的单调序号，直接当 SSE 的 id: 用，也是续传的游标。
+	// 每轮开始时从日志里 seed（见 seedEventSeq）—— 跨 pod 轮转时必须接着数。
+	eventSeq atomic.Uint64
+	// eventLog 把事件写进 Redis 供断线续传。nil = 未启用，Append 是 no-op。
+	eventLog *eventlog.Writer
+	// logs 是读侧（seed 序号要用）。跟 locker / control 一样存成字段而不是每次调
+	// Shared()，这样测试能在同一个二进制里覆盖启用和未启用两条路。
+	logs *eventlog.Log
 
 	// lastActive 供 Manager 做空闲淘汰。单独一把锁而不是复用 mu/turnMu：
 	// 清理协程要在不打断读写的前提下频繁读它。
@@ -99,7 +140,7 @@ func NewAgentSession(ctx context.Context, cfg *runtime.AgentConfig, p Params) (*
 
 	// 只有主会话该有的工具（memory_add）。其余平台工具走 ToolRuntime 的 Provision
 	// 通道，子代理和专家才继承得到 —— 见 GatewayToolset.Tools。
-	extraTools := runtime.BuildMainSessionTools(cfg, p.TenantID, p.UserID)
+	extraTools := runtime.BuildMainSessionTools(cfg, p.TenantID, p.UserID, sessionID)
 	toolEvents := make(chan tool.Event, 64)
 
 	// skill bundle 投递到本会话的 skills 目录，让 Read 能读到 SKILL.md 引用的
@@ -146,6 +187,11 @@ func NewAgentSession(ctx context.Context, cfg *runtime.AgentConfig, p Params) (*
 			sessionID, cfg.Team.Strategy, modeLabel(teamMode), names)
 	}
 
+	// 加载侧和发送侧必须用同一个预算，所以只算一次：MaxContextTokens 给引擎决定何时
+	// 压缩，同一个数给 EngineBackend 决定 raw 路径最多载入多少。两处各算一次的话迟早
+	// 漂开，而漂开的表现是加载侧砍了一段、引擎却以为还有余量。
+	ctxBudget := contextBudget(cfg.ModelContextWindow, costCeilingTokens)
+
 	engineCfg := engine.Config{
 		Provider:       "openai",
 		Model:          cfg.Model,
@@ -160,7 +206,23 @@ func NewAgentSession(ctx context.Context, cfg *runtime.AgentConfig, p Params) (*
 		// `if s.maxContextTokens <= 0 { return working, false }` 直接返回，于是
 		// 五个文件工具声明的 ResultRetention（Read/Glob 的 Reproducible、Write/Edit 的
 		// InputStub、Bash 的 KeepTail）和引擎给 Skill 声明的那份，全都从未被调用过。
-		MaxContextTokens: contextWindowFor(cfg.Model),
+		MaxContextTokens: ctxBudget,
+
+		// 引擎自带的跨会话记忆（memory.md + Remember 工具）在这里必须关掉，而且是
+		// 无条件关，不跟着 memory_mode 走。
+		//
+		// 它的两个文件由 CWD 和进程的用户配置目录推导，而我们给每个会话的 CWD 都是
+		// 同一个 "/tmp"，且 memory.Shared 对相同路径返回进程级共享的 Store。结果是
+		// 一个 pod 上所有租户的所有会话共用同一份 memory.md：任何一个会话调
+		// Remember 写进去的内容，会作为"既有事实"注入到别的租户下一个会话的 system
+		// prompt 里。这是跨租户泄漏，而它不会自己报错。
+		//
+		// memory_mode=off 不生效只是这件事露出来的症状 —— 那个开关管的是本侧的
+		// memory_add / memory_search / MemoryMiddleware（都带 tenant+user scope），
+		// 管不到引擎内置的这个。
+		//
+		// 关掉之后没有功能损失：平台记忆是另一套，租户隔离由它保证。
+		DisableMemory: true,
 
 		// 以下三份名册**必须非 nil**，这是服务端和客户端的分界：
 		// nil 在引擎里的意思是"去磁盘扫"（config.go 的 tri-state），而我们 CWD 是
@@ -171,6 +233,18 @@ func NewAgentSession(ctx context.Context, cfg *runtime.AgentConfig, p Params) (*
 		Experts: experts,
 		// 星型时是零值，也就是引擎的默认 —— 现有团走的代码路径一个字没变。
 		TeamMode: teamMode,
+
+		// 会话历史交给引擎自己读写，走 sessions.Backend（见下面的 opts.Backend）。
+		//
+		// Resume 让 Build 调 backend.LoadHistory —— 这个进程没跑过这个会话时（另一个
+		// pod 服务过它，或本进程重启过）历史从库里回来。缺了它的后果是静默的：请求
+		// 成功、照常计费，模型却当这段对话没发生过。
+		//
+		// PersistSession 让引擎把每轮消息写回去。落的是引擎原生消息（含 tool_use /
+		// tool_result 块），所以下次加载连工具调用都在 —— 比从 chat_messages 的渲染
+		// 正文反推要保真。chat_messages 那份仍然写，那是给前端看的。
+		Resume:         sessionID,
+		PersistSession: true,
 	}
 
 	// H2: 请求 AgentID 可能是 0（前端硬编码 super-agent），
@@ -189,7 +263,17 @@ func NewAgentSession(ctx context.Context, cfg *runtime.AgentConfig, p Params) (*
 		cfg:         cfg,
 		subscribers: make(map[chan SSEEvent]struct{}),
 		lastActive:  time.Now(),
+		locker:      lock.Shared(),
+		control:     control.Shared(),
+		// 只 handoff 团需要拒服 plan mode：它没有常驻 engine，SetPlanMode 会 panic。
+		// 星型团有 engine，团长 = 主 agent，ask_expert = Agent tool，可以正常规划。
+		isHandoff: teamMode == team.ModeHandoff,
+		// 存下来给 handoff 那条路用：它每轮现建 backend 写历史（persistChainHistory），
+		// 拿不到 Build 里的局部变量。
+		ctxBudget: ctxBudget,
 	}
+	s.logs = eventlog.Shared()
+	s.eventLog = s.logs.NewWriter(s.id)
 
 	// 记忆中间件（memory_mode != off 时启用）
 	if cfg.MemoryMode != "off" {
@@ -207,6 +291,17 @@ func NewAgentSession(ctx context.Context, cfg *runtime.AgentConfig, p Params) (*
 		},
 		ToolEvents: toolEvents,
 		ExtraTools: extraTools,
+		// 装我们自己的权限服务，为的是让它认识平台工具。
+		//
+		// 引擎的 DefaultResolver 只认它自己那批名字，其余全是 OperationUnknown，
+		// 而 isMutatingAction 对 unknown 返回 false —— 于是 plan 模式在这儿只挡得住
+		// Write/Edit/Bash 三个，code_interpreter、memory_add、所有租户网关工具照跑。
+		// 见 runtime.PlatformResolver 顶部的实测输出。
+		//
+		// 一个会话一个实例（plan 模式是这个服务上的原子量，共享会串），而会话**内部**
+		// 共享正是想要的：deriveExpertBase 原样继承这个指针，所以团长进规划态时它的
+		// 专家和子代理跟着一起被挡。
+		Permissions: runtime.NewPermissionService("flight"),
 		// 身份传进 runtime：它装配的文件工具要靠 tenantID + sessionID 定位
 		// workspace。放在 ToolRuntime 而非 ExtraTools，子代理才能继承（见
 		// GatewayToolset.Tools 的注释）。
@@ -221,6 +316,16 @@ func NewAgentSession(ctx context.Context, cfg *runtime.AgentConfig, p Params) (*
 		// 传 true：拆 gate 之后 Read/Write/Edit/Glob 只要 cfg 非 nil 就注册
 		// （gateway.go 的 Tools），而这里 cfg 必然非 nil，所以引导指向的 Read 一定在。
 		SkillTool: runtime.NewGatewaySkillDiscloser(true),
+	}
+
+	// 会话历史的后端。db 拿不到时传 nil —— 引擎会退回它自己的 JSONL 后端，写到
+	// CWD（/tmp）下，也就是本进程内有效、重启即失。那是降级而不是拒服：会话本身
+	// 完全可用，只是跨节点接不上。
+	if db, err := persistence.DB(); err == nil && db != nil {
+		opts.Backend = persistence.NewEngineBackend(db, p.TenantID, ctxBudget)
+	} else {
+		log.Printf("engine_backend_unavailable session=%s err=%v —— 会话历史退回进程本地，"+
+			"跨节点接续会失效", sessionID, err)
 	}
 
 	if teamMode == team.ModeHandoff {
@@ -245,6 +350,10 @@ func NewAgentSession(ctx context.Context, cfg *runtime.AgentConfig, p Params) (*
 	}
 	s.engine = sess
 
+	// 历史不在这里灌了 —— Build 已经通过 engineCfg.Resume + opts.Backend 自己加载过。
+	// 这里曾经有一个手写的 seedHistoryFromDB，它的问题不是不好用而是**要人记得调**：
+	// 星型这条调了，handoff 那条从来没调，而漏掉的表现是静默的。
+
 	go s.forwardToolEvents(toolEvents)
 
 	return s, nil
@@ -267,19 +376,183 @@ func (s *AgentSession) OwnedBy(tenantID, userID string) bool {
 	return s.tenantID == tenantID && s.userID == userID
 }
 
-func (s *AgentSession) Send(message string, attachmentIDs []int64) error {
+// lockWaitTimeout 是等本进程上一轮释放执行权的上限。取消传播很快，但上一轮还要
+// 跑完收尾（落库），所以不能不等。等超了就返 409 让客户端重试 —— 比让 HTTP 请求
+// 无限期挂着好。
+const (
+	lockWaitTimeout = 5 * time.Second
+	lockPollEvery   = 50 * time.Millisecond
+)
+
+// acquireTurnLock 拿到本会话的执行权，必要时把上一轮打断。
+//
+// "上一轮在本进程"和"上一轮在别的 pod"是同一件事的两种物理形态，处理方式只差在
+// 取消信号怎么送达：
+//
+//  1. 本进程 —— 直接调它的 cancel。REDIS_URL 没配时这是唯一生效的分支，所以
+//     单实例下的行为跟接锁之前一模一样。
+//  2. 别的 pod —— cancel 是个函数指针，跨不过进程边界，所以走控制面转发一条停止
+//     请求（internal/control），然后跟等自己上一轮一样地轮询锁。
+//
+// 两条路合流之后语义统一了：**在生成过程中再发一条消息就是打断重问，跟落在哪个
+// 副本上无关。**这是接 pub/sub 之前做不到的 —— 那时第 2 条只能拒（返 409），于是
+// 同一个操作在单副本下是"打断"、多副本下有一定概率变成"被拒"，而概率取决于负载
+// 均衡把请求丢给了谁。这种随部署形态变化的语义是最难排查的一类问题。
+//
+// 剩下的 409 只出现在真的等不到让位的时候：远端 pod 被 SIGKILL 了（没人解锁，要
+// 等 TTL）、pub/sub 那条消息在重连窗口里丢了、或者那一轮的收尾比 lockWaitTimeout
+// 还慢。这些都是异常，返 409 让客户端重试是对的。
+//
+// 顺带一句这不是唯一解：OpenAI Assistants 选的是纯拒绝（一个 thread 同时只能有一个
+// active run，第二个直接 400），LangGraph 把它做成可配的 multitask_strategy
+// （reject / interrupt / rollback / enqueue）。我们选 interrupt 是因为它匹配用户的
+// 直觉 —— 打字打到一半改主意，按下发送就该换个问题，而不是收到一条报错。
+func (s *AgentSession) acquireTurnLock() (*lock.Handle, error) {
+	s.turnMu.Lock()
+	prev := s.turnCancel
+	s.turnMu.Unlock()
+	if prev != nil {
+		prev()
+	}
+
+	// waiting 表示"取消信号已经送出去了，值得轮询等它释放"。本进程有上一轮时天然
+	// 成立；跨 pod 那条要等发布成功之后才成立 —— 没送出去就去等是白等五秒。
+	waiting := prev != nil
+	askedRemote := false
+
+	deadline := time.Now().Add(lockWaitTimeout)
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		h, err := s.locker.Acquire(ctx, s.id)
+		cancel()
+		if err == nil {
+			return h, nil
+		}
+		if !errors.Is(err, lock.ErrHeld) {
+			return nil, err
+		}
+
+		// 锁被别的 pod 占着（本进程的上一轮已经在上面 cancel 过了）。请它让位。
+		// 只发一次 —— 轮询期间反复 PUBLISH 只会让对方重复调 Stop，那是幂等的但
+		// 毫无意义，还会把日志刷满。
+		if !waiting && !askedRemote {
+			askedRemote = true
+			pctx, pcancel := context.WithTimeout(context.Background(), 2*time.Second)
+			perr := s.control.PublishStop(pctx, s.id)
+			pcancel()
+			if perr != nil {
+				// 送不出去就别装作在等。如实返 ErrHeld → 409，客户端重试或者用户
+				// 再点一次停止，都比让这个 HTTP 请求白挂五秒好。
+				log.Printf("cross_pod_interrupt_failed session=%s err=%v —— 退回拒绝（409）", s.id, perr)
+				return nil, err
+			}
+			log.Printf("cross_pod_interrupt session=%s —— 已请远端 runner 让位，等它释放执行权", s.id)
+			waiting = true
+		}
+
+		// 走到这里 waiting 必然为真：要么本来就有上一轮，要么上面刚发出了转发请求
+		// （发不出去的那条路已经 return 了）。
+		//
+		// 有一个罕见的漏网情况：本进程确实有上一轮（waiting=true），但它已经释放完
+		// 执行权、被另一个 pod 抢走了 —— 这时我们只会干等而不会去请对方让位，5 秒后
+		// 返 409。发生条件是"上一轮收尾"和"另一个 pod 抢锁"精确交错，而代价只是这次
+		// 发送要重试一下，所以不为它增加一条分支。
+		if time.Now().After(deadline) {
+			return nil, err
+		}
+		time.Sleep(lockPollEvery)
+	}
+}
+
+// seedEventSeq 把事件序号对齐到日志里已有的最大值，并清掉上一轮的降级标记。
+//
+// 为什么每轮都要做：序号是**进程内**的计数器，而会话可以在 pod 之间轮转。pod A 跑完
+// 第一轮写到 seq=500，用户的第二条消息落到 pod B —— B 的计数器还是 0，于是它的 XADD
+// 全部因为"ID 不大于流顶端"而失败。表现是那一轮完全没有日志，而且只在多副本轮转时
+// 才出现，本地怎么测都测不到。
+//
+// 调这个函数的时候执行权锁已经在手，所以不存在两个 pod 同时 seed 的问题。
+//
+// 读失败时保守地不动计数器：本轮的日志大概率写不进去（会走降级删流），
+// 而那只影响续传，不影响回答本身。
+func (s *AgentSession) seedEventSeq() {
+	s.eventLog.Reset()
+	if s.eventLog == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	last, err := s.logs.LastSeq(ctx, s.id)
+	if err != nil {
+		log.Printf("event_seq_seed_failed session=%s err=%v —— 本轮可能没有续传日志", s.id, err)
+		return
+	}
+	// 只前进不后退：本进程如果已经数得更高（同一个 pod 连着跑两轮），
+	// 退回去会造成 ID 冲突。
+	for {
+		cur := s.eventSeq.Load()
+		if last <= cur || s.eventSeq.CompareAndSwap(cur, last) {
+			return
+		}
+	}
+}
+
+// PlanControl 是一次请求携带的两个计划相关信号。它们是**不同的东西**，所以分成
+// 两个字段而不是一个枚举：
+//
+//	Mode    这一轮跑在规划态还是执行态（引擎原子量，turn 内生效）
+//	Action  用户对**已提交的那份计划**表了什么态（批准 / 否决 / 没表态）
+//
+// 一条消息可以只有其中一个：用户点"同意"是 Mode=false + Action=approve；
+// 用户在执行中途又切回规划是 Mode=true + Action=""（旧计划原样留着）。
+type PlanControl struct {
+	Mode   bool
+	Action string
+}
+
+// plan_action 的取值。空串是合法的"没表态"，不是缺省错误 —— 绝大多数消息都是它。
+const (
+	PlanActionNone    = ""
+	PlanActionApprove = "approve"
+	PlanActionReject  = "reject"
+)
+
+func (s *AgentSession) Send(message string, attachmentIDs []int64, plan PlanControl) error {
 	// turn 级可取消 ctx —— Stop() 靠它掐断。不能用 context.Background()：
 	// 引擎的 collectAssistantMessage / 工具层 httpClient 全是 ctx-aware，
 	// 但没人持有 cancel 时那些 select <-ctx.Done() 永远不会触发，一旦
 	// RunTurn 起飞就得等 MaxIterations 跑完（实测 20+ 轮、几分钟）。
 	s.Touch()
 
+	// 计划模式跟专家团不兼容，而且不是"没做"，是结构性做不到 —— 所以在入口拒掉，
+	// 不能静默忽略（那样用户以为自己在规划态，agent 已经在改东西了）。
+	//
+	// 三条，每一条单独都足以让它不成立：
+	//
+	//  1. handoff 团里 s.engine 是 nil（那条链每一棒都是引擎现建的），而
+	//     SetPlanMode 会解引用它 —— 实测直接 panic，且 Send 的 goroutine 里没有
+	//     recover，是整个进程挂掉。
+	//  2. 引擎的 Config **没有** PlanMode 字段：它是 repl 会话上的运行时原子量。
+	//     每条 leg 由 deriveExpertBase 从 Config 派生，所以计划模式传不下去。
+	//  3. save_plan 走 Options.ExtraTools，而 deriveExpertBase 里有一句
+	//     `opts.ExtraTools = nil` —— 团里没有任何一棒拿得到这个工具。
+	//
+	// 概念上也重复：handoff 链的拓扑本身就是一份计划，配置时就定好了。再叠一层
+	// 每轮的计划等于两份计划各说各的。要支持得先给引擎加 Config.PlanMode 并接到
+	// 每条 leg 上，那是另一个量级的事。
+	if err := s.planSupported(plan); err != nil {
+		return err
+	}
+
+	// 抢执行权必须同步做 —— 起了 goroutine 就没法把 409 回给调用方了。
+	handle, err := s.acquireTurnLock()
+	if err != nil {
+		return err
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	s.turnMu.Lock()
-	if s.turnCancel != nil {
-		// 上一轮还没收尾（引擎侧 turnActive 也会拒绝并发 turn），先掐掉它
-		s.turnCancel()
-	}
 	s.turnCancel = cancel
 	s.turnEpoch++
 	s.turnStopped = false
@@ -287,6 +560,9 @@ func (s *AgentSession) Send(message string, attachmentIDs []int64) error {
 	s.turnMu.Unlock()
 
 	go func() {
+		// 最先声明 = 最后执行：执行权要持到收尾（落库）真的做完，否则另一个 pod
+		// 可能在我们还在 INSERT 的时候就开始写同一段历史。
+		defer handle.Release()
 		defer func() {
 			cancel()
 			s.turnMu.Lock()
@@ -295,6 +571,8 @@ func (s *AgentSession) Send(message string, attachmentIDs []int64) error {
 			}
 			s.turnMu.Unlock()
 		}()
+		// 必须排在第一次 broadcast 之前 —— 序号一旦发歪，这一整轮的日志都写不进去。
+		s.seedEventSeq()
 		s.broadcast(SSEEvent{Type: "start", Data: nil})
 
 		// H1: 起新 collector，同时 touch session 行（首次自动 INSERT）
@@ -333,6 +611,60 @@ func (s *AgentSession) Send(message string, attachmentIDs []int64) error {
 			}
 		}
 
+		// ── Phase 1b: Plan 模式开关 + 计划状态流转 + 执行计划注入 ──
+		//
+		// SetPlanMode 是引擎原子量，turn 内生效，不持久化：请求带来什么就设什么，
+		// 下一个请求（可能落在另一个 pod）自带它自己的值。plan_mode=true 时 prompt
+		// 引导模型只做调研；plan_mode=false 时恢复执行态。
+		//
+		// ⚠️ 引擎的权限层也会跟着翻（perms.SetPlanMode），但它只挡得住引擎原生的
+		// Write/Edit/Bash —— 平台工具（code_interpreter / memory_add / 网关动态工具）
+		// 在 DefaultResolver 里全部解析成 OperationUnknown，而 isMutatingAction 对
+		// unknown 返回 false，所以规划态下它们照样能跑。要真挡住得给引擎传一个自定义
+		// Resolver，那是另一件事，不在这轮改动范围内。
+		//
+		// nil 判断不是多余的：handoff 团里 engine 就是 nil（见字段注释），而
+		// SetPlanMode 会解引用它 —— 实测 panic，且这里是 goroutine 内、没有 recover，
+		// 整个进程跟着走。Send 入口已经用 ErrPlanModeUnsupported 拦了带 plan_mode 的
+		// 请求，这一道是防"以后有人加了别的调用路径"。
+		if s.engine != nil {
+			s.engine.SetPlanMode(plan.Mode)
+		}
+
+		// 计划状态流转：由请求里的 plan_action 显式驱动。
+		//
+		// 以前这里是「plan_mode=false 就 ActivatePlan」—— 从一个不相干的事件里推断
+		// "用户批准了"。用户回一句"算了不用了"照样会把 draft 激活，然后那份没人要的
+		// 计划会被注入到这个会话之后的每一轮。
+		if db != nil {
+			if err := applyPlanAction(ctx, db, s.tenantID, s.id, plan); err != nil {
+				log.Printf("plan_action_failed session=%s action=%q err=%v", s.id, plan.Action, err)
+			}
+		}
+
+		// 执行阶段注入的是**一行指针**，不是计划全文。
+		//
+		// 全文每轮拼一次的代价是实打实的：引擎的 store 落的是它收到的那条
+		// llm.Message，也就是拼过前缀的那条，所以每一轮的 user 消息里都有一份完整
+		// 计划，ReloadHistory 读回 20 轮就是 20 份。一份 1500 token 的计划 × 20 轮
+		// ≈ 3 万 token 纯重复，而且这个平台没有可继承的 prompt cache，每轮全价。
+		//
+		// 换成指针之后全文由模型按需调 get_plan 取，那份结果声明了 Reproducible +
+		// Identity，陈旧的会被引擎脱水、旧的那份会被新的取代，所以历史里始终只有
+		// 最新一份。指针本身三十来个 token，堆二十份也无所谓。
+		//
+		// 只读**已批准**的那份：待批准的修订不进指针，否则用户还没点同意，模型已经
+		// 按新计划跑了。
+		//
+		// 失败只记日志不拒服：DB 读不到就用原始 message，是降级不是不可用。
+		if !plan.Mode && db != nil {
+			if p, err := persistence.LoadPlan(ctx, db, s.tenantID, s.id); err != nil {
+				log.Printf("load_plan_failed session=%s err=%v (本轮不注入计划)", s.id, err)
+			} else if hint := planHint(p); hint != "" {
+				message = hint + "\n\n[用户消息]\n" + message
+			}
+		}
+
 		// ── Phase 2: 执行 ──
 		//
 		// 两条拓扑在这里分岔，往下的收尾（历史、用量、SSE、落库）完全共用：runChain 把
@@ -345,6 +677,23 @@ func (s *AgentSession) Send(message string, attachmentIDs []int64) error {
 		if s.chainCfg != nil {
 			result, err = s.runChain(ctx, message)
 		} else {
+			// 星型/单 agent：跑之前把历史从库里重读一遍。
+			//
+			// 这个会话对象被 Manager 按 session_id 缓存并跨请求复用，而它内部的引擎会话
+			// 只在 Build 那一刻读过一次库。多副本下这条会静默出错：中间某一轮落到别的
+			// pod，那一轮进了 agent_messages 但**没进本进程的内存**，于是下一轮再落回来
+			// 时，模型拿着缺了一轮的历史回答，然后把自己这轮也写进去 —— 库里那段对话就
+			// 成了两个写者交错的产物。
+			//
+			// 表现是"模型忘了刚才说过的话"，跟持久化整个没生效长得一模一样，排查时很容易
+			// 以为是回退。
+			//
+			// 接力型不需要这一步：runChain 每轮都由引擎重新建 leg，天然每轮重载。
+			//
+			// 失败只记日志不拒服：读不到就用内存里那份，是降级不是不可用。
+			if err := s.engine.ReloadHistory(ctx); err != nil {
+				log.Printf("history_reload_failed session=%s err=%v (沿用内存中的历史)", s.id, err)
+			}
 			result, err = s.engine.RunTurn(ctx, message)
 		}
 		switch {
@@ -390,14 +739,41 @@ func (s *AgentSession) Send(message string, attachmentIDs []int64) error {
 
 			inTok, outTok := sumUsages(result.Usages)
 			s.recordTurnUsage(result)
-			s.broadcast(SSEEvent{Type: "result", Data: map[string]any{
+
+			resultData := map[string]any{
 				"text":            assistantText,
 				"iterations":      result.Iterations,
 				"stopped":         result.Stopped,
 				"inputTokens":     inTok,
 				"outputTokens":    outTok,
 				"peakInputTokens": peakInputTokens(result.Usages),
-			}})
+			}
+			// 追问标记：前端据此区分"正常完成"和"等用户回答"。
+			if result.AwaitingUser {
+				resultData["awaitingUser"] = true
+			}
+			s.broadcast(SSEEvent{Type: "result", Data: resultData})
+
+			// 追问事件：携带问题和选项，前端渲染交互 UI。
+			// 在 result 之后、done 之前播，保证前端在收到 done 之前已经拿到追问数据。
+			// AskUser 只做一件事：把问题和选项播给前端。它**不碰 plan 表**。
+			//
+			// 这里以前还顺手 SavePlan(question)，那是把两个信号焊在了一个事件上：
+			// "这是一份计划" 和 "停下来等用户"。后果是规划一轮里模型先调
+			// save_plan(完整计划) 再调 AskUser("是否同意？")，收尾时这段把那句一行
+			// 的追问**覆盖**掉刚存好的正文，执行阶段注入的"计划"就成了"是否同意？"。
+			//
+			// 而那个 `if planMode` 守卫本身就是耦合的症状：正因为 AskUser 会写 plan
+			// 表，才必须判断"现在是不是规划阶段"，否则执行中的普通追问会污染计划。
+			// 解耦之后这个判断不需要了 —— save_plan 是计划的唯一写入口。
+			if result.AwaitingUser {
+				if q, opts := extractAskUserPayload(result.FinalAssistant); q != "" {
+					s.broadcast(SSEEvent{Type: "ask_user", Data: map[string]any{
+						"question": q,
+						"options":  opts,
+					}})
+				}
+			}
 		}
 
 		// H1: 落库 user + assistant 两条消息（含 extra 可视化）
@@ -448,11 +824,21 @@ func (s *AgentSession) runChain(ctx context.Context, message string) (turn.Resul
 		Stopped: chain.Stopped,
 		// 迭代数 = 全链所有请求次数。它回答的是"这一次对话花了多少轮模型调用"，
 		// 跟星型同义；leg 数另外单独播（chain_hop），两个数不该混。
-		Iterations: len(chain.Usages),
+		Iterations:   len(chain.Usages),
+		AwaitingUser: chain.AwaitingUser,
 		FinalAssistant: llm.Message{
 			Role:    llm.RoleAssistant,
 			Content: []llm.ContentBlock{{Type: llm.ContentBlockTypeText, Text: chain.Final}},
 		},
+	}
+
+	// 追问场景：链因为某个专家调了 AskUser 而停下。问题和选项在 History 最后的
+	// assistant 消息的 tool_use 块里。把它追加到 FinalAssistant，这样 Send 能
+	// 从中提取 question/options 播 ask_user 事件。
+	if chain.AwaitingUser {
+		if block, ok := findAskUserToolUse(chain.History); ok {
+			result.FinalAssistant.Content = append(result.FinalAssistant.Content, block)
+		}
 	}
 
 	// 每一棒播一条事件。没有它前端只能看到一堆工具卡而不知道换过人 —— 链是平的，
@@ -485,6 +871,13 @@ func (s *AgentSession) runChain(ctx context.Context, message string) (turn.Resul
 	}
 	log.Printf("chain_done session=%s legs=%d diverted=%v stopped=%v",
 		s.id, len(chain.Legs), chain.DivertedToExit, chain.Stopped)
+
+	// 留给落库用。链现在是一整段对话，落的是引擎自己产出的那份消息 —— 里面有
+	// handoff 的 tool_use 和 tool_result，下一轮读回来时交接的痕迹还在。
+	// 存在字段上而不是塞进 turn.Result：那是引擎的类型，不该为这个宿主加字段。
+	s.mu.Lock()
+	s.lastChain = &chain
+	s.mu.Unlock()
 
 	return result, err
 }
@@ -562,6 +955,84 @@ func (s *AgentSession) persistTurn(ctx context.Context, userMsg, assistantMsg st
 	if err := persistence.SaveMessages(ctx, db, msgs...); err != nil {
 		log.Printf("save_messages_failed session=%s err=%v", s.id, err)
 	}
+
+	// agent_messages（给模型的那份）在两条拓扑上由不同的人写，互斥不重叠：
+	//
+	//   星型 —— 引擎自己写（PersistSession=true + opts.Backend）。落的是引擎原生
+	//           消息，含 tool_use / tool_result，保真度最高。
+	//   handoff —— 引擎写不了：每一棒都是 PersistSession=false 的临时会话，跑完就
+	//           销毁，RunChain 也不把各棒的消息交出来。所以这里补写。
+	//
+	// 只补用户消息和最终回答，不补各棒的内部往来 —— 一条链的**对话**就是这两条，
+	// 中间换棒是实现细节。把上一棒的 tool_use 块重放给下一棒本身也说不通：那些块
+	// 属于另一个专家的会话。
+	if s.chainCfg != nil {
+		s.appendChainHistory(ctx, db, runErr)
+	}
+}
+
+// appendChainHistory 把一整条链新产生的那段对话落到 agent_messages。
+//
+// 落的是引擎产出的真消息，不是重新拼的一问一答。这是这轮改造的落点：链在引擎里已经
+// 是一整段对话了，每一棒的 assistant 消息、handoff 的 tool_use 和 tool_result 都在
+// 里面，原样落下去下一轮才读得回同一段东西。以前这里造一对 user/assistant 文本，
+// 结果是**给模型看的历史和链真正跑过的历史不是一回事** —— 交接痕迹没了，工具调用
+// 没了，第二轮的链只知道"上次有人回答过一句话"。
+//
+// 只落 History[PriorLen:]：前面那截是这条链启动时从库里读出来的，已经在表里了。
+//
+// 失败的轮次整轮不落：链跑挂时最后那棒可能停在半路，把半截东西灌回给模型会让它
+// 把没做完的事当做过。chat_messages 那份仍然写 —— 用户该在历史里看到出过错。
+func (s *AgentSession) appendChainHistory(ctx context.Context, db *sql.DB, runErr error) {
+	if runErr != nil {
+		return
+	}
+	s.mu.RLock()
+	chain := s.lastChain
+	s.mu.RUnlock()
+	if chain == nil {
+		return
+	}
+	fresh, ok := freshChainMessages(chain)
+	if !ok {
+		log.Printf("chain_history_bad_prior session=%s prior=%d len=%d —— 本轮不落",
+			s.id, chain.PriorLen, len(chain.History))
+		return
+	}
+	if len(fresh) == 0 {
+		return
+	}
+
+	store, err := persistence.NewEngineBackend(db, s.tenantID, s.ctxBudget).OpenStore(ctx, s.id)
+	if err != nil {
+		log.Printf("chain_history_store_failed session=%s err=%v", s.id, err)
+		return
+	}
+	defer store.Close(ctx)
+
+	if err := store.Append(ctx, fresh); err != nil {
+		// 降级而不是拒服：这一轮的回答已经给了用户，只是下一轮模型会少这段上下文。
+		log.Printf("chain_history_append_failed session=%s msgs=%d err=%v —— 下一轮会缺这段上下文",
+			s.id, len(fresh), err)
+	}
+}
+
+// freshChainMessages 取一条链本次新产生的消息 —— History 去掉开头那截"跑之前就有的"。
+//
+// ok=false 表示 PriorLen 不可信，调用方整轮不落。引擎那边已经夹过一次，这里再挡是因为
+// 出错的两种方向代价差得远：多写一段会让下一轮把同一段对话读两遍（模型看到自己复读），
+// 少写不了什么；而 PriorLen 超出长度会直接 panic 在落库的收尾 goroutine 上。
+//
+// 单独拎出来是为了能不连库测。这段的判断（切在哪、越界怎么办）跟 SQL 没关系，混在
+// 需要 *sql.DB 的方法里就只能靠真机跑到才发现切错了。
+func freshChainMessages(chain *engine.ChainResult) ([]llm.Message, bool) {
+	if chain == nil {
+		return nil, true
+	}
+	if chain.PriorLen < 0 || chain.PriorLen > len(chain.History) {
+		return nil, false
+	}
+	return chain.History[chain.PriorLen:], true
 }
 
 func (s *AgentSession) Subscribe() chan SSEEvent {
@@ -593,6 +1064,9 @@ func (s *AgentSession) Close() {
 	if s.engine != nil {
 		s.engine.Close(context.Background())
 	}
+	// 日志写入器停掉，但**不删流** —— TTL 到了自然清。会话被空闲淘汰时那一轮
+	// 早就结束了，而流还留着的话，正好赶上重连的客户端仍能把结尾补齐。
+	s.eventLog.Close()
 	s.mu.Lock()
 	for ch := range s.subscribers {
 		close(ch)
@@ -601,7 +1075,19 @@ func (s *AgentSession) Close() {
 	s.mu.Unlock()
 }
 
+// broadcast 是所有 SSE 事件的唯一出口 —— 发序号、写事件日志、扇出给订阅者都在这里。
+//
+// 放在这一个漏斗里是有意的：十来处 broadcast 调用点如果各自负责这些，漏掉一处的
+// 表现是"某类事件续传不了"，而且只在断线重连时才暴露。
 func (s *AgentSession) broadcast(ev SSEEvent) {
+	// 序号在本地发，不等 Redis —— 广播这一刻就知道 id，SSE 写入零阻塞。
+	// 从 1 开始：Redis 的流条目 ID 不接受 0-0。
+	ev.Seq = s.eventSeq.Add(1)
+
+	// 渲染一次，直播和重放共用同一份字节。原始对象留在 ev.Data 里给内存订阅者用，
+	// 渲染结果只进日志 —— 两条路最终都过 gin 的 sse 编码器，格式一致。
+	s.eventLog.Append(eventlog.Entry{Seq: ev.Seq, Type: ev.Type, Data: RenderSSEData(ev.Data)})
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for ch := range s.subscribers {
@@ -609,6 +1095,37 @@ func (s *AgentSession) broadcast(ev SSEEvent) {
 		case ch <- ev:
 		default:
 		}
+	}
+}
+
+// RenderSSEData 把事件载荷渲染成 SSE 的 data 字段内容，规则跟 gin 的 sse 编码器一致：
+// struct / slice / map 走紧凑 JSON，其余走 fmt.Sprint（于是 nil 渲染成 "<nil>"，
+// 跟今天线上的行为一样）。
+//
+// 必须跟 gin 对齐，否则重放出来的载荷格式跟直播不同 —— 前端对 delta 是直接取字符串、
+// 对 tool_event 是 JSON.parse，格式一变两边都会崩，而且只在断线重连时才发生。
+//
+// 渲染后的字符串再交回 gin 时会走 fmt.Sprint 那条分支原样写出，所以逐字节等价
+// （紧凑 JSON 内部没有换行，不会被 gin 的多行 data: 拆分逻辑改动）。
+func RenderSSEData(data any) string {
+	// 照抄 gin 的 kindOfData：指针要先解引用再判断，所以 *struct 走 JSON、
+	// *int 走 fmt.Sprint。不解引用的话这两类会分岔。
+	v := reflect.ValueOf(data)
+	kind := v.Kind()
+	if kind == reflect.Ptr {
+		kind = v.Elem().Kind()
+	}
+	switch kind {
+	case reflect.Struct, reflect.Slice, reflect.Map:
+		b, err := json.Marshal(data)
+		if err != nil {
+			// 编不出来就退回文本形式。丢格式好过丢事件 —— 少一条 delta 就是正文缺一段。
+			log.Printf("sse_render_failed type=%T err=%v", data, err)
+			return fmt.Sprint(data)
+		}
+		return string(b)
+	default:
+		return fmt.Sprint(data)
 	}
 }
 
@@ -719,33 +1236,95 @@ func peakInputTokens(usages []*llm.Usage) int {
 	return peak
 }
 
-// defaultContextWindow 是拿不准的模型用的保守缺省。
+// fallbackContextWindow 是配置里没给出窗口时的兜底。
 //
-// 这个数字只决定**什么时候开始回收历史**（引擎在超过 threshold ratio 时才跑 Reduce），
-// 不是硬上限。估小了只是回收得早一点、多付几次重读的代价；估大了会在模型真实上限前
-// 撞墙，那才是用户能看到的失败。所以缺省往小取。
-const defaultContextWindow = 128_000
+// 刻意取小，而且比这里曾经的 128_000 小得多。理由是**它现在是兜底，不是典型值**：
+// 它只在 lea-config 没下发 model_context_window 时才生效，也就是"我们不知道这是什么
+// 模型"的时候。那种情况下猜大的代价是在模型真实上限处整轮失败（用户可见），猜小的
+// 代价只是早压一次（一次摘要调用）。
+//
+// 原来那个 128_000 的问题不是数值不对，是它同时在当"典型值"和"兜底"用 —— 于是给
+// qwen3-8b（真实窗口 32k）也发 128k，Reduce 永远不触发然后直接撞墙。
+const fallbackContextWindow = 32_000
 
-// contextWindowFor 返回模型的上下文预算。
+// costCeilingTokens 是成本闸：我们愿意为一轮**输入**付多少 token。0 = 不设闸。
 //
-// 按前缀匹配而不是精确表：精确表在模型名多一个后缀时就静默失效（"qwen3-max" →
-// "qwen3-max-2026" 会掉进缺省分支而没人发现），而这里判断错的代价只是回收时机偏移。
-// 前缀匹配对同一系列的新版本自动生效。
+// 为什么它跟模型窗口是两个数：窗口是模型的客观事实，成本是产品决策。压成一个的后果是
+// "换了个大窗口的模型，账单自己涨了"，而没人做过那个决定。
 //
-// 实际在用的模型见 .env：LEA_MODEL_CHAT / LEA_MODEL_ROUTING = qwen3-max，
-// LEA_MODEL_FALLBACK = glm-5.1，LEA_LOCAL_MODEL = qwen3-8b。
-func contextWindowFor(model string) int {
-	m := strings.ToLower(strings.TrimSpace(model))
-	switch {
-	case strings.HasPrefix(m, "qwen3-8b"), strings.HasPrefix(m, "qwen2"):
-		// 小模型窗口小得多，给它 128k 会让 Reduce 永远不触发然后直接撞墙。
-		return 32_000
-	case strings.HasPrefix(m, "qwen3-max"), strings.HasPrefix(m, "qwen-max"),
-		strings.HasPrefix(m, "qwen-plus"), strings.HasPrefix(m, "qwen3"):
-		return defaultContextWindow
-	case strings.HasPrefix(m, "glm-5"), strings.HasPrefix(m, "glm-4"):
-		return defaultContextWindow
-	default:
-		return defaultContextWindow
+// 具体到 qwen3-max，阿里按输入长度分档计价（0–32K $0.861/M，32–128K $1.434/M，
+// 128–252K $2.151/M），所以让上下文长到窗口上限是 token 数和单价**同时**涨，超线性。
+// 而这个平台每轮都重新加载历史、没有可继承的 prompt cache，是全价重发。
+//
+// 现在留空：先按模型窗口走，要收紧时把这个数填上即可，形状已经在了。
+const costCeilingTokens = 0
+
+// engineBudgetRatio 把"模型窗口"换算成引擎的 MaxContextTokens。
+//
+// 引擎在 MaxContextTokens × compactionThresholdRatio 处触发压缩，而那个 0.8 是引擎的
+// **包级常量，改不了**。我们想让压缩落在真实窗口的 70%，所以 0.7 / 0.8 = 0.875。
+//
+// 也就是说 MaxContextTokens **不是**触发线，它是触发线除以 0.8 之后的那个数。这两者
+// 差 25%，看混了就会以为压缩比实际更早或更晚。
+const engineBudgetRatio = 0.875
+
+// contextBudget 由模型窗口和成本闸算出引擎的上下文预算。
+//
+// modelWindow 来自 lea-config 下发的 AgentConfig.ModelContextWindow —— 模型和它的参数
+// 都是外部传进来的，窗口没有理由例外。这里不再有"lea-agent 认识哪些模型"的表：那种表
+// 在模型名多一个后缀时会静默失效，而且换模型要改代码、发版。
+func contextBudget(modelWindow, costCeiling int) int {
+	// 小于 minPlausibleWindow 的值当成"没配"，不是当成"这个模型真的这么小"。
+	//
+	// 不加这道的后果很具体：窗口填 1 时 int(1 × 0.875) == 0，而 0 在引擎那边的含义是
+	// **把压缩整个关掉**（`if s.maxContextTokens <= 0 { return }`）。也就是说一个手滑
+	// 填小的配置不会让压缩变激进，会让它彻底消失 —— 而且没有任何报错。
+	// 零值和"小得离谱"必须走同一条兜底路径，否则这个函数在边界上是反直觉的。
+	if modelWindow < minPlausibleWindow {
+		modelWindow = fallbackContextWindow
 	}
+	if costCeiling >= minPlausibleWindow && costCeiling < modelWindow {
+		modelWindow = costCeiling
+	}
+	return int(float64(modelWindow) * engineBudgetRatio)
+}
+
+// minPlausibleWindow 是"这看起来像个真的上下文窗口"的下限。
+// 比任何在用的模型都小（最小的 qwen3-8b 也有 32k），所以正常配置不会被它捕获。
+const minPlausibleWindow = 4_096
+
+// findAskUserToolUse 从会话历史中找最后一个 AskUser tool_use 块。
+// 追问场景下，问题和选项在 chain.History 最后一条 assistant 消息的 tool_use 里。
+func findAskUserToolUse(history []llm.Message) (llm.ContentBlock, bool) {
+	for i := len(history) - 1; i >= 0; i-- {
+		msg := history[i]
+		if msg.Role != llm.RoleAssistant {
+			continue
+		}
+		for _, block := range msg.Content {
+			if block.Type == llm.ContentBlockTypeToolUse && block.Name == "AskUser" {
+				return block, true
+			}
+		}
+	}
+	return llm.ContentBlock{}, false
+}
+
+// extractAskUserPayload 从 FinalAssistant 的 AskUser tool_use 块中提取问题和选项。
+// 返回 (question, options)。找不到或解析失败时 question 为空串。
+func extractAskUserPayload(msg llm.Message) (string, []string) {
+	for _, block := range msg.Content {
+		if block.Type != llm.ContentBlockTypeToolUse || block.Name != "AskUser" {
+			continue
+		}
+		var in struct {
+			Question string   `json:"question"`
+			Options  []string `json:"options"`
+		}
+		if err := json.Unmarshal(block.Input, &in); err != nil {
+			return "", nil
+		}
+		return strings.TrimSpace(in.Question), in.Options
+	}
+	return "", nil
 }

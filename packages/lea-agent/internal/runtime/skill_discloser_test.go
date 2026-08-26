@@ -232,18 +232,18 @@ func bulkSkillSet() *skill.Set {
 	}))
 }
 
-func TestExpertGetsDeferralInsteadOfBulkBody(t *testing.T) {
+// 专家现在总是拿到完整正文，不再拦截。原因是拦截会让追问在子代理里发生，
+// 而子代理不能 AskUser，问题到不了用户。
+func TestExpertGetsFullBulkBody(t *testing.T) {
 	d := NewGatewaySkillDiscloser(true)
 	d.SetSet(bulkSkillSet())
 
 	txt := discloserText(discloseAs(t, d, "pptx-generator", true))
-	if strings.Contains(txt, strings.Repeat("X", 64)) {
-		t.Fatal("大 skill 的正文进了专家上下文 —— 拦截失效，这笔开销已经付了")
+	if !strings.Contains(txt, strings.Repeat("X", 64)) {
+		t.Fatalf("专家没拿到大 skill 正文 —— 追问会在子代理里发生而用户看不到：\n%s", txt[:min(len(txt), 400)])
 	}
-	for _, want := range []string{"请派给子代理执行", "Task(", SkillRunnerName} {
-		if !strings.Contains(txt, want) {
-			t.Errorf("替代回复缺 %q：\n%s", want, txt)
-		}
+	if strings.Contains(txt, "请派给子代理执行") {
+		t.Error("专家不该被要求派活 —— 现在专家自己加载 skill，追问在专家层闭环")
 	}
 }
 

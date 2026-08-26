@@ -11,6 +11,9 @@ import (
 
 	engine "gitlab.ouc-online.com.cn/aibase/agentloop"
 	"gitlab.ouc-online.com.cn/aibase/agentloop/tool"
+	"gitlab.ouc-online.com.cn/aibase/agentloop/tools/askuser"
+	"gitlab.ouc-online.com.cn/aibase/agentloop/tools/webfetch"
+	"gitlab.ouc-online.com.cn/aibase/agentloop/tools/websearch"
 )
 
 var toolsGatewayURL = getEnv("LEA_TOOLS_URL", "http://localhost:8400")
@@ -90,7 +93,36 @@ func (ts *GatewayToolset) Tools() []tool.Tool {
 		return nil
 	}
 	tools := BuildFileTools(ts.tenantID, ts.userID, ts.sessionID, ts.cfg.SandboxEnabled)
-	return append(tools, BuildPlatformTools(ts.cfg, ts.tenantID, ts.userID, ts.sessionID)...)
+	tools = append(tools, BuildPlatformTools(ts.cfg, ts.tenantID, ts.userID, ts.sessionID)...)
+	// 联网调研：WebSearch（DuckDuckGo，无需 key）+ WebFetch（抓一个 URL 的正文）。
+	//
+	// 它们是引擎自带的工具，但我们此前**一个都没有** —— 不是选择，是遗漏：build.go
+	// 一看到 opts.ToolRuntime 非 nil 就整个替换掉本地 runtime，于是 tools.Builtins()
+	// 里那批（WebSearch / WebFetch / Grep / TodoWrite / Delete）全没进来。跟
+	// TodoWrite 缺失是同一个根因。
+	//
+	// 补上它们对**计划模式**尤其要紧：引擎判 OperationNetwork，而 isMutatingAction
+	// 对 network 返回 false，所以规划态放行（实测 allow）—— 引擎自己的 plan-mode
+	// prompt 里就写着可以 "web fetches"。对一个只配了业务 API、没有知识库的 agent，
+	// 这是规划阶段唯一能用的外部信息来源（租户自定义工具在规划态被当成 External 挡住）。
+	//
+	// 走 Provision 而不是 ExtraTools：专家和子代理同样需要查资料，而
+	// deriveExpertBase 会把 ExtraTools 清空。
+	//
+	// ⚠️ WebSearch 打的是 DuckDuckGo 的 HTML 结果页（引擎硬编码，见
+	// tools/websearch）。它不用 key，所以开箱可用，但也意味着**绕过了 lea-tools
+	// 的凭证和配额体系** —— 平台已有的 serpapi 那条路没被用上。要换成走网关得包一个
+	// 自己的工具，那是另一件事；先接上引擎这个，让规划态有东西可查。
+	tools = append(tools, websearch.New(), webfetch.New())
+	// 追问工具。走 Provision 而不是 ExtraTools，因为**需要它的正是转交团的每一棒**，
+	// 而 deriveExpertBase 会把 ExtraTools 清空 —— 放那边等于只有单 agent 能问。
+	//
+	// 引擎侧不会让子代理继承它（build.go 明确剔除）：子代理调它只会把自己那轮停掉，
+	// 问题到不了用户，父代理反而拿到一个截断的结果然后替用户回答。
+	//
+	// 不接的代价实测过：内部沟通专家读完 skill（那份 skill 明写"先问用户目标受众"），
+	// 提了四个问题就结束回合，链把它当丢线兜底，白跑两棒，用户一个字都没看到。
+	return append(tools, askuser.New())
 }
 
 func (ts *GatewayToolset) Close(ctx context.Context) error {
@@ -114,6 +146,16 @@ func ExecuteRemoteTool(ctx context.Context, toolName string, params map[string]a
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", tenantID)
+	// userID 这个参数一直都在签名里，只是从来没发出去过 —— 网关侧因此只能按
+	// (租户, 名字) 找工具。工具名改成用户内唯一之后（migrations/007），同一个租户里
+	// alice 和 bob 可以各有一个 weather，不带这个头就是在两个人的工具之间随便挑一个。
+	//
+	// 空值不设头：网关把"没有 X-User-ID"当成 fail-closed（只解析平台工具），
+	// 而设一个空字符串会变成"owner_user_id = ''"，那是个匹配不到任何人的值，
+	// 但语义上比缺席更像"有身份"。缺席更诚实。
+	if userID != "" {
+		req.Header.Set("X-User-ID", userID)
+	}
 	req.Header.Set("X-User-Role", "user")
 
 	resp, err := gatewayClient.Do(req)

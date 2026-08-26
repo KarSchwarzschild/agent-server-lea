@@ -48,6 +48,12 @@ const routes: RouteRecordRaw[] = [
             name: 'Documents',
             component: () => import('../views/Documents.vue'),
             meta: { title: '文档中心' }
+          },
+          {
+            path: 'chat-v2/:sessionId?',
+            name: 'ChatV2',
+            component: () => import('../views/ChatV2.vue'),
+            meta: { title: '对话 v2 (Go)' }
           }
         ]
       },

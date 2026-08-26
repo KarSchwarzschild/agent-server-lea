@@ -1,0 +1,125 @@
+# 多副本验证台 —— 不是生产编排。
+#
+# 生产是 CCE（k8s），见 infra/k8s/。这份存在的唯一目的是**在本地真的起两个
+# lea-agent 副本挂在轮询的 nginx 后面**，把只在多副本下才会暴露的路径跑一遍：
+#
+#   - 跨副本停止（stop 请求落到不持有该会话的副本）
+#   - 断线续传（GET /chat/stream/:id?from= 落到另一个副本）
+#   - 生成中再发消息（打断远端副本的 turn，而不是 409 拒绝）
+#   - 优雅退出（SIGTERM 时排空正在跑的 turn，/health 翻 503 让 nginx 摘流量）
+#
+# 这四条单元测试都覆盖不到 —— 它们靠的是真实的 HTTP、真实的 nginx 缓冲行为、
+# 真实的信号投递。
+#
+# ── 跑法 ──────────────────────────────────────────────────────────────────
+#
+#   # lea-agent 需要 agentloop 作为具名上下文（见 packages/lea-agent/Dockerfile）
+#   docker build --build-context agentloop=../agentloop \
+#       -f packages/lea-agent/Dockerfile -t lea-agent:dev .
+#   docker build -f packages/lea-tools/Dockerfile  -t lea-tools:dev .
+#   docker build -f packages/lea-config/Dockerfile -t lea-config:dev .
+#
+#   docker compose -f infra/docker-compose.verify.yml up -d
+#   curl http://127.0.0.1:8080/nginx-health
+#
+# ── 中间件 ────────────────────────────────────────────────────────────────
+#
+# 全部用**已有的自建中间件**（202.205.160.9 上的 Redis / MySQL），这里不起任何
+# 中间件容器。理由跟 CCE 上一样：中间件端点是注入进来的配置，不是编排的一部分。
+# 将来换成云服务商的托管实例，改的是下面这几个值，编排本身不动。
+#
+# ⚠️ REDIS_URL 在这里**必须覆盖 .env**。.env 里是 redis://127.0.0.1:6379/0，
+# 在容器里指的是容器自己 —— 连不上。而 lock / control / eventlog 三个包在连不上
+# Redis 时是"正确地什么都不做"（单实例下那是对的行为），不报错、日志里也看不出来。
+# 于是整个验证台会安静地退化成两个互不相干的单实例，四条测试全部假绿。
+
+name: lea-verify
+
+x-agent-common: &agent-common
+  image: lea-agent:dev
+  env_file: [../.env]
+  environment: &agent-env
+    # 真 Redis —— 见上面那段 ⚠️
+    REDIS_URL: redis://202.205.160.9:26379/0
+    # 容器网络里按服务名解析，不是 127.0.0.1
+    LEA_CONFIG_URL: http://lea-config:8500
+    LEA_TOOLS_URL: http://lea-tools:8400
+    # 排空超时调短，验证时不想等 3 分钟。生产保持默认。
+    LEA_AGENT_DRAIN_TIMEOUT: 30s
+  depends_on:
+    lea-config: {condition: service_healthy}
+  restart: unless-stopped
+
+services:
+  # 两个副本故意分成两个具名 service，而不是 deploy.replicas: 2。
+  # 验证时需要能精确地"停掉 A"、"只看 B 的日志"、"确认这一轮跑在哪个副本上" ——
+  # replicas 起出来的实例名字带随机后缀，做不到。
+  #
+  # hostname 是有用途的，不只是好看：控制面（internal/control）用 host/pid 当
+  # origin 打在跨副本的停止消息里。默认的容器 hostname 是一串容器 ID，
+  # 日志里看到 "origin=3f2a9b1c4d5e/1" 对不上任何东西；设成 agent-a 之后
+  # 一眼能看出这条停止请求是谁发的、谁执行的。
+  agent-a:
+    <<: *agent-common
+    container_name: verify-agent-a
+    hostname: agent-a
+
+  agent-b:
+    <<: *agent-common
+    container_name: verify-agent-b
+    hostname: agent-b
+
+  nginx:
+    image: nginx:alpine
+    container_name: verify-nginx
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx/lea-agent.conf:/etc/nginx/conf.d/default.conf:ro
+      # 主配置也要换，为的就是 worker_processes 1 —— 见下面那段。
+      # 不能用 `nginx -g "worker_processes 1;"` 代替：会跟镜像自带 nginx.conf 里的
+      # worker_processes auto 冲突，报 directive is duplicate 直接起不来（试过）。
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    # ── worker_processes 1 是这个验证台能用的前提 ──────────────────────────
+    #
+    # nginx 默认轮询的状态是**每个 worker 各持一份**（fork 之后的独立拷贝），而
+    # worker_processes auto 在这台机器上是 34。低流量下每个请求基本落在不同的
+    # worker 上，每个 worker 都从第一个 peer 开始数 —— 实测 40 个并发请求里
+    # 36 个去了 agent-a、只有 4 个去 agent-b。
+    #
+    # 后果不是"nginx 坏了"（高负载下分布是正常的），而是**人工验证跨副本行为时
+    # 几乎永远打不到第二个副本** —— 于是跨副本停止、断线续传、生成中打断这几条
+    # 路径一条都走不到，测出来的绿是假的。
+    #
+    # 压成 1 个 worker 之后轮询是严格交替的，验证才有意义。
+    # 这只是验证台的设置，生产不要这么配（会浪费多核）。
+    depends_on: [agent-a, agent-b]
+    restart: unless-stopped
+
+  lea-config:
+    image: lea-config:dev
+    container_name: verify-lea-config
+    env_file: [../.env]
+    restart: unless-stopped
+
+  # ⚠️ 这个本地 lea-tools 只是让链路完整，**不能用来验证沙箱的文件行为。**
+  #
+  # 真正在用的 lea-tools 部署在 10.192.241.137（跟 Cube 同一台），.env 里的
+  # LEA_TOOLS_URL 指的是那个。上面 agent 的 environment 把它覆盖成了这个容器，
+  # 所以验证台里跑的是本地这份。
+  #
+  # 差别是实质性的：这台机器上没有共享存储，`ensure_session_dir` 建不出目录，
+  # 于是沙箱创建时**不挂 host-mount** —— 日志里只有一行
+  #   host-mount skipped: shared storage not writable from lea-tools
+  # 然后文件只存在于沙箱内部，沙箱一死就没了。所以"产物跨轮次还在"这类验证
+  # 必须在有共享存储的环境做，在这里做出来的结论是错的。
+  #
+  # 沙箱跨副本认领那部分不受影响 —— 它只依赖 Cube 的 metadata，而 Cube 是真的
+  # （见 packages/lea-tools/tests/verify_adopt.py，那个脚本直接打真 Cube）。
+  lea-tools:
+    image: lea-tools:dev
+    container_name: verify-lea-tools
+    env_file: [../.env]
+    environment:
+      REDIS_URL: redis://202.205.160.9:26379/0
+    restart: unless-stopped

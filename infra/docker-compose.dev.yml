@@ -1,46 +1,8 @@
 services:
-  backend:
-    build:
-      context: ..
-      dockerfile: packages/lea-server/Dockerfile
-    container_name: lea-backend-dev
-    ports:
-      - "8100:8000"  # host:container — 8100 避开 lifelong-edu 的 8000
-    env_file:
-      - ../.env
-    environment:
-      DB_HOST: 202.205.160.9
-      DB_PORT: 3307
-      DB_PASSWORD: 123456
-      REDIS_URL: redis://redis:6379/0
-      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      MINIO_ENDPOINT: http://minio:9000
-      LEA_MILVUS_URI: http://milvus:19530
-      LEA_EMBEDDING_API_BASE: https://tenantapi-ai.ouchn.edu.cn/v1/embeddings
-      LEA_EMBEDDING_MODEL: bge-large-zh-v1.5
-      LEA_EMBEDDING_DIM: 1536
-      LEA_RERANKER_API_BASE: http://202.205.160.8:6006
-      MINERU_TOKEN: ${MINERU_TOKEN:-sk-avF2b1pvsuGxSv1St07QRTENYjib14fGGkc9cwEA0RGuXvBw}
-      LEA_RETRIEVAL_SERVICE_URL: http://retrieval:8300
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    volumes:
-      - ../packages:/app/packages
-      - ../pyproject.toml:/app/pyproject.toml
-      - ../uv.lock:/app/uv.lock
-      - backend_venv:/app/.venv
-    command: >
-      sh -c "uv sync --frozen --no-dev && uv run uvicorn lea_server.main:app --host 0.0.0.0 --port 8000 --reload"
-    depends_on:
-      redis:
-        condition: service_healthy
-      minio:
-        condition: service_healthy
-
   retrieval:
     build:
       context: ..
-      dockerfile: packages/lea-server/Dockerfile
+      dockerfile: packages/lea-rag/Dockerfile
     container_name: lea-retrieval-dev
     ports:
       - "8300:8300"
@@ -75,7 +37,7 @@ services:
   retrieval-worker:
     build:
       context: ..
-      dockerfile: packages/lea-server/Dockerfile
+      dockerfile: packages/lea-rag/Dockerfile
     container_name: lea-retrieval-worker-dev
     env_file:
       - ../.env
@@ -119,40 +81,6 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
-
-  celery-worker:
-    build:
-      context: ..
-      dockerfile: packages/lea-server/Dockerfile
-    container_name: lea-celery-worker-dev
-    env_file:
-      - ../.env
-    environment:
-      DB_HOST: 202.205.160.9
-      DB_PORT: 3307
-      DB_PASSWORD: 123456
-      REDIS_URL: redis://redis:6379/0
-      MINIO_ENDPOINT: http://minio:9000
-      LEA_MILVUS_URI: http://milvus:19530
-      LEA_EMBEDDING_API_BASE: https://tenantapi-ai.ouchn.edu.cn/v1/embeddings
-      LEA_EMBEDDING_MODEL: bge-large-zh-v1.5
-      LEA_EMBEDDING_DIM: 1536
-      LEA_RERANKER_API_BASE: http://202.205.160.8:6006
-      MINERU_TOKEN: ${MINERU_TOKEN:-sk-avF2b1pvsuGxSv1St07QRTENYjib14fGGkc9cwEA0RGuXvBw}
-    volumes:
-      - ../packages:/app/packages
-      - ../pyproject.toml:/app/pyproject.toml
-      - ../uv.lock:/app/uv.lock
-      - backend_venv:/app/.venv
-    command: >
-      sh -c "uv sync --frozen --no-dev && uv run celery -A lea_server.tasks.celery_app worker --loglevel=info --pool=solo --concurrency=2"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    depends_on:
-      redis:
-        condition: service_healthy
-      minio:
-        condition: service_healthy
 
   minio:
     image: minio/minio:RELEASE.2024-12-13T22-19-12Z

@@ -1,0 +1,165 @@
+# NetworkPolicy —— 把"内网"从假设变成 k8s 真正强制的边界。
+#
+# 这层跟服务间鉴权（LEA_INTERNAL_TOKEN）作用在不同高度，两个都要：
+#
+#     NetworkPolicy   挡"能不能连上这个端口"        —— 不用改代码
+#     共享密钥        挡"连上了之后能不能被受理"    —— 应用层
+#
+# 只有后者时，集群里任何一个 pod（包括被拿下的第三方组件、CI runner、别人的业务）
+# 都能跟 :8300 / :8400 / :8500 建连接并开始猜。只有前者时，凡是能进到集群网络里的
+# 东西就等于有了全部权限。
+#
+# ── 只写 Ingress，不写 Egress ──────────────────────────────────────────────
+#
+# 每条策略都显式写了 `policyTypes: [Ingress]`。**这不是省事，是必须的**：
+# 只要 policyTypes 里出现 Egress 而又没给 egress 规则，那个 pod 的**所有出站流量
+# 会被全部禁掉** —— 包括 DNS。症状是服务起来了、探针也过了，但所有下游调用报
+# "name resolution failed"，非常难联想到是这个文件。
+#
+# 不做 egress 限制的另一个原因是这套东西的出站面很宽且大部分在集群外：
+# MySQL / Redis（202.205.160.9）、Cube（10.192.241.137:3000）、中转 LLM API、
+# Milvus、对象存储。逐个放行等于把一份随时会过期的网络清单写进 manifest，
+# 而收益远小于 ingress 那一半 —— 横向移动是"打进来"，不是"打出去"。
+#
+# 真要做 egress 的话，最小可用形态是：放行 kube-dns 的 53/UDP+TCP、放行
+# 上面那几个外部 CIDR、其余拒绝。等 ingress 这半跑稳了再说。
+#
+# ── ⚠️ 上线前必须确认的两件事 ─────────────────────────────────────────────
+#
+# 1. **CCE 的网络模型支不支持 NetworkPolicy。**
+#    容器隧道网络（Cilium/Calico 那套）支持；云原生网络 2.0（VPC ENI，Pod 直接
+#    拿 VPC IP）对 NetworkPolicy 的支持是受限的。
+#    危险在于：**不支持的集群上 `kubectl apply` 一样会成功**，对象老老实实存在
+#    etcd 里，只是没有任何东西去执行它。于是你以为加了一层，其实什么都没加。
+#    验证方法在文件末尾 —— 必须实际跑一次，别看 apply 的返回。
+#
+# 2. **探针会不会被挡。**
+#    readinessProbe 的 httpGet 是 kubelet 从**节点**发起的，不是从某个 Pod。
+#    NetworkPolicy 规范对"节点到 Pod"的行为写的是实现相关，多数 CNI 默认放行，
+#    但这是 NetworkPolicy 造成事故最常见的一条。
+#    挂了的表现极具误导性：readiness 失败 → pod 被摘出 endpoints → 整个服务不可用，
+#    而 pod 自己 Running、日志干净，看起来像应用问题。
+#    apply 之后第一件事就是 `kubectl get pods` 确认还是 Ready。
+#
+# ── 调用图（下面的规则就是照它写的）────────────────────────────────────────
+#
+#     浏览器 ──Ingress──> lea-gateway:8080
+#     lea-gateway ───────> lea-agent:8100 / lea-config:8500 / lea-rag:8300
+#     lea-agent ─────────> lea-tools:8400
+#     lea-agent ─────────> lea-rag:8300
+#     lea-agent ─────────> lea-config:8500
+#     lea-tools ─────────> lea-rag:8300      ← 容易漏的一条，见下
+#
+# 全部策略只在**同一个 namespace 内**生效（podSelector 默认限本 namespace）。
+# 四个服务不在同一个 namespace 时，下面的 from 要改成 namespaceSelector + podSelector。
+
+---
+# lea-rag —— 两个调用方，不是一个。
+#
+# lea-tools 也会打它：executor/router.py 的 _execute_internal 把 kb_search /
+# memory_search / memory_add 转发到 lea_rag_url。漏掉这条 from 的后果是工具形态的
+# 知识库检索全部失败，而 lea-agent 直连的那条还好着 —— 于是现象是"有的检索行、
+# 有的不行"，很容易往 RAG 逻辑上查。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: lea-rag-allow-internal
+spec:
+  podSelector:
+    matchLabels: {app: lea-rag}
+  policyTypes: [Ingress]   # 别加 Egress，见文件头
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {app: lea-agent}
+        - podSelector:
+            matchLabels: {app: lea-tools}
+        - podSelector:
+            matchLabels: {app: lea-gateway}
+      ports:
+        - {protocol: TCP, port: 8300}
+
+---
+# lea-tools —— 只有 lea-agent 调它。
+#
+# 这个服务能跑任意代码（code_interpreter → 沙箱）、读写用户工作区，是整个平台
+# blast radius 最大的一个，所以它的 ingress 面越窄越好。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: lea-tools-allow-internal
+spec:
+  podSelector:
+    matchLabels: {app: lea-tools}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {app: lea-agent}
+      ports:
+        - {protocol: TCP, port: 8400}
+
+---
+# lea-config —— lea-agent 取运行配置；lea-gateway 提供客户端配置管理入口。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: lea-config-allow-internal
+spec:
+  podSelector:
+    matchLabels: {app: lea-config}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {app: lea-agent}
+        - podSelector:
+            matchLabels: {app: lea-gateway}
+      ports:
+        - {protocol: TCP, port: 8500}
+
+# lea-agent —— 客户端流量只经 lea-gateway 进入。
+#
+# 它是唯一对外的服务，而"外"具体长什么样取决于入口形态，写错了就是全站不可用：
+#
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: lea-agent-allow-gateway
+spec:
+  podSelector:
+    matchLabels: {app: lea-agent}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels: {app: lea-gateway}
+      ports:
+        - {protocol: TCP, port: 8100}
+#
+# ── 验证（必须实际跑，不能只看 apply 成功）────────────────────────────────
+#
+#   # 0. 先确认没把探针挡死 —— apply 之后立刻看
+#   kubectl get pods -l 'app in (lea-rag,lea-tools,lea-config)'
+#   # 全部还是 Ready 才继续。有 NotReady 就立刻 kubectl delete -f 这个文件。
+#
+#   # 1. 该通的还通：从 lea-agent 里打下游
+#   kubectl exec deploy/lea-agent -- wget -qO- --timeout=5 http://lea-rag:8300/health
+#   kubectl exec deploy/lea-agent -- wget -qO- --timeout=5 http://lea-tools:8400/health
+#   kubectl exec deploy/lea-agent -- wget -qO- --timeout=5 http://lea-config:8500/health
+#
+#   # 2. lea-tools → lea-rag 这条也要通（上面注释里说的那条）
+#   kubectl exec deploy/lea-tools -- python -c \
+#     "import urllib.request;print(urllib.request.urlopen('http://lea-rag:8300/health',timeout=5).status)"
+#
+#   # 3. **该断的真的断了** —— 这一步才是判断 NetworkPolicy 有没有被执行的唯一方法。
+#   #    起一个不带任何 app 标签的 pod，它应该连不上。
+#   kubectl run np-probe --rm -it --restart=Never --image=busybox:1.36 -- \
+#     sh -c 'for p in lea-rag:8300 lea-tools:8400 lea-config:8500; do
+#              wget -qO- --timeout=3 http://$p/health >/dev/null 2>&1 \
+#                && echo "BAD  $p 还能连 —— 策略没生效" \
+#                || echo "OK   $p 已挡住"; done'
+#
+#   第 3 步如果三个都是 BAD，说明这个集群的网络模型不执行 NetworkPolicy
+#   （见文件头第 1 条）—— 那就得换成 ELB 安全组 / VPC 安全组那一层来做，
+#   别留着这个文件让人以为已经有防护了。

@@ -1,0 +1,109 @@
+# 配置与密钥。
+#
+# ⚠️ **Secret 这一份不要填真值提交。** 下面给的是键名清单和创建命令，值从你们的
+# 密钥来源来（CCE 的密钥管理、CI 的变量，或者手工 kubectl create）。
+#
+# 这也是整个容器化里最该守住的一条：legacy packages/lea-server-legacy/Dockerfile 里有
+# `COPY .env* ./`，等于把这些值烤进镜像推到 registry。镜像层是公开可扒的，
+# 后面再删层也拿不回来。新的 Dockerfile 一律不拷 .env，仓库根的 .dockerignore
+# 里也挡了一道。
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lea-common
+data:
+  LEA_ENV: "prod"
+
+  # ── 服务间地址 ────────────────────────────────────────────────────────
+  # k8s 里按 Service 名解析。别写 127.0.0.1 —— 那在容器里指向容器自己，
+  # 表现是连接被拒，而错误信息看起来像"下游服务挂了"。
+  LEA_CONFIG_URL: "http://lea-config:8500"
+  LEA_RAG_URL:    "http://lea-rag:8300"
+  LEA_TOOLS_URL:  "http://lea-tools:8400"
+  LEA_PARSER_URL: "http://lea-parser:8600"
+
+  # 外部统一登录（OIDC / RS256）。lea-gateway 从 JWKS 自动获取验签公钥。
+  OIDC_ISSUER: "https://passport-ai.ouchn.edu.cn"
+  OIDC_JWKS_URL: "https://passport-ai.ouchn.edu.cn/.well-known/openid-configuration/jwks"
+  TENANT_MEMBERSHIP_URL: "https://aibase-preview.ouc-online.com.cn/api/TenantUser/CurrUserTenants"
+
+  # ── lea-agent 的可调项 ────────────────────────────────────────────────
+  LEA_AGENT_PORT: "8100"
+
+  # 排空上限。改这个必须同时改 lea-agent.yaml 的 terminationGracePeriodSeconds
+  # （要更大），否则排空还没完就被 SIGKILL，正在生成的回答丢失且不落库。
+  LEA_AGENT_DRAIN_TIMEOUT: "3m"
+  LEA_AGENT_PRESTOP_DELAY: "5s"
+
+  # 事件日志（断线续传用，见 docs/FRONTEND_API.md）。
+  # 逐 token 写，所以 MAXLEN 直接等于"最多能回放多少个事件"。10000 大约 1MB/会话。
+  # 调小的后果是长回答的开头被挤掉，客户端 from=0 补到的正文缺开头 —— 不报错。
+  LEA_AGENT_EVENTLOG_MAXLEN: "10000"
+  LEA_AGENT_EVENTLOG_TTL: "5m"
+
+  # ── 沙箱 ──────────────────────────────────────────────────────────────
+  # 不设或设成别的值时会**静默退回 mock 沙箱** —— 代码"跑成功"了但什么都没真跑。
+  # 这个 fallback 踩过，所以专门写在这儿。
+  SANDBOX_BACKEND: "cube"
+  CUBE_API_URL: "http://10.192.241.137:3000"
+  CUBE_PROXY_HOST: "10.192.241.137"
+  # 模板会过期，过期后建沙箱报 4xx。换模板改这里。
+  CUBE_TEMPLATE_ID: "tpl-a58d55bcc1a54b5bbfbb4c00"
+
+  # ── 中间件端点 ────────────────────────────────────────────────────────
+  # 现在是自建的（202.205.160.9）。将来换成云服务商的托管实例，只改这里的值，
+  # manifest 和镜像都不用动 —— 这也是为什么 k8s 里不放 Redis/MySQL 的 Deployment。
+  DB_HOST: "202.205.160.9"
+  DB_PORT: "3307"
+  DB_NAME: "lea_platform"
+  DB_USER: "lea"
+
+  # ⚠️ 这个必须是**集群内所有副本都能连到的同一个** Redis。
+  # 连不上时 lock / control / eventlog 三个包是"正确地什么都不做"（单实例下那是
+  # 对的行为），不报错、日志里也看不出来 —— 于是多副本会安静地退化成 N 个互不
+  # 相干的单实例：停止按钮一半概率失效、断线续传全部 410、生成中再发消息变成 409。
+  # 上线后请确认这三条行为是好的，别只看服务起没起来。
+  REDIS_URL: "redis://202.205.160.9:26379/0"
+
+  # ── 服务间鉴权 ────────────────────────────────────────────────────────
+  #
+  # 开了这个，Python 服务在 LEA_INTERNAL_TOKEN 没配时会**拒绝启动**，而不是静默
+  # 放行。生产必须开。
+  #
+  # ⚠️ 上线顺序：先把密钥配好、两边（lea-agent 和 Python 三件套）都发布完，
+  # **最后**再把这个翻成 "1"。反过来的话，滚动更新期间会出现"服务端已经要求 token、
+  # 调用方还没带"的窗口，整条链断在部署中途。
+  LEA_REQUIRE_INTERNAL_TOKEN: "1"
+
+  # Skill 包使用华为 OBS 的 S3 兼容接口。
+  OBS_ENDPOINT: "https://obs.cn-north-4.myhuaweicloud.com"
+  OBS_BUCKET: "lea-uploads"
+  OBS_REGION: "cn-north-4"
+  OBS_ADDRESSING_STYLE: "virtual"
+  OBS_PUBLIC_ENDPOINT: "https://obs.cn-north-4.myhuaweicloud.com"
+---
+# 只是键名清单，方便对照。**不要在这里填值、不要提交填了值的版本。**
+#
+# 创建方式（值从密钥来源取，别从 .env 抄到命令行历史里）：
+#
+#   kubectl create secret generic lea-secrets \
+#       --from-literal=DB_PASSWORD=... \
+#       --from-literal=JWT_SECRET=... \
+#       --from-literal=LEA_TENANT_API_KEY=... \
+#       --from-literal=LEA_CHAT_APP_KEY=... \
+#       --from-literal=LEA_LOCAL_API_KEY=... \
+#       --from-literal=OBS_ACCESS_KEY=... \
+#       --from-literal=OBS_SECRET_KEY=... \
+#       --from-literal=MINERU_TOKEN=... \
+#       --from-literal=LEA_INTERNAL_TOKEN=...
+#
+# LEA_INTERNAL_TOKEN 是服务间鉴权用的（lea-tools 等 Python 服务），见 task #17。
+apiVersion: v1
+kind: Secret
+metadata:
+  name: lea-secrets
+  annotations:
+    lea.io/note: "键名清单见本文件注释；值不入库，用 kubectl create secret 创建"
+type: Opaque
+stringData: {}

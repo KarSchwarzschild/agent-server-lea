@@ -1,0 +1,66 @@
+# 构建上下文排除表。
+#
+# 第一条是安全项而不是体积项：.env 里有数据库密码、对象存储 key、中转 API key。
+# 现成的 packages/lea-server/Dockerfile 里有一行 `COPY .env* ./` —— 那等于把这些
+# 密钥烤进镜像推到 registry。镜像层是可以随便扒的，删掉后续层也拿不回来。
+# 新的 Dockerfile 一律不拷 .env，这里再挡一道：就算谁手滑写了 COPY .env，
+# 构建上下文里也没有这个文件。
+.env
+.env.*
+*.env
+
+# 密钥 / 证书
+*.pem
+*.key
+*.p12
+id_rsa*
+
+# 版本控制与 IDE
+.git
+.gitignore
+.idea
+.vscode
+
+# 依赖与构建产物（镜像里重新装）
+node_modules
+**/node_modules
+.venv
+**/.venv
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+dist
+build
+*.egg-info
+**/*.egg-info
+
+# Go 的本地产物（镜像里重新编）
+*.exe
+lea-agent.exe
+
+# 本地数据与日志 —— 这些能有几百 MB，白拖慢每次构建
+*.log
+*.db
+*.sqlite
+*.sqlite3
+lea-platform-dev.db
+test-integration.db
+
+# 前端构建产物（前端是独立镜像）
+frontend-user/dist
+frontend-admin/dist
+
+# 测试与文档不进运行镜像
+tests
+**/tests
+docs
+*.md
+!README.md
+
+# 杂物
+*.pptx
+*.xlsx
+.pytest_cache
+**/.pytest_cache
+.ruff_cache

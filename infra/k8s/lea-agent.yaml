@@ -1,0 +1,98 @@
+# lea-agent —— Go 引擎，只接受 lea-gateway 的客户端流量。
+#
+# 这份里有三处不是模板套出来的，改之前先看注释：探针的分工、优雅退出的时长配对、
+# Ingress 的 SSE 参数。前两个配错的表现都是"滚动更新时用户的回答莫名中断"，
+# 而事件本身在 k8s 里看起来完全正常。
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lea-agent
+  labels: {app: lea-agent}
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: lea-agent}
+  template:
+    metadata:
+      labels: {app: lea-agent}
+    spec:
+      # ── 优雅退出的时长配对 ──────────────────────────────────────────────
+      #
+      # 必须 > LEA_AGENT_DRAIN_TIMEOUT（默认 3 分钟）+ LEA_AGENT_PRESTOP_DELAY（5s）。
+      #
+      # 小于的话：kubelet 发 SIGTERM，进程开始排空正在跑的 turn，还没跑完就到了
+      # grace period，kubelet 补一个 SIGKILL —— 正在生成的回答直接消失，**而且不落库**。
+      # 用户看到的是流突然断掉、刷新之后那条回答压根不存在。
+      # 在 k8s 事件里这是一次"正常的滚动更新"，没有任何异常。
+      #
+      # 200 = 180（drain）+ 5（prestop）+ 15（余量）。
+      # 改 LEA_AGENT_DRAIN_TIMEOUT 的时候这个数必须一起改。
+      terminationGracePeriodSeconds: 200
+
+      containers:
+        - name: lea-agent
+          # 替换成你们 SWR 的地址，例如
+          #   swr.cn-north-4.myhuaweicloud.com/<组织名>/lea-agent:<tag>
+          # 别用 :latest —— 回滚时你会需要知道上一版到底是哪个镜像。
+          image: lea-agent:dev
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - {name: http, containerPort: 8100}
+
+          envFrom:
+            - configMapRef: {name: lea-common}
+            - secretRef: {name: lea-secrets}
+
+          # ── 探针的分工（这里最容易配错）────────────────────────────────
+          #
+          # readiness 用 /health，liveness 用 TCP —— **故意不一样**。
+          #
+          # 排空期间 /health 会故意返 503（见 cmd/server/main.go），目的就是让 k8s
+          # 把这个 pod 从 Service 的 endpoints 里摘掉，新请求不再进来，而已经在跑的
+          # turn 继续跑完。readiness 用 /health 正是要利用这一点。
+          #
+          # 但 liveness 绝不能也用 /health：那样排空一开始就会被判定为"容器挂了"，
+          # kubelet 会重启容器 —— 于是精心实现的优雅退出反而变成了强杀，比不做还糟。
+          # liveness 只看端口还在不在听，进程活着就算活着。
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            failureThreshold: 2
+          livenessProbe:
+            tcpSocket: {port: http}
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            failureThreshold: 3
+
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            # 这个服务自己不算什么，重活都在下游（LLM、沙箱）。内存主要是并发会话
+            # 的历史和事件缓冲。
+            limits: {cpu: "2", memory: 1Gi}
+
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lea-agent
+spec:
+  # ClusterIP + Ingress。**不要**为了"让同一用户总落到同一个 pod"去开
+  # sessionAffinity: ClientIP —— 跨副本停止 / 断线续传 / 生成中打断这三条路径
+  # 都是按"不需要会话亲和"设计并测过的，开了亲和只会掩盖问题，而且亲和在 pod
+  # 重启导致重新映射时照样失效。
+  #
+  # 亲和本来也救不了：session_id 在 stop 请求的 URL 里、在 POST /chat/stream 的
+  # **请求体**里，没有哪个七层负载能让两者哈希到同一个后端。
+  type: ClusterIP
+  selector: {app: lea-agent}
+  ports:
+    - {name: http, port: 8100, targetPort: http}

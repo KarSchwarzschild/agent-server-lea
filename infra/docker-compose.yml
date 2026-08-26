@@ -1,11 +1,25 @@
 services:
-  backend:
+  gateway:
     build:
       context: ..
-      dockerfile: packages/lea-server/Dockerfile
-    container_name: lea-backend
+      dockerfile: packages/lea-gateway/Dockerfile
+    container_name: lea-gateway
     ports:
-      - "8000:8000"
+      - "8080:8080"
+    env_file:
+      - ../.env
+    depends_on:
+      - agent
+      - config
+      - rag
+      - tools
+    restart: unless-stopped
+
+  agent:
+    build:
+      context: ..
+      dockerfile: packages/lea-agent/Dockerfile
+    container_name: lea-agent
     env_file:
       - ../.env
     depends_on:
@@ -15,16 +29,48 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  frontend:
-    image: nginx:alpine
-    container_name: lea-frontend
-    ports:
-      - "80:80"
-    volumes:
-      - ../frontend/dist:/usr/share/nginx/html:ro
-      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+  config:
+    build:
+      context: ..
+      dockerfile: packages/lea-config/Dockerfile
+    container_name: lea-config
+    env_file:
+      - ../.env
     depends_on:
-      - backend
+      mysql:
+        condition: service_healthy
+    restart: unless-stopped
+
+  rag:
+    build:
+      context: ..
+      dockerfile: packages/lea-rag/Dockerfile
+    container_name: lea-rag
+    env_file:
+      - ../.env
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      milvus:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
+
+  tools:
+    build:
+      context: ..
+      dockerfile: packages/lea-tools/Dockerfile
+    container_name: lea-tools
+    env_file:
+      - ../.env
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     restart: unless-stopped
 
   minio:

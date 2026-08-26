@@ -1,0 +1,88 @@
+# lea-tools —— 工具执行网关 :8400。集群内服务，不对外暴露。
+#
+# 三件跟另外两个 Python 服务不一样的事，都在下面注释里：可以扩容（这是最近才成立
+# 的）、要 root、要挂共享存储。
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lea-tools
+  labels: {app: lea-tools}
+spec:
+  # ── 可以扩容了 ────────────────────────────────────────────────────────
+  #
+  # 以前不行：沙箱句柄记在进程内存的字典里，建沙箱的副本和后续 exec 的副本不是
+  # 同一个时直接 404（"sandbox session not found"），而沙箱明明活着。
+  #
+  # 现在句柄改成从 Cube 认领（沙箱本来就住在 Cube 里，进程内那份只是缓存），
+  # 所以任何副本都能接手。见 services/sandbox_session.py 的 _adopt。
+  #
+  # 前提：沙箱创建时要往 metadata 打 lea.session_id 标记，否则认领查不回来。
+  # 那是同一次改动的一部分，但如果**集群里还跑着旧版镜像建的沙箱**，那些沙箱
+  # 没有标记、认领不了，会退化成老行为。滚动更新完之后老会话可能需要重开。
+  replicas: 2
+  selector:
+    matchLabels: {app: lea-tools}
+  template:
+    metadata:
+      labels: {app: lea-tools}
+    spec:
+      containers:
+        - name: lea-tools
+          image: lea-tools:dev   # 换成 SWR 地址 + 具体 tag
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: http, containerPort: 8400}
+          envFrom:
+            - configMapRef: {name: lea-common}
+            - secretRef: {name: lea-secrets}
+
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket: {port: http}
+            initialDelaySeconds: 15
+            periodSeconds: 20
+
+          resources:
+            requests: {cpu: 200m, memory: 256Mi}
+            limits: {cpu: "2", memory: 2Gi}
+
+          # ── 为什么这个服务用 root ──────────────────────────────────────
+          #
+          # 它要往共享存储建 session 目录，给沙箱做 host-mount（RW /workspace +
+          # RO /opt/skills）。权限不够时**不报错**，只在日志里留一行
+          #   host-mount skipped: shared storage not writable from lea-tools
+          # 然后沙箱退回用容器内的本地 fs —— 沙箱一死用户的文件就没了，而服务
+          # 看起来完全正常。这种静默降级比起不来更难发现。
+          #
+          # 想改成非 root：把下面的 PV 属主设成对应 UID，然后**去日志里确认没有
+          # 那行 skipped**。只看 pod Running 是不够的。
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+
+          # 共享存储。挂载点要跟 nfs_provisioner 里的根路径一致
+          # （本地开发时那个路径是 /data/cubelet/lea）。
+          #
+          # ⚠️ 这段我没法替你们填对 —— PV 的类型（CCE 的 SFS / NFS / 自建）和
+          # 实际路径只有你们知道。**不挂的后果不是启动失败，是上面说的静默降级**，
+          # 所以别因为"先跑起来看看"就把它注释掉忘了。
+          volumeMounts:
+            - {name: shared, mountPath: /data/cubelet/lea}
+      volumes:
+        - name: shared
+          persistentVolumeClaim:
+            claimName: lea-shared   # 需要你们按 CCE 的存储类型另建 PVC
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lea-tools
+spec:
+  type: ClusterIP
+  selector: {app: lea-tools}
+  ports:
+    - {name: http, port: 8400, targetPort: http}

@@ -1,0 +1,54 @@
+# lea-config —— Agent / 技能 / 模型配置 :8500。集群内服务。
+#
+# 无状态（只读 DB），所以扩容没有任何附加条件。
+# 结构上的说明见 lea-agent.yaml（探针分工那段同样适用）。
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lea-config
+  labels: {app: lea-config}
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: lea-config}
+  template:
+    metadata:
+      labels: {app: lea-config}
+    spec:
+      containers:
+        - name: lea-config
+          image: lea-config:dev   # 换成 SWR 地址 + 具体 tag
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: http, containerPort: 8500}
+          envFrom:
+            - configMapRef: {name: lea-common}
+            - secretRef: {name: lea-secrets}
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket: {port: http}
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {cpu: "1", memory: 512Mi}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lea-config
+spec:
+  type: ClusterIP
+  selector: {app: lea-config}
+  ports:
+    - {name: http, port: 8500, targetPort: http}

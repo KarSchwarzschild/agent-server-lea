@@ -1,0 +1,35 @@
+services:
+  lea-config:
+    image: ${LEA_CONFIG_IMAGE:?set LEA_CONFIG_IMAGE in .env.skill-market}
+    restart: unless-stopped
+    env_file: .env.skill-market
+    environment:
+      LEA_REQUIRE_INTERNAL_TOKEN: "1"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8500/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  migrate:
+    image: ${LEA_CONFIG_IMAGE:?set LEA_CONFIG_IMAGE in .env.skill-market}
+    env_file: .env.skill-market
+    user: "0"
+    command: ["python", "scripts/apply_skill_versions_migration.py"]
+    depends_on:
+      lea-config:
+        condition: service_healthy
+    profiles: ["migration"]
+
+  lea-gateway:
+    image: ${LEA_GATEWAY_IMAGE:?set LEA_GATEWAY_IMAGE in .env.skill-market}
+    restart: unless-stopped
+    env_file: .env.skill-market
+    environment:
+      LEA_CONFIG_URL: http://lea-config:8500
+      LEA_GATEWAY_PORT: 8080
+    depends_on:
+      lea-config:
+        condition: service_healthy
+    ports:
+      - "${SKILL_MARKET_PORT:-8080}:8080"

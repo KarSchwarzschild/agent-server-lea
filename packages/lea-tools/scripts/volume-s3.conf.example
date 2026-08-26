@@ -1,0 +1,40 @@
+# cube-volume-s3.sh 配置模板
+#
+# 部署位置：跟 cube-volume-s3.sh 同目录（或用环境变量 $CUBE_S3_CONFIG 指定别的路径）
+# 权限：chmod 600（内含 secret key）
+#
+# **要点**：这里的 ENDPOINT 是 Cube 节点内部访问 S3 用的（s3fs mount 走它），
+# 必须跟 lea-tools .env 里的 S3_INTERNAL_ENDPOINT 指向同一个 S3 集群，
+# 否则 attach 时挂载的数据跟 lea-tools 下载看到的数据会对不上。
+#
+# ── 开发环境（MinIO 单机） ─────────────────────────
+# ENDPOINT=http://127.0.0.1:9000
+# BUCKET=lea-sandbox-volumes
+# ACCESS_KEY=minioadmin
+# SECRET_KEY=minioadmin
+# REGION=us-east-1
+# USE_PATH_STYLE=1
+# USE_CACHE_DIR=/data/cubelet/s3fs-cache
+#
+# ── 生产环境（华为云 OBS 示例） ───────────────────
+# ENDPOINT=https://obs.cn-north-4.myhuaweicloud.com
+# BUCKET=lea-sandbox-volumes-prod
+# ACCESS_KEY=<OBS_AK>
+# SECRET_KEY=<OBS_SK>
+# REGION=cn-north-4
+# USE_PATH_STYLE=1
+# USE_CACHE_DIR=/data/cubelet/s3fs-cache
+
+ENDPOINT=http://127.0.0.1:9000
+BUCKET=lea-sandbox-volumes
+ACCESS_KEY=minioadmin
+SECRET_KEY=minioadmin
+REGION=us-east-1
+
+# MinIO 必须走 path-style（http://host:9000/bucket/key，而不是
+# http://bucket.host:9000/key，后者依赖 DNS 通配）。OBS 也建议走 path-style。
+USE_PATH_STYLE=1
+
+# s3fs 本地缓存目录。**必须落在数据盘**，不然会撑爆系统盘。
+# 空串 = 关闭本地缓存（每次都直连 S3，慢但省本地空间）。
+USE_CACHE_DIR=/data/cubelet/s3fs-cache

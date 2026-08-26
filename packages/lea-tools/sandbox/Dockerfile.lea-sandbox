@@ -1,0 +1,20 @@
+FROM cube-sandbox-cn.tencentcloudcr.com/cube-sandbox/sandbox-code:latest
+
+# 换阿里云 Debian 源
+RUN rm -rf /etc/apt/sources.list.d/* && \
+    echo "deb http://mirrors.aliyun.com/debian bookworm main" > /etc/apt/sources.list && \
+    echo "deb http://mirrors.aliyun.com/debian bookworm-updates main" >> /etc/apt/sources.list && \
+    echo "deb http://mirrors.aliyun.com/debian-security bookworm-security main" >> /etc/apt/sources.list
+
+# Node.js 20 — 直接下二进制解压，100%可靠
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl ca-certificates xz-utils && \
+    curl -fsSL https://npmmirror.com/mirrors/node/v20.18.0/node-v20.18.0-linux-x64.tar.xz \
+      | tar -xJ -C /usr/local --strip-components=1 && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# 国内源
+RUN npm config set registry https://registry.npmmirror.com && \
+    pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
+
+RUN node --version && npm --version && python3 --version

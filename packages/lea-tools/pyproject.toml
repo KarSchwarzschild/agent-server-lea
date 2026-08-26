@@ -1,0 +1,32 @@
+[project]
+name = "lea-tools"
+version = "0.1.0"
+description = "LEA Tool Gateway — 云端工具执行网关"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "httpx>=0.26",
+    "sqlalchemy>=2.0",
+    "pymysql>=1.1",
+    "pydantic-settings>=2.0",
+    "python-dotenv>=1.0",
+    "structlog>=24.0",
+    "cryptography>=42.0",
+    "redis>=5.0",
+    "jinja2>=3.1",
+    "jsonpath-ng>=1.6",
+    "boto3>=1.34",
+    # 服务间鉴权（被调方中间件 + 打 lea-rag 时的请求头）。见 packages/lea-authkit。
+    "lea-authkit",
+]
+
+[tool.uv.sources]
+lea-authkit = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lea_tools"]

@@ -1,0 +1,42 @@
+-- 005 删掉 tools 上的全局 UNIQUE(name)
+--
+-- 真实表上原本有**两个**唯一约束：
+--
+--   UNIQUE name                  (name)              ← 本迁移删的
+--   UNIQUE uq_tools_tenant_name  (tenant_id, name)   ← 保留，这才是对的
+--
+-- agents / skills 只有后者。出处是 lea-tools/db/models.py 里
+-- `name = Column(String(100), unique=True)`，而 lea-config 的模型声明的是
+-- UniqueConstraint(tenant_id, name) —— 两个服务的 create_all() 先后打在同一张表上，
+-- 于是两套约束都攒下来了。
+--
+-- 全局唯一的后果：**工具名全平台唯一**，租户 A 建了 web_search，其他租户永远
+-- 不能有同名工具。
+--
+-- ── ⚠️ 为什么这条必须排在代码改动之后 ────────────────────────────────────
+--
+-- 那个索引在被删之前是**承重的**：lea-tools 有四处按 name 查工具且不带 tenant，
+-- 全局唯一恰好保证了它们无歧义。先删索引会把"建不了同名工具"这个显式报错，
+-- 变成 `.first()` 随机返回某个租户的工具行 —— 而工具行里有 endpoint /
+-- http_adapter_config / sandbox_config，也就是拿着别的租户的配置去执行。
+-- 从一个看得见的错误退化成一个看不见的跨租户执行。
+--
+-- 前置代码改动（都已完成）：
+--   db/models.py            Tool 加上 tenant_id（以前压根没这一列，所以那些查询
+--                           不是"忘了过滤"而是没法过滤），name 去掉 unique=True
+--   services/__init__.py    新增 visible_tools(db, tenant_id) = 本租户 + 平台全局
+--   api/execute.py:44       改走 visible_tools
+--   api/admin_mcp.py:65     按 server.tenant_id 查和建
+--   seed.py:119             内置工具显式落 GLOBAL_TENANT_ID
+--
+-- 执行：
+--   uv run python scripts/apply_migration.py migrations/005_drop_global_tool_name_unique.sql
+--
+-- MySQL 里 UNIQUE 约束就是唯一索引，所以用 DROP INDEX。重复执行会报
+-- "check that column/key exists"，apply_migration.py 会当成"已经跑过"跳过。
+
+DROP INDEX name ON tools;
+
+-- 删完之后 uq_tools_tenant_name 仍然拦着同租户内的重名，
+-- 而跨租户同名工具从此合法 —— 这正是 scripts/seed_test_data.py 里工具名
+-- 那个租户前缀存在的唯一原因，可以去掉了（本次已同步去掉）。

@@ -1,0 +1,37 @@
+-- 006 — tools 表去掉重复列（三份模型并存留下的）
+--
+-- ## 这些列怎么来的
+--
+-- `tools` 被三个服务各定义一遍（lea-tools / lea-config / lea-server），而
+-- `create_all()` **只建表不改表**。两个服务先后打在同一张表上，于是真实表成了
+-- 两份模型的并集，还带着两组表达同一件事的列：
+--
+--     执行器真正读的            lea-config 以前写的
+--     ──────────────────       ──────────────────
+--     enabled                  is_enabled
+--     schema_json  NOT NULL    input_schema
+--
+-- 危害不在"多几列"，在**写的那一侧和读的那一侧对不上**：lea-config 写
+-- is_enabled/input_schema，执行器读 enabled/schema_json（lea-tools 的
+-- services/__init__.py:29、services/registry.py:14,37）。建出来的行存得下、列得出、
+-- 一执行就找不到 schema —— 一个静默的坏。models/tool.py 已经统一到执行器那套词汇。
+--
+-- ## 动手前查过的事（8 行数据，lea-platform-test）
+--
+--     input_schema      6 行非空，且**与 schema_json 逐字节相同** → 纯重复，可删
+--     is_enabled        与 enabled 无一行不一致（mismatch=0）      → 纯重复，可删
+--     is_builtin        5 行为真；owner_scope 全是 platform        → **有信息，保留**
+--     source            1 行为 'user'，其余 'builtin'              → 同上
+--
+-- is_builtin / source 为什么不删：它们区分"平台预置的内置工具"和"用户自建后被
+-- 004 回填成 platform 的工具"（#7 get_weather 就是后者）。owner_scope 表达不了这个
+-- 差别 —— 两者都是 platform。虽然现在没有代码读它们，但那是**信息**而不是重复，
+-- 删掉就再也算不回来了。真要收拾它们得先决定"内置"这个概念归谁管，那是 #20 的事。
+--
+-- ## 顺序要求
+--
+-- 必须在 models/tool.py 改完并部署之后再跑。反过来的话 lea-config 还在写
+-- is_enabled，而那列已经没了 → 每次 POST /tools 都是 Unknown column。
+
+ALTER TABLE tools DROP COLUMN input_schema;
+ALTER TABLE tools DROP COLUMN is_enabled;

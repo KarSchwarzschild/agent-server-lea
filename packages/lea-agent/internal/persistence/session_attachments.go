@@ -3,6 +3,9 @@ package persistence
 import (
 	"context"
 	"database/sql"
+	"sort"
+	"strconv"
+	"strings"
 )
 
 // 会话级挂载 —— 用户在**这一个会话里**临时挂上的工具/知识库（migrations/017）。
@@ -31,7 +34,49 @@ type SessionAttachment struct {
 	RefID int
 }
 
-// SessionAttachmentKinds 是这一版认得的 kind。
+// Fingerprint 把一组挂载压成一个可比较的字符串。
+//
+// 用途：判断"内存里这份会话是不是按当前的挂载集合建的"。会话建立时记下指纹，下次
+// GetOrCreate 命中缓存时重算一遍，不一样就说明有人改过挂载，得重建。
+//
+// ## 为什么需要它 —— 多副本
+//
+// 一开始只有 Manager.Drop：挂载接口落库之后丢掉内存对象，下条消息重建。**那在多副本
+// 下是错的**，而且是真链路才暴露的（scripts/session_attach_e2e.py）：
+//
+//	06:16:32  POST /attachments  → 副本 A     A 内存里没这个会话，Drop 直接返回成功
+//	06:16:51  POST /chat/stream  → 副本 B     B 手里那个旧引擎对象还在，工具集是旧的
+//
+// nginx 轮询，两条请求本来就会落到不同副本。Drop 只能丢**本副本**的。
+//
+// ## 为什么不走 control 总线
+//
+// internal/control 正是为这类跨副本动作建的（停 turn 就走它）。但它基于 Redis
+// pub/sub，而那个包自己的注释写明了：**没有投递保证**，目标 pod 的订阅连接刚好在重连
+// 窗口里，消息就没了。
+//
+// 对"停止"来说可以接受 —— 用户看得见没停下来，会再点一次。挂载**没有这个反馈回路**：
+// 消息丢了的表现是工具永远不出现，用户不知道发生了什么，也不知道要重试。
+//
+// 所以这里用拉取式：每次 GetOrCreate 自己比一次指纹。代价是一个走
+// idx_session 索引的小查询，而 ReloadHistory 本来每轮就要读一次库，多这一下可以忽略。
+// 换来的是**自愈**：任何原因错过一次（副本重启、Drop 失败、消息丢失），下一条消息
+// 照样会发现并修正。
+func Fingerprint(rows []SessionAttachment) string {
+	if len(rows) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(rows))
+	for _, r := range rows {
+		parts = append(parts, r.Kind+":"+strconv.Itoa(r.RefID))
+	}
+	// 排序，否则同一组挂载因为 SELECT 顺序不同就算"变了"，每条消息都白重建一次。
+	// LoadSessionAttachments 有 ORDER BY id，但依赖它等于让指纹的稳定性取决于另一个
+	// 函数的实现细节。
+	sort.Strings(parts)
+	return strings.Join(parts, ",")
+}
+
 //
 // 表上那列是 VARCHAR 而不是 ENUM（见 migrations/017），所以库里可能出现这一版还不认识
 // 的值 —— 那是故意留的：加一种新资源不该要求先改所有读端再排序部署。读到不认识的照常

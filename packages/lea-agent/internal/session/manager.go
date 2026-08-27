@@ -195,21 +195,41 @@ func (m *Manager) GetOrCreate(ctx context.Context, p Params) (*AgentSession, err
 			if !s.OwnedBy(p.TenantID, p.UserID) {
 				return nil, ErrForbidden
 			}
-			s.Touch()
-			return s, nil
-		}
-		// 内存里没有 —— 可能是别的副本在跑、可能本进程重启过、也可能这个
-		// session_id 压根不是调用方的。**必须查库确认归属才能往下走。**
-		//
-		// 少了这道就是一个跨用户的数据泄漏，而且只在多副本下出现：
-		// 下面 NewAgentSession 会沿用客户端给的 session_id，引擎的 Resume 又会按
-		// 这个 id 调 backend.LoadHistory 把历史读进上下文 —— 于是拿着别人的
-		// session_id 打到"内存里没有它"的副本，就能让模型复述别人的对话。
-		//
-		// 实测过：同一个请求打三次，落到持有该会话的副本返 403，落到另一个副本
-		// 返 200 并带出了受害者的历史。安全边界取决于负载均衡挑了谁 —— 而单副本
-		// 下永远命中上面那条内存分支，所以测不出来。
-		if err := verifySessionOwner(ctx, p); err != nil {
+			// 挂载集合变了吗？变了就得重建 —— 引擎的工具数组在 engine.Build 那一刻
+			// 冻住，事后改不了。
+			//
+			// **这一步是多副本正确性的关键**，而且只有真链路能暴露（见
+			// persistence.Fingerprint 的长注释）：挂载接口和对话是两条独立的 HTTP
+			// 请求，nginx 轮询会把它们分到不同副本，而 Drop 只丢得掉本副本的内存对象。
+			// 于是"在 A 上挂载、在 B 上对话"时，B 手里还是旧的工具集。
+			//
+			// 放在归属校验**之后**：先确认这人有资格碰这个会话，再花一次查询。
+			if !m.attachmentsChanged(ctx, s, p) {
+				s.Touch()
+				return s, nil
+			}
+			log.Printf("session_rebuild_needed session=%s reason=attachments_changed", p.SessionID)
+			if !m.Drop(p.SessionID) {
+				// 正在跑一轮（或有 SSE 订阅者）—— 那个引擎对象正被占用，丢不得。
+				// 置标志让它本轮收尾时自己丢，这一轮继续用旧工具集：用户等着这轮的
+				// 结果，不该为了换工具集把它掐掉。
+				s.MarkPendingRebuild()
+				s.Touch()
+				return s, nil
+			}
+			// 丢掉了，落到下面走完整重建 —— 归属已经在上面验过，不必再查库。
+		} else if err := verifySessionOwner(ctx, p); err != nil {
+			// 内存里没有 —— 可能是别的副本在跑、可能本进程重启过、也可能这个
+			// session_id 压根不是调用方的。**必须查库确认归属才能往下走。**
+			//
+			// 少了这道就是一个跨用户的数据泄漏，而且只在多副本下出现：
+			// 下面 NewAgentSession 会沿用客户端给的 session_id，引擎的 Resume 又会按
+			// 这个 id 调 backend.LoadHistory 把历史读进上下文 —— 于是拿着别人的
+			// session_id 打到"内存里没有它"的副本，就能让模型复述别人的对话。
+			//
+			// 实测过：同一个请求打三次，落到持有该会话的副本返 403，落到另一个副本
+			// 返 200 并带出了受害者的历史。安全边界取决于负载均衡挑了谁 —— 而单副本
+			// 下永远命中上面那条内存分支，所以测不出来。
 			return nil, err
 		}
 	}
@@ -237,12 +257,14 @@ func (m *Manager) GetOrCreate(ctx context.Context, p Params) (*AgentSession, err
 	//
 	// 整段失败只记日志不阻断：少几个临时工具，比**整段对话打不开**轻得多。
 	// 同理见 runtime.MergeAttachments 和 lea-config 那边对失效项的静默丢弃。
-	cfg = m.mergeSessionAttachments(ctx, cfg, p)
+	cfg, attachFP := m.mergeSessionAttachments(ctx, cfg, p)
 
 	s, err := NewAgentSession(ctx, cfg, p)
 	if err != nil {
 		return nil, fmt.Errorf("create session: %w", err)
 	}
+	// 记下建这份会话时用的挂载指纹，下次缓存命中时靠它发现"有人在别的副本上改了挂载"。
+	s.setAttachmentFingerprint(attachFP)
 	// 让会话能在一轮收尾时自己请求重建（挂载工具那条路）。注入回调而不是让
 	// AgentSession 持有 *Manager —— 后者是循环引用，而且会话不该知道谁在管它。
 	s.dropper = m.Drop
@@ -428,29 +450,52 @@ func (m *Manager) Delete(id string) {
 //
 // 任何一步失败都返回 cfg 原样 —— 挂载是增量能力，它的问题不该让一段已有的对话打不开。
 // 但每一步失败都记日志：用户报"我昨天挂的工具今天不见了"时，只有日志能复原。
+//
+// 第二个返回值是这次用的挂载指纹，交给 AgentSession 记住，供 attachmentsChanged 比对。
 func (m *Manager) mergeSessionAttachments(
 	ctx context.Context, cfg *runtime.AgentConfig, p Params,
-) *runtime.AgentConfig {
+) (*runtime.AgentConfig, string) {
 	if p.SessionID == "" {
-		return cfg
+		return cfg, ""
 	}
 	db, err := persistence.DB()
 	if err != nil || db == nil {
-		return cfg // 没配库：本地开发和单测都会走到，不是错误
+		return cfg, "" // 没配库：本地开发和单测都会走到，不是错误
 	}
 	rows, err := persistence.LoadSessionAttachments(ctx, db, p.TenantID, p.SessionID)
 	if err != nil {
 		log.Printf("session_attachments_load_failed session=%s err=%v (跳过挂载)", p.SessionID, err)
-		return cfg
+		return cfg, ""
 	}
+	fp := persistence.Fingerprint(rows)
 	if len(rows) == 0 {
-		return cfg
+		return cfg, fp
 	}
 	refs := make([]runtime.AttachmentRef, 0, len(rows))
 	for _, r := range rows {
 		refs = append(refs, runtime.AttachmentRef{Kind: r.Kind, RefID: r.RefID})
 	}
-	return runtime.MergeAttachments(ctx, cfg, p.TenantID, p.UserID, refs)
+	return runtime.MergeAttachments(ctx, cfg, p.TenantID, p.UserID, refs), fp
+}
+
+// attachmentsChanged 判断内存里这份会话是不是按当前的挂载集合建的。
+//
+// 读一次库比指纹。查询走 idx_session(tenant_id, session_id)，而 ReloadHistory 本来每轮
+// 就要读一次库 —— 多这一下可以忽略。
+//
+// **查库失败时返回 false（当作没变）**：拿不到真相时保持现状，而不是每条消息都重建一遍。
+// 后者会在 lea-config 或 MySQL 抖动时把每一轮都变成完整重建，把一次小故障放大成全线变慢。
+func (m *Manager) attachmentsChanged(ctx context.Context, s *AgentSession, p Params) bool {
+	db, err := persistence.DB()
+	if err != nil || db == nil {
+		return false
+	}
+	rows, err := persistence.LoadSessionAttachments(ctx, db, p.TenantID, p.SessionID)
+	if err != nil {
+		log.Printf("attachments_fingerprint_check_failed session=%s err=%v (当作没变)", p.SessionID, err)
+		return false
+	}
+	return persistence.Fingerprint(rows) != s.AttachmentFingerprint()
 }
 
 // Drop 丢掉内存里那份引擎对象，**不当作会话结束**。

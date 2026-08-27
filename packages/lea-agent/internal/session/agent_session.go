@@ -114,6 +114,29 @@ type AgentSession struct {
 	// 存成回调而不是让 AgentSession 持有 *Manager：后者是个循环引用，而且会话本来
 	// 不该知道管理它的东西长什么样。nil 时 rebuildIfPending 直接跳过（单测里常见）。
 	dropper func(string) bool
+
+	// attachFP 是建这份会话时挂载集合的指纹（persistence.Fingerprint）。
+	//
+	// 存它是为了在**别的副本**改了挂载时能发现：GetOrCreate 缓存命中时重算一次指纹，
+	// 不一样就重建。Drop 只丢得掉本副本的内存对象，而挂载请求和对话请求会被 nginx
+	// 轮询分到不同副本 —— 少了这个指纹，"在 A 上挂载、在 B 上对话"就完全无效。
+	//
+	// 跟 pendingRebuild 共用 rebuildMu：两者都是"这份会话该不该重建"这一个问题的
+	// 两半，共用一把锁就不存在它们之间的加锁顺序问题。
+	attachFP string
+}
+
+// AttachmentFingerprint 返回建这份会话时用的挂载指纹。
+func (s *AgentSession) AttachmentFingerprint() string {
+	s.rebuildMu.Lock()
+	defer s.rebuildMu.Unlock()
+	return s.attachFP
+}
+
+func (s *AgentSession) setAttachmentFingerprint(fp string) {
+	s.rebuildMu.Lock()
+	s.attachFP = fp
+	s.rebuildMu.Unlock()
 }
 
 // Touch 记一次活跃。Send / Subscribe / Get 都要调，否则正在用的会话会被清理掉。

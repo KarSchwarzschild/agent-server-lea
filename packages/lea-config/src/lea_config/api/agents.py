@@ -27,6 +27,7 @@ from lea_config.models.agent import Agent
 from lea_config.models.binding import AgentKbBinding, AgentSkillBinding, AgentToolBinding
 from lea_config.models.knowledge import KnowledgeBase
 from lea_config.models.skill import Skill
+from lea_config.models.team import AgentTeam, AgentTeamMember
 from lea_config.models.tool import Tool
 
 router = APIRouter(prefix="/agents", tags=["agents"])
@@ -328,6 +329,215 @@ def delete_agent(
     db.delete(agent)
     db.commit()
     return {"message": "\u5df2\u5220\u9664"}
+
+
+# ── 共享 / 取消共享 ────────────────────────────────────────
+#
+# 共享一个 agent = 把 owner_scope 从 user 升到 platform，本租户所有人可用。
+#
+# ## 为什么要一道门
+#
+# agent 是个**容器**：它自己没有内容，内容全在它绑的 tool / skill / kb 里。把容器
+# 共享出去而里面装着私有资源，等于绕开那些资源自己的可见性。
+#
+# 真链路实测过这个形状（scripts/my_prefix_e2e.py）：私有工具挂在共享 agent 上，
+# 另一个用户的工具清单里确实出现了 my__stock_lookup。
+#
+# ## 硬拦 vs 软提示：差别在**泄漏的是定义还是数据**
+#
+#     tool / skill / 团队成员    硬拦
+#         它们的**定义本身**就是要下发给模型的：名字、描述、完整参数 schema 全部
+#         进入别人的对话上下文。执行会被 resolve_tool 挡住，但该泄的在下发时就泄
+#         完了 —— 而 schema 的字段名往往就是业务内部结构。挡不住就是真泄漏。
+#
+#     knowledge_base            只提示，不拦
+#         下发的只有 kb_ids，内容要再经过一次 kb_search 才拿得到，而那一跳是
+#         lea-rag 授权的。所以它不是"共享 agent 就等于泄漏内容"，是"别人可能
+#         搜到你的库"。这条留给用户判断 —— 有人就是想共享一个带自己资料的助手。
+#
+#         ⚠️ 这个判断依赖 lea-rag 真的按租户/归属授权，而那一层现在是弱的
+#         （server_admin_kb.py 的 list_all_kbs 不传 tenant_id 就返全平台）。
+#         提示文案因此得说清"别人可能搜到"，不能只说"建议共享"。
+#
+# ## 拒绝，而不是连带发布
+#
+# 撞到未发布的资源直接 409 并列出**每一个**阻塞项。不做"顺手一起上架"：那是一个
+# 动作改很多东西，而 skill 还有真正的审批流（skill_publish_requests），连带触发
+# 等于替审批人做决定。
+
+class ShareBlocker(BaseModel):
+    kind: str          # tool / skill / team_member / kb
+    id: int
+    name: str
+    reason: str
+
+
+def _share_blockers(
+    db: Session, agent: Agent
+) -> tuple[list[ShareBlocker], list[ShareBlocker]]:
+    """返回 (硬阻塞, 软提示)。硬阻塞为空 = 可以共享。
+
+    **两个都列全，不是碰到第一个就返回** —— 用户要的是一张待办清单，一次一个地
+    试错很折磨人，尤其绑了十几样东西的 agent。
+    """
+    blockers: list[ShareBlocker] = []
+    warnings: list[ShareBlocker] = []
+
+    tool_rows = (
+        db.query(Tool)
+        .join(AgentToolBinding, AgentToolBinding.tool_id == Tool.id)
+        .filter(AgentToolBinding.agent_id == agent.id)
+        .all()
+    )
+    for t in tool_rows:
+        if t.owner_scope == OWNER_SCOPE_USER:
+            blockers.append(ShareBlocker(
+                kind="tool", id=t.id, name=t.name,
+                reason=f"私有工具（属于 {t.owner_user_id}），要先共享到租户",
+            ))
+
+    skill_rows = (
+        db.query(Skill)
+        .join(AgentSkillBinding, AgentSkillBinding.skill_id == Skill.id)
+        .filter(AgentSkillBinding.agent_id == agent.id)
+        .all()
+    )
+    for s in skill_rows:
+        if s.owner_scope == OWNER_SCOPE_USER:
+            blockers.append(ShareBlocker(
+                kind="skill", id=s.id, name=s.name,
+                reason=f"私有技能（属于 {s.owner_user_id}），走 /skills/{s.id}/publish 上架",
+            ))
+
+    # 知识库：**只提示不拦**。见上面"定义 vs 数据"那段。
+    kb_rows = (
+        db.query(KnowledgeBase)
+        .join(AgentKbBinding, AgentKbBinding.kb_id == KnowledgeBase.id)
+        .filter(AgentKbBinding.agent_id == agent.id)
+        .all()
+    )
+    for k in kb_rows:
+        if k.visibility == "private":
+            warnings.append(ShareBlocker(
+                kind="kb", id=k.id, name=k.name,
+                reason="私有知识库。共享后别人用这个 agent 时可能搜到里面的内容；"
+                       "不想被搜到就先解绑，或者改成 public 让归属明确。",
+            ))
+
+    # 专家团成员 —— 硬拦。
+    #
+    # 不加这条的话前面几条全白做：共享 agent 的团里挂一个**私有**成员 agent，
+    # 引擎会用成员的 agent_id 再打一次 /internal/agent-config
+    # （runtime/expert_assembly.go:104），成员绑的私有工具照样下发。
+    # 容器套容器，可见性要一路传下去。
+    team = db.query(AgentTeam).filter_by(agent_id=agent.id).first()
+    if team:
+        member_ids = [
+            m.member_agent_id
+            for m in db.query(AgentTeamMember).filter_by(team_id=team.id).all()
+        ]
+        if member_ids:
+            for ma in db.query(Agent).filter(Agent.id.in_(member_ids)).all():
+                if ma.owner_scope == OWNER_SCOPE_USER:
+                    blockers.append(ShareBlocker(
+                        kind="team_member", id=ma.id, name=ma.name,
+                        reason=f"专家团成员是私有 agent（属于 {ma.owner_user_id}），"
+                               f"要先共享它",
+                    ))
+
+    return blockers, warnings
+
+
+@router.get("/{agent_id}/share-check")
+def check_share(
+    agent_id: int,
+    db: Session = Depends(get_db),
+    actor: Actor = Depends(require_actor),
+):
+    """预检：现在能不能共享，卡在哪，以及有什么要留意的。
+
+    单独一个只读端点，前端可以在"共享"按钮旁边先亮出清单，而不是让用户点一下
+    才发现被拒。
+    """
+    agent = _get_agent_or_404(db, agent_id, actor)
+    _require_mine(agent, actor)
+    blockers, warnings = _share_blockers(db, agent)
+    return {
+        "agent_id": agent.id,
+        "already_shared": agent.owner_scope == OWNER_SCOPE_PLATFORM,
+        "can_share": not blockers,
+        "blockers": [b.model_dump() for b in blockers],
+        "warnings": [w.model_dump() for w in warnings],
+    }
+
+
+@router.post("/{agent_id}/share")
+def share_agent(
+    agent_id: int,
+    db: Session = Depends(get_db),
+    actor: Actor = Depends(require_actor),
+):
+    """把自己的私有 agent 升到租户共享档。"""
+    agent = _get_agent_or_404(db, agent_id, actor)
+    _require_mine(agent, actor)
+
+    # 幂等：已经共享就直接返回，不 400。共享是"达到某个状态"，重复调用该无害 ——
+    # 前端重试、双击按钮都会走到这里。
+    if agent.owner_scope == OWNER_SCOPE_PLATFORM:
+        return {"agent": _agent_to_dict(agent, actor.user_id), "warnings": []}
+
+    blockers, warnings = _share_blockers(db, agent)
+    if blockers:
+        raise HTTPException(409, {
+            "message": f"有 {len(blockers)} 项资源还没共享，agent 不能共享",
+            "blockers": [b.model_dump() for b in blockers],
+            "warnings": [w.model_dump() for w in warnings],
+        })
+
+    agent.owner_scope = OWNER_SCOPE_PLATFORM
+    agent.owner_user_id = None
+    # is_system 不动。共享 ≠ 系统内置：系统 agent 是平台预置且不可删的，而这是
+    # 用户自己建的、共享出来的，他仍然该能改能删。
+    db.commit()
+    db.refresh(agent)
+    # 软提示跟着成功一起返回 —— 共享成功了，但"你有个私有知识库在里面"这件事用户
+    # 仍然该知道。丢掉它等于让软提示只在失败时出现，而那时反而没人看。
+    return {
+        "agent": _agent_to_dict(agent, actor.user_id),
+        "warnings": [w.model_dump() for w in warnings],
+    }
+
+
+@router.post("/{agent_id}/unshare")
+def unshare_agent(
+    agent_id: int,
+    db: Session = Depends(get_db),
+    actor: Actor = Depends(require_actor),
+):
+    """撤回共享，还给原作者。
+
+    共享是个对别人可见的动作。没有回退路径的话它就是一道单向门 —— 用户会因此
+    不敢点。所以这个端点跟 share 一起给。
+
+    ⚠️ `created_by` 为空的行拒绝撤回。那些是**种子数据**（库里 agent 1/3/4/5/6 的
+    created_by 就是 NULL），撤回等于把平台预置的 agent 塞进当前操作者的私人名下。
+    """
+    agent = _get_agent_or_404(db, agent_id, actor)
+    _require_mine(agent, actor)
+
+    if agent.owner_scope == OWNER_SCOPE_USER:
+        return {"agent": _agent_to_dict(agent, actor.user_id)}  # 幂等，同 share
+
+    if not agent.created_by:
+        raise HTTPException(
+            400, "这个 agent 没有记录创建者（多半是种子数据），不能撤回共享"
+        )
+
+    agent.owner_scope = OWNER_SCOPE_USER
+    agent.owner_user_id = agent.created_by
+    db.commit()
+    db.refresh(agent)
+    return {"agent": _agent_to_dict(agent, actor.user_id)}
 
 
 # ── Skill Bindings ─────────────────────────────────────────

@@ -42,7 +42,16 @@ from sqlalchemy import (
     text,
 )
 
-from lea_config.database import OWNER_SCOPE_USER, Base, OwnerMixin, TenantMixin
+from sqlalchemy import and_, or_
+
+from lea_config.database import (
+    DEFAULT_TENANT_ID,
+    OWNER_SCOPE_PLATFORM,
+    OWNER_SCOPE_USER,
+    Base,
+    OwnerMixin,
+    TenantMixin,
+)
 
 # 跟 lea_tools.db.models.Tool 的 ENUM 保持逐值一致 —— 两个模型映射同一列，
 # 值集合不一样的话 create_all() 在新库上会建出一个双方都不认的 ENUM。
@@ -122,6 +131,46 @@ class Tool(OwnerMixin, TenantMixin, Base):
 # ⚠️ 这个值必须跟 lea-tools 的 `services/__init__.py::USER_TOOL_PREFIX` 一致，
 # **故意在这里重新定义一遍**而不是从那边导 —— 两个服务分开部署，lea-config 不依赖
 # 执行侧的包。跟 OWNER_SCOPE_* 在三处各定义一遍是同一个取舍。
+def visible_to(tenant_id: str, user_id: str | None):
+    """"这个人能用哪些工具"的三段式判据，返回一组 SQLAlchemy 过滤条件。
+
+        全局平台工具   (default, platform, NULL)   谁都能用
+        本租户共享的   (t1,      platform, NULL)   t1 的人能用
+        自己私有的     (t1,      user,     alice)  只有 alice 能用
+
+    ## 为什么提成一个函数
+
+    这条规则要在**至少三个地方**成立：绑定到 agent 时、按名字解析执行时、挂载到会话
+    时。而它上一次被各写一遍的结果是 `bind_tool` 整个漏掉了校验 —— 旁边 180 行的
+    `bind_skill` 写对了、有注释、有测试，工具那份原样留着裸的
+    `AgentToolBinding(agent_id=..., **body.model_dump())`，猜一个 id 就能绑走别人的
+    工具。同一个文件里，两个几乎一样的函数，一个查了一个没查。
+
+    所以新增用到这条规则的地方一律从这里取，别再抄一遍。
+    （lea-tools 侧的 `visible_tools()` 是同一条规则的另一个实现 —— 两个服务分开部署，
+    不能互相 import，跟 OWNER_SCOPE_* 各定义一遍是同一个取舍。改这里要同步改那边。）
+
+    user_id 为空时**只返回平台工具**，是 fail-closed：没有身份就当没有私有工具，
+    而不是"匹配 owner_user_id IS NULL"——后者会把平台工具和"没主人的行"混为一谈。
+    """
+    conds = [
+        Tool.tenant_id.in_([tenant_id, DEFAULT_TENANT_ID]),
+    ]
+    if user_id:
+        conds.append(
+            or_(
+                Tool.owner_scope == OWNER_SCOPE_PLATFORM,
+                and_(
+                    Tool.owner_scope == OWNER_SCOPE_USER,
+                    Tool.owner_user_id == user_id,
+                ),
+            )
+        )
+    else:
+        conds.append(Tool.owner_scope == OWNER_SCOPE_PLATFORM)
+    return conds
+
+
 USER_TOOL_PREFIX = "my__"
 
 

@@ -28,7 +28,7 @@ from lea_config.models.binding import AgentKbBinding, AgentSkillBinding, AgentTo
 from lea_config.models.knowledge import KnowledgeBase
 from lea_config.models.skill import Skill
 from lea_config.models.team import AgentTeam, AgentTeamMember
-from lea_config.models.tool import Tool
+from lea_config.models.tool import Tool, visible_to
 
 router = APIRouter(prefix="/agents", tags=["agents"])
 
@@ -793,14 +793,10 @@ def bind_tool(
         .filter(
             Tool.id == body.tool_id,
             Tool.enabled.is_(True),
-            Tool.tenant_id.in_([actor.tenant_id, DEFAULT_TENANT_ID]),
-            or_(
-                Tool.owner_scope == OWNER_SCOPE_PLATFORM,
-                and_(
-                    Tool.owner_scope == OWNER_SCOPE_USER,
-                    Tool.owner_user_id == actor.user_id,
-                ),
-            ),
+            # 三段式可见性只有一份实现，见 models/tool.py::visible_to。
+            # 以前这里是内联的一段 or_/and_，而 /internal/resolve-attachments 需要
+            # 同一条规则 —— 各写一遍正是 bind_tool 当初整个漏掉校验的原因。
+            *visible_to(actor.tenant_id, actor.user_id),
         )
         .first()
     )

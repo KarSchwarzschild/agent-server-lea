@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from lea_config.database import get_db
 from lea_config.models.agent import Agent
 from lea_config.models.binding import AgentKbBinding, AgentSkillBinding, AgentToolBinding
+from lea_config.models.knowledge import KnowledgeBase
 from lea_config.models.llm_provider import LLMProvider
 from lea_config.models.skill import Skill
 from lea_config.models.team import AgentTeam, AgentTeamMember
-from lea_config.models.tool import Tool, exposed_name
+from lea_config.models.tool import Tool, exposed_name, visible_to
 
 router = APIRouter(prefix="/internal", tags=["internal"])
 
@@ -202,3 +204,115 @@ def get_agent_config(
         "team": team,
         "llm": llm_config,
     }
+
+
+# ── 会话级挂载的解析 ───────────────────────────────────────────────────────
+#
+# 用户在**单个会话里**临时挂上的资源（migrations/017 的 session_attachments）。
+# 那张表归 lea-agent 写和读 —— 它是会话状态，跟 session_plans / agent_messages 一类，
+# 不是配置。lea-config 在这里只做一件事：**把 id 还原成定义，并且按归属过滤**。
+#
+# 分工的理由跟 tools / mcp_servers 一样：谁拥有这张表，谁定义它的语义。会话状态归
+# 引擎，资源定义归配置服务。
+#
+# ## 跟 agent 绑定的区别（别混）
+#
+#     agent_tool_bindings   agent 定义的一部分，所有使用者相同，改它 = 改这个 agent
+#     session_attachments   只属于一个会话，别人用同一个 agent 完全不受影响
+#
+# 所以共享 agent 的发布门（api/agents.py 的 _share_blockers）查的是绑定，跟挂载无关。
+
+
+class AttachmentRef(BaseModel):
+    kind: str          # tool | kb（mcp_server / skill 是下一批）
+    ref_id: int
+
+
+class ResolveAttachmentsBody(BaseModel):
+    tenant_id: str
+    user_id: str = ""
+    items: list[AttachmentRef] = []
+
+
+@router.post("/resolve-attachments")
+def resolve_attachments(body: ResolveAttachmentsBody, db: Session = Depends(get_db)):
+    """把挂载记录还原成引擎能直接用的配置。
+
+    ## 够不着的**静默丢弃**，不报错
+
+    挂载行没有外键（ref_id 是多态的），而且资源随时可能被删掉、被取消共享、或者用户
+    被移出租户。如果这里对失效项报错，后果是**用户的老会话直接打不开** —— 一个跟他
+    无关的删除操作，让一整段对话变成打不开的东西。少一个工具远比这个轻。
+
+    但也不能真的悄无声息：失效项进 `dropped` 一起返回，引擎打一行日志。否则"我昨天
+    挂的工具今天不见了"在任何地方都查不到。
+
+    ## 返回形状必须跟 /internal/agent-config 的 tools 一致
+
+    引擎两边用的是**同一个** ToolDef 结构体去解。差一个键名就是静默失效 —— 那正是
+    `schema_json` 那个 bug 的形状（tag 写成 input_schema，json.Decode 静默丢弃，
+    模型拿到一个空 schema 然后全靠猜）。所以这里同样走 _row_to_dict + exposed_name，
+    不另起一套。
+    """
+    tools_out: list[dict] = []
+    kb_ids: list[int] = []
+    dropped: list[dict] = []
+
+    tool_ids = [i.ref_id for i in body.items if i.kind == "tool"]
+    kb_refs = [i.ref_id for i in body.items if i.kind == "kb"]
+    for i in body.items:
+        if i.kind not in ("tool", "kb"):
+            # 认不出的 kind 不算错误：kind 是 VARCHAR 就是为了让新资源不必先改所有
+            # 读端（见 migrations/017 的说明）。老版本的 lea-config 碰到 mcp_server
+            # 就该跳过，而不是让整个会话建不起来。
+            dropped.append({"kind": i.kind, "ref_id": i.ref_id, "reason": "unknown kind"})
+
+    if tool_ids:
+        rows = (
+            db.query(Tool)
+            .filter(
+                Tool.id.in_(tool_ids),
+                Tool.enabled.is_(True),
+                # 可见性判据只有一份，见 models/tool.py::visible_to 的说明
+                *visible_to(body.tenant_id, body.user_id or None),
+            )
+            .all()
+        )
+        found = {t.id: t for t in rows}
+        for tid in tool_ids:
+            t = found.get(tid)
+            if t is None:
+                dropped.append({
+                    "kind": "tool", "ref_id": tid,
+                    "reason": "not found / disabled / not visible to this user",
+                })
+                continue
+            d = _row_to_dict(t)
+            d["name"] = exposed_name(t)   # 发给模型的名字，用户私有工具带 my__
+            tools_out.append(d)
+
+    if kb_refs:
+        rows = (
+            db.query(KnowledgeBase)
+            .filter(
+                KnowledgeBase.id.in_(kb_refs),
+                KnowledgeBase.tenant_id == body.tenant_id,
+                KnowledgeBase.enabled.is_(True),
+            )
+            .all()
+        )
+        found = {k.id: k for k in rows}
+        for kid in kb_refs:
+            k = found.get(kid)
+            # 私有库只有主人能用 —— 跟 api/agents.py 绑定 kb 时那条判据一致。
+            # kb 用的是 visibility/owner 这套更老的编码，不是 owner_scope 三段式；
+            # 统一它是另一件事，这里先把两套都判对。
+            if k is None or (k.visibility == "private" and k.owner != body.user_id):
+                dropped.append({
+                    "kind": "kb", "ref_id": kid,
+                    "reason": "not found / disabled / not visible to this user",
+                })
+                continue
+            kb_ids.append(k.id)
+
+    return {"tools": tools_out, "kb_ids": kb_ids, "dropped": dropped}

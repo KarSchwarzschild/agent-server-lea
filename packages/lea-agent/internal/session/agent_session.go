@@ -100,6 +100,20 @@ type AgentSession struct {
 	// 清理协程要在不打断读写的前提下频繁读它。
 	activeMu   sync.Mutex
 	lastActive time.Time
+
+	// pendingRebuild：本轮跑的时候有人挂/摘了会话级资源，收尾时要丢掉这份引擎对象
+	// （工具数组在 engine.Build 那一刻就冻住了，只能靠重建换）。
+	//
+	// 又是一把单独的锁，理由跟 activeMu 一样：挂载接口在 HTTP 协程里置这个标志，
+	// 而收尾在 turn 的协程里读它 —— 复用 turnMu 的话，置标志就要等这一轮的锁，
+	// 而 turnMu 在整轮里被反复持有。
+	rebuildMu      sync.Mutex
+	pendingRebuild bool
+
+	// dropper 是"把我从 Manager 的表里丢掉"的回调，由 Manager 注入（就是 Manager.Drop）。
+	// 存成回调而不是让 AgentSession 持有 *Manager：后者是个循环引用，而且会话本来
+	// 不该知道管理它的东西长什么样。nil 时 rebuildIfPending 直接跳过（单测里常见）。
+	dropper func(string) bool
 }
 
 // Touch 记一次活跃。Send / Subscribe / Get 都要调，否则正在用的会话会被清理掉。
@@ -123,6 +137,39 @@ func (s *AgentSession) HasActiveTurn() bool {
 	s.turnMu.Lock()
 	defer s.turnMu.Unlock()
 	return s.turnCancel != nil
+}
+
+// MarkPendingRebuild 记下"这个会话的资源集变了，等这轮跑完把它丢掉重建"。
+//
+// 挂载工具时如果正好有一轮在生成，不能立刻丢 —— 那个引擎对象正被占用。而**也不该打断
+// 那一轮**：用户挂工具是想*增补*，他还等着这轮的结果。（对比一下：用户在生成中发新消息
+// 走的是 acquireTurnLock，那里会直接取消上一轮，因为那是*改主意*，旧的产出已经作废。
+// 同一个"生成中的用户操作"，两种语义，两种处理。）
+//
+// 所以记个标志，本轮收尾时（rebuildIfPending）自己丢。对调用方来说挂载永远成功，
+// 只是生效时机差一轮，不需要处理任何错误分支。
+func (s *AgentSession) MarkPendingRebuild() {
+	s.rebuildMu.Lock()
+	s.pendingRebuild = true
+	s.rebuildMu.Unlock()
+}
+
+// rebuildIfPending 在一轮收尾时把待重建的会话丢掉。由 Send 的 defer 调。
+func (s *AgentSession) rebuildIfPending() {
+	s.rebuildMu.Lock()
+	pending := s.pendingRebuild
+	s.pendingRebuild = false
+	s.rebuildMu.Unlock()
+	if !pending || s.dropper == nil {
+		return
+	}
+	if s.dropper(s.id) {
+		log.Printf("session_dropped_for_rebuild session=%s reason=attachments_changed", s.id)
+	} else {
+		// 又有新的一轮开始了，或者有 SSE 订阅者挂着。标志放回去，下一轮收尾再试 ——
+		// 丢不掉不是错误，只是再等等。
+		s.MarkPendingRebuild()
+	}
 }
 
 // SubscriberCount 返回当前挂着的 SSE 订阅者数量。
@@ -570,6 +617,12 @@ func (s *AgentSession) Send(message string, attachmentIDs []int64, plan PlanCont
 				s.turnCancel = nil
 			}
 			s.turnMu.Unlock()
+			// 本轮跑的时候有人挂/摘了资源 —— 现在丢掉这份引擎对象，下一条消息重建时
+			// 新的工具集就生效了。
+			//
+			// 放在 turnCancel 清空**之后**，否则 Drop 会看到 HasActiveTurn() 为真、
+			// 拒绝丢弃，于是挂载永远等不到生效（用户点了没反应，还得再发一条消息才好）。
+			s.rebuildIfPending()
 		}()
 		// 必须排在第一次 broadcast 之前 —— 序号一旦发歪，这一整轮的日志都写不进去。
 		s.seedEventSeq()
@@ -1052,6 +1105,9 @@ func (s *AgentSession) Unsubscribe(ch chan SSEEvent) {
 
 func (s *AgentSession) Close() {
 	// SessionEnd: 批量提取记忆 + merge 画像
+	//
+	// ⚠️ 这一段是"会话真的结束了"才该做的。想丢掉内存里这份对象但**不**当作结束
+	// （比如让新挂的工具生效），走 closeCore —— 见 Manager.Drop。
 	if s.memory != nil {
 		s.mu.RLock()
 		history := make([]runtime.MessagePair, len(s.history))
@@ -1061,6 +1117,19 @@ func (s *AgentSession) Close() {
 			go s.memory.OnSessionEnd(context.Background(), history, s.id)
 		}
 	}
+	s.closeCore()
+}
+
+// closeCore 释放这份会话对象持有的资源，**不**跑任何"会话结束"的语义。
+//
+// 拆出来是为了 Manager.Drop：挂载工具之后要丢掉内存里的引擎对象让下次重建生效，
+// 而那不是会话结束 —— 走 Close 的话每挂一次工具就白跑一次记忆提取，同一段历史被反复
+// 提取，画像里堆重复内容。
+//
+// 沙箱不在这里关，本来也不在 Close 里 —— 它的生命周期由 lea-tools 按 pause/kill 分层
+// 管（见 project_cube_volume_artifacts）。所以 Drop 之后重建，沙箱和工作区里的文件
+// 都还在，用户不会因为挂了个工具就丢掉正在做的事。
+func (s *AgentSession) closeCore() {
 	if s.engine != nil {
 		s.engine.Close(context.Background())
 	}

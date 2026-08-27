@@ -31,6 +31,11 @@ func RegisterRoutes(api *gin.RouterGroup, mgr *session.Manager) {
 		sess.GET("", handleListSessions(mgr))
 		sess.GET("/:id/messages", handleGetMessages(mgr))
 		sess.DELETE("/:id", handleDeleteSession(mgr))
+		// 会话级挂载：在**这一个会话里**临时挂上自己的工具/知识库，不动 agent 的绑定。
+		// 见 session_attachments.go 顶部。
+		sess.GET("/:id/attachments", handleListSessionAttachments(mgr))
+		sess.POST("/:id/attachments", handleAttachToSession(mgr))
+		sess.DELETE("/:id/attachments/:kind/:ref_id", handleDetachFromSession(mgr))
 	}
 
 	files := api.Group("/files")

@@ -225,10 +225,27 @@ func (m *Manager) GetOrCreate(ctx context.Context, p Params) (*AgentSession, err
 		return nil, fmt.Errorf("load agent config: %w", err)
 	}
 
+	// 会话级挂载：用户在这一个会话里临时挂上的工具/知识库，并进 cfg。
+	//
+	// 放在 LoadAgentConfig 之后、NewAgentSession 之前，是因为引擎的工具数组在
+	// engine.Build() 那一刻就冻住了（agentloop/build.go 里 Toolset.Tools() 全仓只调
+	// 一次）。合并进 cfg 是唯一不用改工具装配、也不用动 agentloop 的接法 ——
+	// BuildPlatformTools 读的就是 cfg.Tools 和 cfg.KBIDs。
+	//
+	// **这是"重建才生效"的那一环**：挂载接口落库之后调 Drop 丢掉内存里那份引擎对象，
+	// 下一条消息走到这里，新工具就在初始集合里了。
+	//
+	// 整段失败只记日志不阻断：少几个临时工具，比**整段对话打不开**轻得多。
+	// 同理见 runtime.MergeAttachments 和 lea-config 那边对失效项的静默丢弃。
+	cfg = m.mergeSessionAttachments(ctx, cfg, p)
+
 	s, err := NewAgentSession(ctx, cfg, p)
 	if err != nil {
 		return nil, fmt.Errorf("create session: %w", err)
 	}
+	// 让会话能在一轮收尾时自己请求重建（挂载工具那条路）。注入回调而不是让
+	// AgentSession 持有 *Manager —— 后者是循环引用，而且会话不该知道谁在管它。
+	s.dropper = m.Drop
 
 	m.mu.Lock()
 	m.sessions[s.ID()] = s
@@ -405,6 +422,65 @@ func (m *Manager) Delete(id string) {
 	if ok {
 		s.Close()
 	}
+}
+
+// mergeSessionAttachments 读这个会话挂了什么，解析后并进 cfg。
+//
+// 任何一步失败都返回 cfg 原样 —— 挂载是增量能力，它的问题不该让一段已有的对话打不开。
+// 但每一步失败都记日志：用户报"我昨天挂的工具今天不见了"时，只有日志能复原。
+func (m *Manager) mergeSessionAttachments(
+	ctx context.Context, cfg *runtime.AgentConfig, p Params,
+) *runtime.AgentConfig {
+	if p.SessionID == "" {
+		return cfg
+	}
+	db, err := persistence.DB()
+	if err != nil || db == nil {
+		return cfg // 没配库：本地开发和单测都会走到，不是错误
+	}
+	rows, err := persistence.LoadSessionAttachments(ctx, db, p.TenantID, p.SessionID)
+	if err != nil {
+		log.Printf("session_attachments_load_failed session=%s err=%v (跳过挂载)", p.SessionID, err)
+		return cfg
+	}
+	if len(rows) == 0 {
+		return cfg
+	}
+	refs := make([]runtime.AttachmentRef, 0, len(rows))
+	for _, r := range rows {
+		refs = append(refs, runtime.AttachmentRef{Kind: r.Kind, RefID: r.RefID})
+	}
+	return runtime.MergeAttachments(ctx, cfg, p.TenantID, p.UserID, refs)
+}
+
+// Drop 丢掉内存里那份引擎对象，**不当作会话结束**。
+//
+// 跟 Delete 的区别只有一个，但很要紧：Delete 走 s.Close()，而 Close 头一件事是
+// `go s.memory.OnSessionEnd(...)` —— 批量提取记忆 + merge 画像。那对真正的空闲淘汰是
+// 对的（冷到被回收就当结束了），但用来"让新挂的工具生效"就不对：每挂一次工具白烧一次
+// 记忆提取，而且同一段历史被反复提取，画像里会堆重复的东西。
+//
+// 返回 false 表示**没丢**，因为这一轮正在跑或者还有 SSE 订阅者挂着。判据跟
+// ensureCapacity 里那条一致，不另写一套。调用方据此把重建推迟到本轮结束
+// （见 AgentSession.MarkPendingRebuild）。
+func (m *Manager) Drop(id string) bool {
+	m.mu.Lock()
+	s, ok := m.sessions[id]
+	if !ok {
+		m.mu.Unlock()
+		return true // 本来就不在内存里，目标状态已经达到
+	}
+	if s.HasActiveTurn() || s.SubscriberCount() > 0 {
+		m.mu.Unlock()
+		return false
+	}
+	delete(m.sessions, id)
+	m.mu.Unlock()
+
+	// 在锁外：closeCore 要拿 s.mu，在 m.mu 里嵌套是给死锁留口子
+	// （跟 ensureCapacity 里 victim.Close() 放锁外是同一个理由）。
+	s.closeCore()
+	return true
 }
 
 // ActiveTurns 返回当前有 turn 在跑的会话数。优雅退出靠它判断排空是否完成。

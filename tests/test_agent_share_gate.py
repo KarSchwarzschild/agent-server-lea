@@ -306,11 +306,16 @@ def test_all_blockers_are_listed_not_just_the_first(client):
 # ── 软提示：知识库不拦 ────────────────────────────────────────────────────
 
 def test_private_kb_warns_but_does_not_block(client):
-    """**产品决定**：私有知识库只提示，不挡共享。
+    """**产品决定**：未公开的知识库只提示，不挡共享。
 
-    理由是泄漏的东西不同 —— tool 的定义直接进别人的上下文，而 kb 下发的只有
-    kb_ids，内容要再经过 lea-rag 授权的 kb_search 才拿得到。有人就是想共享一个
-    带自己资料的助手。
+    它跟 tool / skill 不是同一类问题：
+
+        tool / skill   安全问题 —— 定义直接进别人的上下文，泄漏已经发生
+        kb             可用性问题 —— 下发的只有 kb_ids，别人用这个 agent 时
+                       可能检索不到，于是同一个 agent 对 owner 和对别人表现不同
+
+    提示的目的是告诉作者"你共享出去的这个 agent 对别人是残的"，而不是拦住他。
+    他完全可能明知故犯（就想共享一个骨架，让别人自己接知识库）。
 
     这一条钉的是"**不要**把它改成 blocker"。下一个人看到 warnings 里躺着一个
     private kb，很容易觉得"这不也是私有吗"顺手升级 —— 那会把一个刻意的产品选择
@@ -325,8 +330,10 @@ def test_private_kb_warns_but_does_not_block(client):
 
     warnings = r.json()["warnings"]
     assert [w["kind"] for w in warnings] == ["kb"]
-    # 文案要说清后果，不能只说"建议共享"
-    assert "搜到" in warnings[0]["reason"]
+    # 文案讲的是**可用性**（别人可能用不了），不是泄漏（别人可能看到）。
+    # 第一版写反了，提示成了"别人可能搜到你的内容" —— 那会把一个"你的 agent
+    # 对别人不完整"的提醒，变成一句吓人的隐私警告，用户的反应完全不同。
+    assert "检索不到" in warnings[0]["reason"]
 
 
 def test_warnings_survive_a_successful_share(client):

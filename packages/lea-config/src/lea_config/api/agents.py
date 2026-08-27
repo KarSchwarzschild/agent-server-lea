@@ -343,21 +343,27 @@ def delete_agent(
 # 真链路实测过这个形状（scripts/my_prefix_e2e.py）：私有工具挂在共享 agent 上，
 # 另一个用户的工具清单里确实出现了 my__stock_lookup。
 #
-# ## 硬拦 vs 软提示：差别在**泄漏的是定义还是数据**
+# ## 硬拦 vs 软提示：差别在**安全问题还是可用性问题**
 #
-#     tool / skill / 团队成员    硬拦
+#     tool / skill / 团队成员    硬拦 —— 这是**安全**问题
 #         它们的**定义本身**就是要下发给模型的：名字、描述、完整参数 schema 全部
 #         进入别人的对话上下文。执行会被 resolve_tool 挡住，但该泄的在下发时就泄
 #         完了 —— 而 schema 的字段名往往就是业务内部结构。挡不住就是真泄漏。
 #
-#     knowledge_base            只提示，不拦
-#         下发的只有 kb_ids，内容要再经过一次 kb_search 才拿得到，而那一跳是
-#         lea-rag 授权的。所以它不是"共享 agent 就等于泄漏内容"，是"别人可能
-#         搜到你的库"。这条留给用户判断 —— 有人就是想共享一个带自己资料的助手。
+#     knowledge_base            只提示 —— 这是**可用性**问题
+#         下发的只有 kb_ids，内容要再经过一次 kb_search 才拿得到，而那一跳按归属
+#         授权。所以未公开的知识库对别人来说是**用不了**的：同一个 agent，owner
+#         自己用能检索到，别人用检索不到，表现不一样。
 #
-#         ⚠️ 这个判断依赖 lea-rag 真的按租户/归属授权，而那一层现在是弱的
-#         （server_admin_kb.py 的 list_all_kbs 不传 tenant_id 就返全平台）。
-#         提示文案因此得说清"别人可能搜到"，不能只说"建议共享"。
+#         这不是"要不要拦住泄漏"，是"要不要提醒作者他共享出去的 agent 对别人是
+#         残的"。作者完全可能明知故犯（就想共享一个骨架，让别人自己接知识库），
+#         所以只提示不拦。
+#
+#         ⚠️ 文案说的是"可能无法检索"而不是"无法检索"，因为 lea-rag 那层的归属
+#         校验现在是弱的（server_admin_kb.py 的 list_all_kbs 不传 tenant_id 就返
+#         全平台）。也就是说**实际行为可能是两头里的任意一头**：按设计别人用不了，
+#         按现状别人可能反而搜得到。两种都不好，都该让作者知道，所以文案要留余地，
+#         不能斩钉截铁说"别人用不了"给人虚假的安全感。见 [project-auth-gaps]。
 #
 # ## 拒绝，而不是连带发布
 #
@@ -409,7 +415,7 @@ def _share_blockers(
                 reason=f"私有技能（属于 {s.owner_user_id}），走 /skills/{s.id}/publish 上架",
             ))
 
-    # 知识库：**只提示不拦**。见上面"定义 vs 数据"那段。
+    # 知识库：**只提示不拦**。见上面"安全 vs 可用性"那段。
     kb_rows = (
         db.query(KnowledgeBase)
         .join(AgentKbBinding, AgentKbBinding.kb_id == KnowledgeBase.id)
@@ -420,8 +426,9 @@ def _share_blockers(
         if k.visibility == "private":
             warnings.append(ShareBlocker(
                 kind="kb", id=k.id, name=k.name,
-                reason="私有知识库。共享后别人用这个 agent 时可能搜到里面的内容；"
-                       "不想被搜到就先解绑，或者改成 public 让归属明确。",
+                reason="这个知识库还没公开，其他人用这个 agent 时可能检索不到它，"
+                       "回答会跟你自己用的时候不一样。要让所有人都能用就先把它"
+                       "改成 public。",
             ))
 
     # 专家团成员 —— 硬拦。

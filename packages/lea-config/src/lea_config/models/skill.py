@@ -15,9 +15,16 @@
 因为 upload 的默认参数没人传）。
 """
 
-from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint, and_, func, or_
 
-from lea_config.database import Base, OwnerMixin, TenantMixin
+from lea_config.database import (
+    DEFAULT_TENANT_ID,
+    OWNER_SCOPE_PLATFORM,
+    OWNER_SCOPE_USER,
+    Base,
+    OwnerMixin,
+    TenantMixin,
+)
 
 
 class Skill(OwnerMixin, TenantMixin, Base):
@@ -49,6 +56,42 @@ class Skill(OwnerMixin, TenantMixin, Base):
     created_by = Column(String(100), nullable=True)
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+
+def visible_to(tenant_id: str, user_id: str | None):
+    """"这个人能用哪些 skill"的三段式判据，返回一组 SQLAlchemy 过滤条件。
+
+        所有人可见  (default, platform, NULL)
+        租户下可见  (t1,      platform, NULL)
+        用户可见    (t1,      user,     alice)
+
+    跟 models/tool.py::visible_to 是同一个形状，故意各写一份而不是抽公共函数：两张表
+    的列虽然同名，但条件里引用的是**各自的类属性**（Skill.owner_scope vs
+    Tool.owner_scope），抽出来要么传类、要么上元编程，两种都比多写十行难读。
+
+    ## 跟 api/skills.py::_visible_skills 的分工
+
+    那个要 `Actor`，还额外处理两种管理员（平台管理员无约束、租户管理员看得到本租户
+    别人的私有 skill —— 他要审核就得先看得见）。**管理面需要那些，下发链路不需要**：
+    引擎按"这个用户能不能用"取 skill，管理员身份在这里不该放大可见范围，否则管理员
+    的会话会挂上别人的私有 skill。
+
+    所以这里只有三段式，不认管理员。user_id 为空时只返回平台级，是 fail-closed。
+    """
+    conds = [Skill.tenant_id.in_([tenant_id, DEFAULT_TENANT_ID])]
+    if user_id:
+        conds.append(
+            or_(
+                Skill.owner_scope == OWNER_SCOPE_PLATFORM,
+                and_(
+                    Skill.owner_scope == OWNER_SCOPE_USER,
+                    Skill.owner_user_id == user_id,
+                ),
+            )
+        )
+    else:
+        conds.append(Skill.owner_scope == OWNER_SCOPE_PLATFORM)
+    return conds
 
 
 class SkillVersion(Base):

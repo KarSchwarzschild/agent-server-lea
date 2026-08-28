@@ -110,6 +110,25 @@ def mk_kb(client, *, tenant=T1, visibility="public", owner=ALICE,
         db.close()
 
 
+def mk_skill(client, *, tenant=T1, scope=OWNER_SCOPE_PLATFORM, owner=None,
+             enabled=True, name="ppt_maker", bundle="") -> int:
+    from lea_config.models.skill import Skill
+
+    db = client.Session()
+    try:
+        s = Skill(
+            tenant_id=tenant, name=name, display_name="做 PPT",
+            description="按模板生成演示文稿", system_prompt="Step 1: 调研…",
+            enabled=enabled, owner_scope=scope, owner_user_id=owner,
+            bundle_uri=bundle or None,
+        )
+        db.add(s)
+        db.commit()
+        return s.id
+    finally:
+        db.close()
+
+
 def resolve(client, items, *, tenant=T1, user=ALICE) -> dict:
     r = client.post("/internal/resolve-attachments", json={
         "tenant_id": tenant, "user_id": user, "items": items,
@@ -274,7 +293,7 @@ def test_unknown_kind_is_dropped_not_an_error(client):
     让整个会话建不起来 —— 那会变成一个部署顺序依赖，正是 016 那轮收拾的病。
     """
     body = resolve(client, [{"kind": "mcp_server", "ref_id": 7}])
-    assert body["tools"] == [] and body["kb_ids"] == []
+    assert body["tools"] == [] and body["kb_ids"] == [] and body["skills"] == []
     assert body["dropped"] == [{"kind": "mcp_server", "ref_id": 7, "reason": "unknown kind"}]
 
 
@@ -294,7 +313,130 @@ def test_tools_and_kbs_together(client):
 def test_empty_items_is_fine(client):
     """没挂任何东西是最常见的情况，不该是特例。"""
     body = resolve(client, [])
-    assert body == {"tools": [], "kb_ids": [], "dropped": []}
+    assert body == {"tools": [], "skills": [], "kb_ids": [], "dropped": []}
+
+
+# ── skill ─────────────────────────────────────────────────────────────────
+#
+# 归属判据跟 tool 同一套三元组（Skill 也是 OwnerMixin），所以这一组盯的是
+# **skill 特有**的三件事：形状要能被同一个 Go SkillDef 解、enabled 要过滤、
+# 以及 models/skill.py::visible_to 跟 api/skills.py::_visible_skills 的分工
+# （下发链路不认管理员，否则管理员的会话会挂上别人的私有 skill）。
+
+
+def test_skill_shape_matches_agent_config(client):
+    """形状必须跟 /internal/agent-config 的 skills 一致。
+
+    引擎两边用**同一个** SkillDef 结构体去解。差一个键名就是静默失效 ——
+    json.Decode 不报错，字段留零值，模型拿到一个没有正文的 skill。那正是
+    schema_json 那个 bug 的形状。
+    """
+    sid = mk_skill(client, bundle="s3://b/ppt.zip")
+    body = resolve(client, [{"kind": "skill", "ref_id": sid}])
+
+    assert len(body["skills"]) == 1
+    s = body["skills"][0]
+    # Go SkillDef 读的这几个键必须都在
+    for key in ("id", "name", "display_name", "description",
+                "system_prompt", "bundle_uri"):
+        assert key in s, f"缺键 {key} —— Go 侧会静默留零值"
+    assert s["name"] == "ppt_maker"
+    assert s["system_prompt"] == "Step 1: 调研…"
+    assert s["bundle_uri"] == "s3://b/ppt.zip"
+
+
+def test_skill_without_bundle_resolves(client):
+    """纯 prompt 型 skill（没打包 reference）也要能挂。
+
+    bundle_uri 为空是正常状态，不是残缺 —— ProvisionSessionSkills 会跳过它，
+    引擎的 locationHeader 也会因为 Path 为空而整段跳过。
+    """
+    sid = mk_skill(client, bundle="")
+    body = resolve(client, [{"kind": "skill", "ref_id": sid}])
+    assert len(body["skills"]) == 1
+    assert not body["skills"][0]["bundle_uri"]
+
+
+def test_own_private_skill_resolves(client):
+    sid = mk_skill(client, scope=OWNER_SCOPE_USER, owner=ALICE)
+    body = resolve(client, [{"kind": "skill", "ref_id": sid}], user=ALICE)
+    assert len(body["skills"]) == 1
+    assert body["dropped"] == []
+
+
+def test_another_users_private_skill_is_dropped(client):
+    """bob 挂 alice 的私有 skill → 丢弃。
+
+    比工具那条更要紧：skill 是一段**注入进 prompt 的正文**。漏过去的话 bob 的会话里
+    会出现 alice 写的内容，而不只是多一个能调的名字。
+    """
+    sid = mk_skill(client, scope=OWNER_SCOPE_USER, owner=ALICE)
+    body = resolve(client, [{"kind": "skill", "ref_id": sid}], user=BOB)
+    assert body["skills"] == []
+    assert body["dropped"][0]["kind"] == "skill"
+
+
+def test_other_tenant_skill_is_dropped(client):
+    sid = mk_skill(client, tenant=T2)
+    body = resolve(client, [{"kind": "skill", "ref_id": sid}], tenant=T1)
+    assert body["skills"] == []
+
+
+def test_global_platform_skill_resolves_across_tenants(client):
+    """住在 default 租户的平台市场 skill，任何租户都该看得见。
+
+    这一层是 lea_authkit.scoped_filter 表达不了的那层（它最后一句是
+    tenant_id == actor.tenant_id），也是 api/skills.py 要本地写一份的原因。
+    """
+    sid = mk_skill(client, tenant=DEFAULT_TENANT_ID)
+    body = resolve(client, [{"kind": "skill", "ref_id": sid}], tenant=T1)
+    assert len(body["skills"]) == 1
+
+
+def test_disabled_skill_is_dropped(client):
+    """Skill.enabled=False 是**整个 skill 停用**，挂载也必须过它。
+
+    不过滤就是"停用了但还能挂上用" —— 而绑定链路上那两级停用开关正是迁移时掉的，
+    修完不久。挂载是第三条路，同一个坑不能再踩。
+    """
+    sid = mk_skill(client, enabled=False)
+    body = resolve(client, [{"kind": "skill", "ref_id": sid}])
+    assert body["skills"] == []
+    assert "disabled" in body["dropped"][0]["reason"]
+
+
+def test_deleted_skill_is_dropped_not_an_error(client):
+    """挂载行没有外键，skill 随时会被删。报错的话用户的老会话直接打不开。"""
+    body = resolve(client, [{"kind": "skill", "ref_id": 99999}])
+    assert body["skills"] == []
+    assert body["dropped"][0]["ref_id"] == 99999
+
+
+def test_anonymous_user_gets_only_platform_skills(client):
+    """没有 user_id 时 fail-closed，跟工具那条一致。"""
+    mine = mk_skill(client, scope=OWNER_SCOPE_USER, owner=ALICE, name="private_one")
+    plat = mk_skill(client, name="public_one")
+    body = resolve(client, [
+        {"kind": "skill", "ref_id": mine},
+        {"kind": "skill", "ref_id": plat},
+    ], user="")
+    assert [s["name"] for s in body["skills"]] == ["public_one"]
+
+
+def test_all_three_kinds_together(client):
+    """tool + skill + kb 一次挂全 —— 引擎一次调用要拿到三样。"""
+    tid = mk_tool(client)
+    sid = mk_skill(client)
+    kid = mk_kb(client, visibility="public")
+    body = resolve(client, [
+        {"kind": "tool", "ref_id": tid},
+        {"kind": "skill", "ref_id": sid},
+        {"kind": "kb", "ref_id": kid},
+    ])
+    assert names(body) == ["stock_lookup"]
+    assert [s["name"] for s in body["skills"]] == ["ppt_maker"]
+    assert body["kb_ids"] == [kid]
+    assert body["dropped"] == []
 
 
 def test_anonymous_user_gets_only_platform_tools(client):

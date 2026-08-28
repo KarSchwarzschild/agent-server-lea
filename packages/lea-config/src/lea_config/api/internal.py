@@ -12,6 +12,7 @@ from lea_config.models.binding import AgentKbBinding, AgentSkillBinding, AgentTo
 from lea_config.models.knowledge import KnowledgeBase
 from lea_config.models.llm_provider import LLMProvider
 from lea_config.models.skill import Skill
+from lea_config.models.skill import visible_to as skill_visible_to
 from lea_config.models.team import AgentTeam, AgentTeamMember
 from lea_config.models.tool import Tool, exposed_name, visible_to
 
@@ -224,7 +225,7 @@ def get_agent_config(
 
 
 class AttachmentRef(BaseModel):
-    kind: str          # tool | kb（mcp_server / skill 是下一批）
+    kind: str          # tool | kb | skill（mcp_server 是下一批）
     ref_id: int
 
 
@@ -255,13 +256,15 @@ def resolve_attachments(body: ResolveAttachmentsBody, db: Session = Depends(get_
     不另起一套。
     """
     tools_out: list[dict] = []
+    skills_out: list[dict] = []
     kb_ids: list[int] = []
     dropped: list[dict] = []
 
     tool_ids = [i.ref_id for i in body.items if i.kind == "tool"]
+    skill_ids = [i.ref_id for i in body.items if i.kind == "skill"]
     kb_refs = [i.ref_id for i in body.items if i.kind == "kb"]
     for i in body.items:
-        if i.kind not in ("tool", "kb"):
+        if i.kind not in ("tool", "kb", "skill"):
             # 认不出的 kind 不算错误：kind 是 VARCHAR 就是为了让新资源不必先改所有
             # 读端（见 migrations/017 的说明）。老版本的 lea-config 碰到 mcp_server
             # 就该跳过，而不是让整个会话建不起来。
@@ -291,6 +294,32 @@ def resolve_attachments(body: ResolveAttachmentsBody, db: Session = Depends(get_
             d["name"] = exposed_name(t)   # 发给模型的名字，用户私有工具带 my__
             tools_out.append(d)
 
+    if skill_ids:
+        rows = (
+            db.query(Skill)
+            .filter(
+                Skill.id.in_(skill_ids),
+                # Skill.enabled 是**整个 skill 停用**，所有绑它的 agent 一起断
+                # （见 models/skill.py 那列的注释）。挂载也必须过它，否则"停用了但
+                # 还能挂上用"—— 而那正是绑定链路上刚修完的同一个坑。
+                Skill.enabled.is_(True),
+                *skill_visible_to(body.tenant_id, body.user_id or None),
+            )
+            .all()
+        )
+        found = {s.id: s for s in rows}
+        for sid in skill_ids:
+            s = found.get(sid)
+            if s is None:
+                dropped.append({
+                    "kind": "skill", "ref_id": sid,
+                    "reason": "not found / disabled / not visible to this user",
+                })
+                continue
+            # 形状跟 /internal/agent-config 的 skills 一致（同一个 Go SkillDef 去解）。
+            # priority 那边来自绑定行，挂载没有绑定 —— 留零值，引擎只用它排序。
+            skills_out.append(_row_to_dict(s))
+
     if kb_refs:
         rows = (
             db.query(KnowledgeBase)
@@ -315,4 +344,4 @@ def resolve_attachments(body: ResolveAttachmentsBody, db: Session = Depends(get_
                 continue
             kb_ids.append(k.id)
 
-    return {"tools": tools_out, "kb_ids": kb_ids, "dropped": dropped}
+    return {"tools": tools_out, "skills": skills_out, "kb_ids": kb_ids, "dropped": dropped}

@@ -50,10 +50,13 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    and_,
     func,
+    or_,
 )
 
 from lea_config.database import (
+    DEFAULT_TENANT_ID,
     OWNER_SCOPE_PLATFORM,
     OWNER_SCOPE_USER,
     OWNER_SCOPE_VALUES,
@@ -136,3 +139,32 @@ class MCPServer(OwnerMixin, TenantMixin, Base):
     created_by = Column(String(100), nullable=True)
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+
+def visible_to(tenant_id: str, user_id: str | None):
+    """"这个人能用哪些 MCP server"的三段式判据，返回一组 SQLAlchemy 过滤条件。
+
+        所有人可见  (default, platform, NULL)
+        租户下可见  (t1,      platform, NULL)
+        用户可见    (t1,      user,     alice)
+
+    跟 models/tool.py / models/skill.py 里那两份同形状，故意各写一份：条件里引用的是
+    各自的类属性（MCPServer.owner_scope vs Tool.owner_scope），抽公共函数要么传类、
+    要么上元编程，两种都比多写十行难读。
+
+    user_id 为空时只返回平台级，是 fail-closed。
+    """
+    conds = [MCPServer.tenant_id.in_([tenant_id, DEFAULT_TENANT_ID])]
+    if user_id:
+        conds.append(
+            or_(
+                MCPServer.owner_scope == OWNER_SCOPE_PLATFORM,
+                and_(
+                    MCPServer.owner_scope == OWNER_SCOPE_USER,
+                    MCPServer.owner_user_id == user_id,
+                ),
+            )
+        )
+    else:
+        conds.append(MCPServer.owner_scope == OWNER_SCOPE_PLATFORM)
+    return conds

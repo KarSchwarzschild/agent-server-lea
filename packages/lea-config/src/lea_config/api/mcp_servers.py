@@ -34,10 +34,12 @@ from lea_config.api._auth_helpers import require_admin
 from lea_config.database import get_db
 from lea_config.models.mcp_server import (
     MCP_SCOPE_PLATFORM,
+    MCP_SCOPE_USER,
     MCP_STATUS_UNKNOWN,
     MCP_TRANSPORT_STREAMABLE_HTTP,
     MCP_TRANSPORT_VALUES,
     MCPServer,
+    visible_to,
 )
 from lea_config.models.tool import Tool
 
@@ -85,6 +87,10 @@ def _to_dict(s: MCPServer) -> dict:
         "name": s.name,
         "description": s.description or "",
         "owner_scope": s.owner_scope,
+        # owner_user_id 以前不在响应里。放开用户私有 server 之后必须给 —— 否则前端
+        # 分不出"这是我建的"和"平台建的"，而这两者能不能改是不一样的（_can_edit）。
+        # 它不是敏感信息：同一个租户里谁建了什么本来就互相可见（列表里就有）。
+        "owner_user_id": s.owner_user_id,
         "transport": s.transport,
         "endpoint": s.endpoint or "",
         "has_auth": bool(s.auth_config),
@@ -106,16 +112,53 @@ def _validate_transport(t: str) -> None:
 def _validate_endpoint(url: str) -> None:
     """只收 http/https 的绝对 URL。
 
-    这道校验必须在这里，不能只靠 httpx 在调用时报错：这一列的值会被**服务端**拿去
-    发请求，所以它是一个 SSRF 面。今天只挡协议（file:// 能读本地文件，其余 scheme
-    httpx 直接抛，表现为一个看不懂的 500）。
-
-    ⚠️ 没挡内网地址。真正的 SSRF 防护要解析 DNS 再查网段，而且得防 TOCTOU 和
-    重定向 —— 那是一件独立的事，属于「放开用户自己填 URL」（P2）的前置，不是这轮
-    的范围。今天能建 server 的只有管理员，风险面是已知的。
+    ⚠️ 这里**只挡 scheme**，挡不住 `foo.example.com` 解析到 10.0.0.5，也挡不住 DNS
+    在写入之后才改指向内网。真正的出网防护在 lea-tools 的 executor/url_guard.py ——
+    它在每次 /test /sync /调用之前查，那才是唯一有意义的时点。
+    这一道留着是为了让明显写错的 URL 在**创建时**就被拒，而不是等到第一次调用。
     """
     if not url.startswith(("http://", "https://")):
         raise HTTPException(400, "endpoint must be an absolute http(s) URL")
+
+
+def _load_visible(db: Session, actor: Actor, mcp_id: int) -> MCPServer:
+    """按 id 取一个 actor 看得见的 server，看不见一律 404。
+
+    404 而不是 403：403 会确认「这个 id 存在」，而跨租户/别人的私有 server 不该给出
+    这个信息。跟 api/skills.py::_load_visible 同一个取向。
+
+    管理员在这里**不放大可见范围**，跟 skills 那边不同 —— 那边租户管理员要审核上架
+    申请，所以得看得见别人的私有 skill。MCP 没有上架流程，管理员没有"必须看见别人
+    私有 server"的理由，而它装着别人的 api key。
+    """
+    s = (
+        db.query(MCPServer)
+        .filter(MCPServer.id == mcp_id, *visible_to(actor.tenant_id, actor.user_id))
+        .first()
+    )
+    if s is None:
+        raise HTTPException(404, "MCP server not found")
+    return s
+
+
+def _require_can_edit(s: MCPServer, actor: Actor) -> None:
+    """能不能改这一行。
+
+    平台级的要管理员（跟放开之前的行为一致）；用户私有的只有主人自己能改 ——
+    **管理员也不能**，理由同 _load_visible：那里面有别人的凭证。
+
+    ⚠️ 判据是 owner_user_id 相等，不是"是不是管理员"。写成后者的话租户管理员能改掉
+    任何人的 server endpoint，而 endpoint 决定请求发到哪 —— 等于能把别人的 key 转发
+    到自己的地址。
+    """
+    if s.owner_scope == MCP_SCOPE_USER:
+        if s.owner_user_id != actor.user_id:
+            raise HTTPException(404, "MCP server not found")
+        return
+    # 平台级
+    require_admin(actor)
+    if not actor.is_platform_admin and s.tenant_id != actor.tenant_id:
+        raise HTTPException(404, "MCP server not found")
 
 
 @router.get("")
@@ -128,10 +171,7 @@ def list_servers(
     db: Session = Depends(get_db),
     actor: Actor = Depends(require_actor),
 ):
-    q = db.query(MCPServer).filter(
-        MCPServer.tenant_id == actor.tenant_id,
-        MCPServer.owner_scope == MCP_SCOPE_PLATFORM,
-    )
+    q = db.query(MCPServer).filter(*visible_to(actor.tenant_id, actor.user_id))
     if transport:
         q = q.filter(MCPServer.transport == transport)
     if enabled is not None:
@@ -150,11 +190,7 @@ def get_server(
     db: Session = Depends(get_db),
     actor: Actor = Depends(require_actor),
 ):
-    s = db.query(MCPServer).get(mcp_id)
-    if not s or s.owner_scope != MCP_SCOPE_PLATFORM:
-        raise HTTPException(404, "MCP server not found")
-    if not actor.is_platform_admin and s.tenant_id != actor.tenant_id:
-        raise HTTPException(404, "MCP server not found")
+    s = _load_visible(db, actor, mcp_id)
     return _to_dict(s)
 
 
@@ -191,6 +227,61 @@ def create_server(
     return _to_dict(s)
 
 
+@router.post("/mine", status_code=201)
+def create_my_server(
+    body: MCPServerCreate,
+    db: Session = Depends(get_db),
+    actor: Actor = Depends(require_actor),
+):
+    """建一个**自己的**私有 MCP server。任何登录用户都可以，不需要管理员。
+
+    ## 为什么是独立端点而不是给 POST "" 加一个 owner_scope 字段
+
+    那样的话「建成平台级」和「建成私有」共用一条路，而它们的授权完全不同（前者要
+    管理员）。参数决定权限的形状很容易写错一次就变成越权 —— 漏判一个分支，普通用户
+    传 owner_scope=platform 就建出了全租户可见的 server，而它装着他自己的 key。
+
+    两条路各自只做一件事，授权写在入口，读代码的人不用去追一个字段的取值。
+
+    ## 出网地址
+
+    这里只挡 scheme（_validate_endpoint）。真正的内网防护在 lea-tools 的
+    executor/url_guard.py，每次 /test /sync /调用之前查 —— 那才是唯一有意义的时点，
+    因为 DNS 可以在写入之后才改。
+
+    ⚠️ 所以**不要**因为"这里已经校验过了"就在那边放宽。
+    """
+    _validate_transport(body.transport)
+    _validate_endpoint(body.endpoint)
+
+    # 唯一约束是 (tenant_id, owner_scope, owner_user_id, name)，所以同名检查也要带上
+    # 归属三元组 —— alice 和 bob 各有一个叫 notion 的 server 是正常的。
+    existing = (
+        db.query(MCPServer)
+        .filter(
+            MCPServer.tenant_id == actor.tenant_id,
+            MCPServer.owner_scope == MCP_SCOPE_USER,
+            MCPServer.owner_user_id == actor.user_id,
+            MCPServer.name == body.name,
+        )
+        .first()
+    )
+    if existing:
+        raise HTTPException(409, f"你已经有一个叫 '{body.name}' 的 MCP server")
+
+    s = MCPServer(
+        tenant_id=actor.tenant_id,
+        owner_scope=MCP_SCOPE_USER,
+        owner_user_id=actor.user_id,
+        created_by=actor.user_id,
+        **body.model_dump(),
+    )
+    db.add(s)
+    db.commit()
+    db.refresh(s)
+    return _to_dict(s)
+
+
 @router.put("/{mcp_id}")
 def update_server(
     mcp_id: int,
@@ -198,12 +289,8 @@ def update_server(
     db: Session = Depends(get_db),
     actor: Actor = Depends(require_actor),
 ):
-    require_admin(actor)
-    s = db.query(MCPServer).get(mcp_id)
-    if not s or s.owner_scope != MCP_SCOPE_PLATFORM:
-        raise HTTPException(404, "MCP server not found")
-    if not actor.is_platform_admin and s.tenant_id != actor.tenant_id:
-        raise HTTPException(404, "MCP server not found")
+    s = _load_visible(db, actor, mcp_id)
+    _require_can_edit(s, actor)
     data = body.model_dump(exclude_unset=True)
     if "transport" in data:
         _validate_transport(data["transport"])
@@ -228,12 +315,8 @@ def toggle_enable(
     db: Session = Depends(get_db),
     actor: Actor = Depends(require_actor),
 ):
-    require_admin(actor)
-    s = db.query(MCPServer).get(mcp_id)
-    if not s or s.owner_scope != MCP_SCOPE_PLATFORM:
-        raise HTTPException(404, "MCP server not found")
-    if not actor.is_platform_admin and s.tenant_id != actor.tenant_id:
-        raise HTTPException(404, "MCP server not found")
+    s = _load_visible(db, actor, mcp_id)
+    _require_can_edit(s, actor)
     s.enabled = body.enabled
     db.commit()
     db.refresh(s)
@@ -246,12 +329,8 @@ def delete_server(
     db: Session = Depends(get_db),
     actor: Actor = Depends(require_actor),
 ):
-    require_admin(actor)
-    s = db.query(MCPServer).get(mcp_id)
-    if not s or s.owner_scope != MCP_SCOPE_PLATFORM:
-        raise HTTPException(404, "MCP server not found")
-    if not actor.is_platform_admin and s.tenant_id != actor.tenant_id:
-        raise HTTPException(404, "MCP server not found")
+    s = _load_visible(db, actor, mcp_id)
+    _require_can_edit(s, actor)
 
     # 连带删掉从这个 server 同步进来的工具行。
     #

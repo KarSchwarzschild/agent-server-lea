@@ -37,7 +37,32 @@ dev = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["tests"]
+# ⚠️ 只写 "tests" 的话**包内测试永远不跑** —— 而且不报错、不警告，全量回归照常绿。
+# 发现它是因为给 admin_mcp 的 sync 补了四条测试，单文件跑 27 passed、全量跑 249 passed，
+# 两个数字对不上：那 27 条一条都没进去。
+#
+# 漏掉的不是边角料：lea-tools/tests 里是传输白名单（stdio 关死）、凭证不进缓存、
+# sync 幂等与归属继承 —— 全是安全行为。「有测试」和「测试会跑」是两件事，中间只隔
+# 这一行配置。
+#
+# 逐个列**文件**而不是目录，因为 lea-tools/tests 里混着三类东西，后两类不能进默认回归：
+#
+#   单元测试        下面这四个，纯内存 + monkeypatch
+#   起服务的集成    test_full_chain.py（subprocess 拉三个服务）、test_e2e.py（uvicorn 线程）
+#   评测脚本        test_artifact_identify.py（有 __main__ 和 --llm 参数，要 API key）
+#
+# 后两类混进来的表现不是"失败"，而是**整个 pytest 崩在 collection 阶段**
+# （capture 的 "I/O operation on closed file"）外加超时被 kill —— 一个测试都收不到，
+# 比失败更难认。同理别写 testpaths = ["."]：那还会去收 packages/*-legacy 和 .venv。
+testpaths = [
+    "tests",
+    "packages/lea-tools/tests/test_mcp_p0.py",
+    "packages/lea-tools/tests/test_file_tools.py",
+    "packages/lea-tools/tests/test_sandbox_adopt.py",
+    "packages/lea-tools/tests/test_tool_tenant_isolation.py",
+    # 名字叫 e2e 但纯内存（不起服务、不出网），10 passed。跟上面那两个真 e2e 只是撞名。
+    "packages/lea-parser/tests/test_e2e.py",
+]
 # workspace 成员由 uv 装成 editable，本来就 import 得到，所以这里只列**需要额外
 # 补路径**的。加 lea-tools / lea-config 是多余的（试过，加不加结果一样）。
 #

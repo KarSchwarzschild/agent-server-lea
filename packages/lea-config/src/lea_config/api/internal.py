@@ -11,6 +11,8 @@ from lea_config.models.agent import Agent
 from lea_config.models.binding import AgentKbBinding, AgentSkillBinding, AgentToolBinding
 from lea_config.models.knowledge import KnowledgeBase
 from lea_config.models.llm_provider import LLMProvider
+from lea_config.models.mcp_server import MCPServer
+from lea_config.models.mcp_server import visible_to as mcp_visible_to
 from lea_config.models.skill import Skill
 from lea_config.models.skill import visible_to as skill_visible_to
 from lea_config.models.team import AgentTeam, AgentTeamMember
@@ -262,9 +264,10 @@ def resolve_attachments(body: ResolveAttachmentsBody, db: Session = Depends(get_
 
     tool_ids = [i.ref_id for i in body.items if i.kind == "tool"]
     skill_ids = [i.ref_id for i in body.items if i.kind == "skill"]
+    mcp_ids = [i.ref_id for i in body.items if i.kind == "mcp_server"]
     kb_refs = [i.ref_id for i in body.items if i.kind == "kb"]
     for i in body.items:
-        if i.kind not in ("tool", "kb", "skill"):
+        if i.kind not in ("tool", "kb", "skill", "mcp_server"):
             # 认不出的 kind 不算错误：kind 是 VARCHAR 就是为了让新资源不必先改所有
             # 读端（见 migrations/017 的说明）。老版本的 lea-config 碰到 mcp_server
             # 就该跳过，而不是让整个会话建不起来。
@@ -319,6 +322,63 @@ def resolve_attachments(body: ResolveAttachmentsBody, db: Session = Depends(get_
             # 形状跟 /internal/agent-config 的 skills 一致（同一个 Go SkillDef 去解）。
             # priority 那边来自绑定行，挂载没有绑定 —— 留零值，引擎只用它排序。
             skills_out.append(_row_to_dict(s))
+
+    if mcp_ids:
+        # 挂一个 MCP server = 挂它同步出来的**全部**工具行。
+        #
+        # 粒度是整个 server，跟主流做法一致：MCP 的心智模型是"接一个服务"，而用户在
+        # 挂之前并不知道那个服务有哪几个工具（那要 sync 之后才知道）。
+        #
+        # ## 归属按**工具行**判，不按 server 判
+        #
+        # 两者今天一致（sync 让工具行继承 server 的归属）。但它们可以短暂不一致 ——
+        # server 归属改了、还没重 sync 的那个窗口。那时候按 server 判会放出一批归属
+        # 还是旧的工具行，而**真正被执行的是工具行**。所以判据落在它上面。
+        #
+        # 顺带这也让"server 可见但某几个工具被单独停用"这种情况自然正确。
+        servers = (
+            db.query(MCPServer)
+            .filter(
+                MCPServer.id.in_(mcp_ids),
+                MCPServer.enabled.is_(True),
+                *mcp_visible_to(body.tenant_id, body.user_id or None),
+            )
+            .all()
+        )
+        found_srv = {s.id: s for s in servers}
+
+        for mid in mcp_ids:
+            srv = found_srv.get(mid)
+            if srv is None:
+                dropped.append({
+                    "kind": "mcp_server", "ref_id": mid,
+                    "reason": "not found / disabled / not visible to this user",
+                })
+                continue
+
+            rows = (
+                db.query(Tool)
+                .filter(
+                    Tool.mcp_server_id == srv.id,
+                    Tool.enabled.is_(True),
+                    *visible_to(body.tenant_id, body.user_id or None),
+                )
+                .all()
+            )
+            if not rows:
+                # server 看得见但一个工具都没有 —— 几乎总是"还没 sync 过"。
+                # 这不是错误（会话照常建），但必须报出来：否则用户挂了个 server、
+                # 模型什么都没多，而任何地方都查不到为什么。
+                dropped.append({
+                    "kind": "mcp_server", "ref_id": mid,
+                    "reason": "server 可见但没有可用的工具行（大概还没 sync）",
+                })
+                continue
+
+            for t in rows:
+                d = _row_to_dict(t)
+                d["name"] = exposed_name(t)
+                tools_out.append(d)
 
     if kb_refs:
         rows = (

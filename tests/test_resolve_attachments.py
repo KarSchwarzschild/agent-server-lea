@@ -292,9 +292,11 @@ def test_unknown_kind_is_dropped_not_an_error(client):
     （migrations/017 的说明）。老版本的 lea-config 碰到 mcp_server 该跳过，而不是
     让整个会话建不起来 —— 那会变成一个部署顺序依赖，正是 016 那轮收拾的病。
     """
-    body = resolve(client, [{"kind": "mcp_server", "ref_id": 7}])
+    # ⚠️ 挑一个**真的还不存在**的 kind。前两版分别用了 "skill" 和 "mcp_server"，
+    # 各自在下一批做完时就过时了 —— 测试名说"未知"，用的却是已经认识的类型。
+    body = resolve(client, [{"kind": "future_thing", "ref_id": 7}])
     assert body["tools"] == [] and body["kb_ids"] == [] and body["skills"] == []
-    assert body["dropped"] == [{"kind": "mcp_server", "ref_id": 7, "reason": "unknown kind"}]
+    assert body["dropped"] == [{"kind": "future_thing", "ref_id": 7, "reason": "unknown kind"}]
 
 
 def test_tools_and_kbs_together(client):
@@ -453,3 +455,213 @@ def test_anonymous_user_gets_only_platform_tools(client):
     ], user="")
     assert names(body) == ["shared"]
     assert dropped_kinds(body) == ["tool"]
+
+
+# ── mcp_server ────────────────────────────────────────────────────────────
+#
+# 挂一个 MCP server = 挂它同步出来的**全部**工具行。粒度是整个 server，跟主流做法
+# 一致：MCP 的心智模型是"接一个服务"，而用户在挂之前并不知道那服务有哪几个工具
+# （那要 sync 之后才知道）。
+#
+# 所以返回形状里**没有** mcp 这一类 —— 它们混在 tools 里回来，Go 侧一个合并分支都
+# 不用加。
+
+
+def mk_mcp(client, *, tenant=T1, scope=OWNER_SCOPE_PLATFORM, owner=None,
+           enabled=True, name="notion") -> int:
+    from lea_config.models.mcp_server import MCPServer
+
+    db = client.Session()
+    try:
+        s = MCPServer(
+            tenant_id=tenant, name=name, endpoint="https://notion.example/mcp",
+            transport="streamable_http", enabled=enabled,
+            owner_scope=scope, owner_user_id=owner,
+        )
+        db.add(s)
+        db.commit()
+        return s.id
+    finally:
+        db.close()
+
+
+def mk_mcp_tool(client, server_id: int, bare: str, *, tenant=T1,
+                scope=OWNER_SCOPE_PLATFORM, owner=None, enabled=True) -> int:
+    """建一行 sync 出来的 MCP 工具。名字形状跟 admin_mcp.py 一致。"""
+    from lea_config.models.tool import Tool
+
+    db = client.Session()
+    try:
+        t = Tool(
+            tenant_id=tenant, name=f"mcp_{server_id}_{bare}",
+            display_name=f"[MCP] {bare}", description=f"{bare} desc",
+            execution_type="mcp", schema_json=SCHEMA, enabled=enabled,
+            mcp_server_id=server_id, owner_scope=scope, owner_user_id=owner,
+        )
+        db.add(t)
+        db.commit()
+        return t.id
+    finally:
+        db.close()
+
+
+def test_mcp_server_resolves_to_all_its_tools(client):
+    """挂一个 server → 它的每个工具都进来。"""
+    sid = mk_mcp(client)
+    for bare in ("search", "create", "update"):
+        mk_mcp_tool(client, sid, bare)
+
+    body = resolve(client, [{"kind": "mcp_server", "ref_id": sid}])
+    assert sorted(names(body)) == [
+        f"mcp_{sid}_create", f"mcp_{sid}_search", f"mcp_{sid}_update",
+    ]
+    assert body["dropped"] == []
+
+
+def test_private_mcp_tools_get_the_user_prefix(client):
+    """alice 私有 server 的工具带 my__ 前缀。
+
+    少了它 resolve_tool 会在 owner_scope != USER 里找 → 404。两层前缀各自独立：
+    my__ 是归属命名空间，mcp_{id}_ 是 server 消歧。
+    """
+    sid = mk_mcp(client, scope=OWNER_SCOPE_USER, owner=ALICE)
+    mk_mcp_tool(client, sid, "search", scope=OWNER_SCOPE_USER, owner=ALICE)
+
+    body = resolve(client, [{"kind": "mcp_server", "ref_id": sid}], user=ALICE)
+    assert names(body) == [f"my__mcp_{sid}_search"]
+
+
+def test_another_users_private_mcp_server_is_dropped(client):
+    sid = mk_mcp(client, scope=OWNER_SCOPE_USER, owner=ALICE)
+    mk_mcp_tool(client, sid, "search", scope=OWNER_SCOPE_USER, owner=ALICE)
+
+    body = resolve(client, [{"kind": "mcp_server", "ref_id": sid}], user=BOB)
+    assert body["tools"] == []
+    assert body["dropped"][0]["kind"] == "mcp_server"
+
+
+def test_disabled_mcp_server_is_dropped(client):
+    """server 停用 → 它的工具一个都不该进来。
+
+    停用 server 的语义就是"这个连接不能用了"，工具行可能还是 enabled 的（sync 只在
+    远端下线时才删它们），所以必须在 server 这一层拦。
+    """
+    sid = mk_mcp(client, enabled=False)
+    mk_mcp_tool(client, sid, "search")
+
+    body = resolve(client, [{"kind": "mcp_server", "ref_id": sid}])
+    assert body["tools"] == []
+    assert "disabled" in body["dropped"][0]["reason"]
+
+
+def test_individually_disabled_mcp_tool_is_skipped(client):
+    """server 能用但某个工具被单独停用 → 只少那一个。
+
+    这是"归属和启用都按工具行判"的好处：不需要为这种情况写特例。
+    """
+    sid = mk_mcp(client)
+    mk_mcp_tool(client, sid, "search")
+    mk_mcp_tool(client, sid, "danger", enabled=False)
+
+    body = resolve(client, [{"kind": "mcp_server", "ref_id": sid}])
+    assert names(body) == [f"mcp_{sid}_search"]
+
+
+def test_unsynced_mcp_server_reports_a_reason(client):
+    """server 可见但没有工具行 —— 几乎总是"还没 sync 过"。
+
+    不是错误（会话照常建），但**必须报出来**：否则用户挂了个 server、模型什么都没多，
+    而任何地方都查不到为什么。这类"静默少了东西"是挂载这套里最难查的一类。
+    """
+    sid = mk_mcp(client)
+    body = resolve(client, [{"kind": "mcp_server", "ref_id": sid}])
+    assert body["tools"] == []
+    assert body["dropped"][0]["kind"] == "mcp_server"
+    assert "sync" in body["dropped"][0]["reason"]
+
+
+def test_deleted_mcp_server_is_dropped_not_an_error(client):
+    body = resolve(client, [{"kind": "mcp_server", "ref_id": 99999}])
+    assert body["tools"] == []
+    assert body["dropped"][0]["ref_id"] == 99999
+
+
+def test_other_tenant_mcp_server_is_dropped(client):
+    sid = mk_mcp(client, tenant=T2)
+    mk_mcp_tool(client, sid, "search", tenant=T2)
+    body = resolve(client, [{"kind": "mcp_server", "ref_id": sid}], tenant=T1)
+    assert body["tools"] == []
+
+
+def test_mcp_tools_from_two_servers_do_not_collide(client):
+    """两个 server 各有一个 search —— 名字带 server_id 所以不撞。
+
+    这是 mcp_{server_id}_ 前缀存在的理由（GitHub 和 Linear 都有 create_issue）。
+    """
+    a = mk_mcp(client, name="notion")
+    b = mk_mcp(client, name="linear")
+    mk_mcp_tool(client, a, "search")
+    mk_mcp_tool(client, b, "search")
+
+    body = resolve(client, [
+        {"kind": "mcp_server", "ref_id": a},
+        {"kind": "mcp_server", "ref_id": b},
+    ])
+    assert sorted(names(body)) == sorted([f"mcp_{a}_search", f"mcp_{b}_search"])
+
+
+def test_mcp_server_alongside_other_kinds(client):
+    """四种 kind 一次挂全。"""
+    tid = mk_tool(client)
+    skid = mk_skill(client)
+    kid = mk_kb(client, visibility="public")
+    sid = mk_mcp(client)
+    mk_mcp_tool(client, sid, "search")
+
+    body = resolve(client, [
+        {"kind": "tool", "ref_id": tid},
+        {"kind": "skill", "ref_id": skid},
+        {"kind": "kb", "ref_id": kid},
+        {"kind": "mcp_server", "ref_id": sid},
+    ])
+    # MCP 的工具跟普通工具混在同一个数组里 —— 这是设计，不是巧合
+    assert sorted(names(body)) == sorted(["stock_lookup", f"mcp_{sid}_search"])
+    assert [s["name"] for s in body["skills"]] == ["ppt_maker"]
+    assert body["kb_ids"] == [kid]
+    assert body["dropped"] == []
+
+
+def test_tool_row_ownership_wins_when_it_lags_behind_the_server(client):
+    """server 已经上架成 platform，工具行还挂在原主人名下 → bob 拿不到它们。
+
+    ## 为什么这条必须存在
+
+    归属**按工具行判，不按 server 判**。两者今天一致（sync 让工具行继承 server 的
+    归属），但它们可以短暂不一致 —— server 归属改了、还没重 sync 的那个窗口。
+
+    这条是变异测试逼出来的：去掉工具行那层归属过滤，其余 9 条 mcp 用例**全绿**，
+    因为 server 那一层已经挡住了跨用户和跨租户。也就是说我注释里声称的那个理由
+    当时没有任何测试覆盖，只是一句好听的话。
+
+    判据方向：真正被执行的是工具行，所以宽的那一层（server 可见）不能放出严的那一层
+    （工具行归属）不允许的东西。
+    """
+    sid = mk_mcp(client)  # server 是 platform 级，bob 看得见
+    # 工具行还是 alice 的私有（sync 还没跑）
+    mk_mcp_tool(client, sid, "search", scope=OWNER_SCOPE_USER, owner=ALICE)
+
+    body = resolve(client, [{"kind": "mcp_server", "ref_id": sid}], user=BOB)
+    assert body["tools"] == [], "bob 拿到了 alice 名下的工具行"
+
+
+def test_tool_row_from_another_tenant_is_not_returned(client):
+    """server 在 T1，工具行却是 T2 的 —— 不该返回。
+
+    这种行只可能来自脏数据或迁移事故，但 mcp_server_id 上没有租户约束，所以查询必须
+    自己带上。跟 tools 表当年"按名字查不带 tenant"是同一类。
+    """
+    sid = mk_mcp(client, tenant=T1)
+    mk_mcp_tool(client, sid, "search", tenant=T2)
+
+    body = resolve(client, [{"kind": "mcp_server", "ref_id": sid}], tenant=T1)
+    assert body["tools"] == []

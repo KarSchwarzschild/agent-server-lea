@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -141,19 +142,51 @@ func TestMergeAttachments_FallsBackOnConfigError(t *testing.T) {
 }
 
 func TestMergeAttachments_IgnoresUnknownKind(t *testing.T) {
+	// ⚠️ 这个 kind 要挑一个**真的还不存在**的。前两版分别用了 "skill" 和 "mcp_server"，
+	// 各自在下一批做完时就过时了 —— 测试名说"未知"，用的却是已经认识的类型。
 	withConfigServer(t, 200, `{"tools":[],"skills":[],"kb_ids":[],"dropped":[
-		{"kind":"mcp_server","ref_id":12,"reason":"mcp_server 是下一批"}
+		{"kind":"future_thing","ref_id":12,"reason":"unknown kind"}
 	]}`)
 
 	cfg := &AgentConfig{}
-	// 表上写了 kind='mcp_server'（persistence 层不过滤），这一版的 lea-config 也不认，
-	// 放 dropped 里。这里**不报错** —— MergeAttachments 的容错性是"能用的留下，用不了
-	// 的丢掉"，而不是"有一个用不了就全失败"。否则「加一种新资源」就等于让老会话打不开。
+	// 表上写了一个这一版不认识的 kind（persistence 层不过滤，kind 是 VARCHAR 就是为了
+	// 让新资源不必先改所有读端），lea-config 放进 dropped。这里**不报错** ——
+	// MergeAttachments 的容错性是"能用的留下，用不了的丢掉"，而不是"有一个用不了就全
+	// 失败"。否则「加一种新资源」就等于让老会话打不开。
 	got := MergeAttachments(context.Background(), cfg, "t1", "alice",
-		[]AttachmentRef{{Kind: "mcp_server", RefID: 12}})
+		[]AttachmentRef{{Kind: "future_thing", RefID: 12}})
 
 	if len(got.Tools) != 0 || len(got.KBIDs) != 0 || len(got.Skills) != 0 {
 		t.Errorf("dropped 项不该合并进 cfg")
+	}
+}
+
+func TestMergeAttachments_McpServerArrivesAsTools(t *testing.T) {
+	// 挂一个 MCP server → lea-config 把它同步出来的**一批工具**放进 tools 数组回来，
+	// 而不是一个新的资源类型。所以 Go 侧不需要为 mcp_server 加任何合并分支 ——
+	// 这条测试钉的就是"不需要"这件事：如果哪天有人给它加了独立字段，这里会提醒他
+	// 先想清楚为什么。
+	withConfigServer(t, 200, `{
+		"tools": [
+			{"name":"my__mcp_37_search","description":"搜页面"},
+			{"name":"my__mcp_37_create","description":"建页面"}
+		],
+		"skills": [], "kb_ids": [], "dropped": []
+	}`)
+
+	cfg := &AgentConfig{}
+	got := MergeAttachments(context.Background(), cfg, "t1", "alice",
+		[]AttachmentRef{{Kind: "mcp_server", RefID: 37}})
+
+	if len(got.Tools) != 2 {
+		t.Fatalf("挂一个 server 该进来两个工具，got %v", toolNames(got))
+	}
+	// 名字上带两层前缀，各自独立：my__ 是归属命名空间（resolve_tool 剥），
+	// mcp_37_ 是 server 消歧（remote_tool_name 剥）。少剥一层远端就会说 unknown tool。
+	for _, n := range toolNames(got) {
+		if !strings.HasPrefix(n, "my__mcp_37_") {
+			t.Errorf("工具名前缀不对: %s", n)
+		}
 	}
 }
 
@@ -297,4 +330,3 @@ func TestMergeAttachments_SendsCorrectPayload(t *testing.T) {
 		t.Errorf("第一项不对: %v", first)
 	}
 }
-

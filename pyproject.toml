@@ -57,6 +57,7 @@ asyncio_mode = "auto"
 testpaths = [
     "tests",
     "packages/lea-tools/tests/test_mcp_p0.py",
+    "packages/lea-tools/tests/test_url_guard.py",
     "packages/lea-tools/tests/test_file_tools.py",
     "packages/lea-tools/tests/test_sandbox_adopt.py",
     "packages/lea-tools/tests/test_tool_tenant_isolation.py",

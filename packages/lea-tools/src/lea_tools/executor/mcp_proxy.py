@@ -37,6 +37,7 @@ from typing import Any
 import httpx
 
 from lea_tools.executor.router import ToolCall, ToolResult, _get_http_pool
+from lea_tools.executor.url_guard import check_outbound_url
 
 # 跟 lea-config 的 MCP_TRANSPORT_VALUES 是同一套值，**故意重新定义一遍**：lea-tools
 # 是执行侧，它不依赖配置服务的包（两个服务分开部署）。跟 db/models.py 里
@@ -168,6 +169,17 @@ async def mcp_call(call: ToolCall, credential: dict | None) -> ToolResult:
                 status="error",
                 error="MCP server has no endpoint configured (见 migrations/016)",
             )
+
+        # 出网地址检查。**每次调用都查，不只在 /test /sync 时查。**
+        #
+        # 只在 admin_mcp._load_server 挡是不够的：那两个端点是管理动作，而工具调用是
+        # 一条独立的路 —— DNS 可以在 sync 成功之后才改指向内网，那之后每次调用都是一次
+        # SSRF，而管理端再也不会被打到。
+        #
+        # 代价是每次调用一次 getaddrinfo（命中系统 DNS 缓存时是内存查表）。跟一次真的
+        # 出网 RPC 比可以忽略。
+        if reason := check_outbound_url(server.endpoint):
+            return ToolResult(status="error", error=f"endpoint 不允许: {reason}")
 
         # 凭证优先级：tool_credentials 里那把（加密、按租户）盖过行上的明文 auth_config。
         #

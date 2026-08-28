@@ -41,6 +41,7 @@ from sqlalchemy.orm import Session
 from lea_tools.db import get_db
 from lea_tools.db.models import MCPServer, Tool
 from lea_tools.executor.mcp_proxy import MCPSession, check_transport
+from lea_tools.executor.url_guard import check_outbound_url
 
 router = APIRouter(prefix="/admin/mcp-servers", tags=["admin-mcp"])
 
@@ -73,6 +74,16 @@ def _load_server(db: Session, server_id: int, tenant_id: str, role: str) -> MCPS
 
     if not server.endpoint:
         raise HTTPException(400, "MCP server has no endpoint configured")
+
+    # 出网地址检查。**这里是拦它的正确位置** —— /test 和 /sync 是本服务唯一会拿
+    # endpoint 去连远端的两个地方，而这个函数是它们共同的前置。
+    #
+    # lea-config 侧的 _validate_endpoint 只挡 scheme，挡不住 `foo.example.com`
+    # 解析到 10.0.0.5。而且那道门在**写入**时生效，DNS 可以在写入之后才改。
+    # 所以这一道必须在真的要连之前、在这一侧做。
+    if reason := check_outbound_url(server.endpoint):
+        # 400 而不是 403：这是"这个配置不能用"，跟调用方有没有权限无关。
+        raise HTTPException(400, f"endpoint 不允许: {reason}")
 
     return server
 

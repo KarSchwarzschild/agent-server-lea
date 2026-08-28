@@ -14,6 +14,7 @@ migrations/016 收口到 `endpoint`。下面的用例盯的是收口之后每一
 from __future__ import annotations
 
 import json
+import socket
 
 import pytest
 from sqlalchemy import create_engine
@@ -25,6 +26,32 @@ from lea_tools.executor.mcp_proxy import MCPSession, check_transport, remote_too
 from lea_tools.executor.router import ToolCall
 
 TENANT = "mcp-t1"
+
+
+@pytest.fixture(autouse=True)
+def _fake_dns(monkeypatch):
+    """把 DNS 解析换成固定的公网地址。
+
+    url_guard 是 fail-closed 的：解析不了就拒绝。而本文件的 endpoint 是
+    `https://notion.example/mcp` —— 一个不存在的域名，真去解析必然失败，于是每条
+    用例都会撞在"endpoint 不允许"上。
+
+    **不能因此放宽 url_guard 的判据。** 那道门正是放开用户私有 MCP server 的前置：
+    任何登录用户都能让服务端去打任意 URL（169.254 拿云凭证、10.x 打内部服务、
+    localhost:6379 是 Redis）。让单测依赖真 DNS 也不对 —— 断网时变红，而那种红跟
+    代码无关，更糟的是会有人为了让它变绿而去改判据。
+
+    所以在这里注入一个假解析器。想验 url_guard 本身的行为看 test_url_guard.py，
+    那边不打这个 patch。
+    """
+    def fake_getaddrinfo(host, port, *a, **kw):
+        # ⚠️ 别用 203.0.113.x（RFC 5737 文档地址块）—— Python 的 ipaddress 把它算作
+        # is_private=True，注进来会让每条用例都撞在"非公网地址"上。第一版就踩了这个。
+        # 93.184.216.34 是 example.com 的历史地址，is_global=True。
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "",
+                 ("93.184.216.34", port or 443))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
 
 
 @pytest.fixture

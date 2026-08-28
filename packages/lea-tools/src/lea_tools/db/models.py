@@ -127,6 +127,21 @@ class MCPServer(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     tenant_id = Column(String(100), nullable=False)
     name = Column(String(200), nullable=False)
+
+    # ⚠️ 归属两列在真实表里一直都有（lea-config 那份模型是 MCPServer(OwnerMixin, ...)，
+    # 唯一约束也早按 (tenant_id, owner_scope, owner_user_id, name) 建好了），这个模型
+    # 以前**不映射它们** —— 跟 Tool 表当年那个病是同一例的第三次。
+    #
+    # 后果不是"少读两列"，而是 sync 出来的工具**归属必然错**：admin_mcp.py 只能写死
+    # OWNER_SCOPE_PLATFORM，因为 server.owner_scope 压根读不出来。今天恰好没错（CRUD
+    # 硬过滤让 server 只可能是 platform 级），一旦放开用户私有 server，alice 的私有
+    # server 同步出的工具会全部变成全租户可见 —— 三层过滤照常工作，只是数据本身是错的。
+    #
+    # 归属的真源是 **server 这一行**，不是谁触发了 sync：管理员帮 alice 同步她的
+    # server，工具也该归 alice。所以补上映射就够，sync 端点不需要 X-User-ID。
+    owner_scope = Column(String(20), nullable=False, default=OWNER_SCOPE_PLATFORM, index=True)
+    owner_user_id = Column(String(64), nullable=True, index=True)
+
     # ⚠️ 这里是 String 而不是 Enum，跟 lea-config 那份模型一致，**是有意的**。
     #
     # 库里的 ENUM（migrations/016 收成一个值）管住写入就够了。Python 层再套一个

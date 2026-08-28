@@ -39,7 +39,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy.orm import Session
 
 from lea_tools.db import get_db
-from lea_tools.db.models import OWNER_SCOPE_PLATFORM, MCPServer, Tool
+from lea_tools.db.models import MCPServer, Tool
 from lea_tools.executor.mcp_proxy import MCPSession, check_transport
 
 router = APIRouter(prefix="/admin/mcp-servers", tags=["admin-mcp"])
@@ -200,6 +200,15 @@ async def sync_mcp_tools(
             row.schema_json = schema
             row.description = description
             row.enabled = True
+            # 归属也要跟着重新对齐，**不能只在新建时设**。server 的归属会变（上架
+            # 审核把私有 server 改成 platform、或者收回），而工具行是它的投影：
+            #
+            #   上架后不同步  →  14 行还挂在 alice 名下，「上架了但别人看不到」
+            #   收回后不同步  →  14 行仍然全租户可见，**收回不生效**
+            #
+            # 后者是安全问题，所以这两行跟新建分支必须一致。
+            row.owner_scope = server.owner_scope
+            row.owner_user_id = server.owner_user_id
         else:
             db.add(Tool(
                 tenant_id=server.tenant_id,
@@ -209,10 +218,14 @@ async def sync_mcp_tools(
                 execution_type="mcp",
                 schema_json=schema,
                 mcp_server_id=server.id,
-                # 归属跟着 server 走。今天 server 只能是 platform 级（CRUD 硬过滤），
-                # 放开用户私有之后这里要改成 server.owner_scope / owner_user_id ——
-                # 而那正是「sync 该搬到有 actor 的那侧」的原因之一。
-                owner_scope=OWNER_SCOPE_PLATFORM,
+                # 归属跟着 **server 那一行** 走，不是跟着触发 sync 的人走：管理员帮
+                # alice 同步她的 server，工具也该归 alice。所以这里不需要 X-User-ID，
+                # 端点签名保持原样（授权由 _load_server 管，那是另一件事）。
+                #
+                # 以前这里写死 platform，因为 lea-tools 的 MCPServer 模型不映射归属两列，
+                # server.owner_scope 读不出来。补上映射之后就是这两行。
+                owner_scope=server.owner_scope,
+                owner_user_id=server.owner_user_id,
                 enabled=True,
             ))
         synced.append(full_name)

@@ -20,7 +20,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from lea_tools.db import Base
-from lea_tools.db.models import MCPServer, Tool
+from lea_tools.db.models import OWNER_SCOPE_PLATFORM, MCPServer, Tool
 from lea_tools.executor.mcp_proxy import MCPSession, check_transport, remote_tool_name
 from lea_tools.executor.router import ToolCall
 
@@ -334,6 +334,94 @@ async def test_sync_updates_changed_schema_in_place(db, monkeypatch):
     row = db.query(Tool).filter_by(name=f"mcp_{server.id}_search").one()
     assert row.description == "新描述"
     assert list(row.schema_json["properties"]) == ["q"]
+
+
+# ── sync 出来的工具，归属跟着 server 走 ───────────────────────────────────
+#
+# 用户私有 MCP server 一放开，这组就是**安全边界**。sync 以前写死
+# OWNER_SCOPE_PLATFORM，因为 lea-tools 的 MCPServer 模型不映射归属两列 ——
+# server.owner_scope 压根读不出来（跟 Tool 表当年那个病同一例的第三次）。
+#
+# 那个洞今天不可达：lea-config 的 CRUD 有 6 处硬过滤，server 只可能是 platform 级。
+# 但它已经在代码里了，所以先修它再放开 CRUD —— 反过来的话中间有一个真实可利用的窗口：
+# alice 私有 Notion 的 14 个工具会全租户可见，别人绑定、调用一路通，用的是 alice 的 key。
+
+
+def test_model_maps_the_ownership_columns():
+    """归属两列必须在**这一侧的模型**里。
+
+    真实表一直有它们（lea-config 那份是 MCPServer(OwnerMixin, ...)，唯一约束也早按
+    (tenant_id, owner_scope, owner_user_id, name) 建好了）。不映射的后果不是"少读两列"，
+    而是任何跟归属有关的逻辑在这一侧**写不出来** —— sync 于是只能写死 platform。
+    """
+    cols = MCPServer.__table__.columns
+    assert "owner_scope" in cols
+    assert "owner_user_id" in cols
+
+
+@pytest.mark.asyncio
+async def test_sync_inherits_private_server_ownership(db, monkeypatch):
+    """alice 的私有 server → 工具行也归 alice。
+
+    这是那个洞的正向判据。写死 platform 的话这里会红。
+    """
+    server = mk_server(db, owner_scope="user", owner_user_id="alice")
+    await run_sync(db, monkeypatch, server, _remote("search", "create"))
+
+    rows = db.query(Tool).filter_by(mcp_server_id=server.id).all()
+    assert len(rows) == 2
+    for row in rows:
+        assert row.owner_scope == "user"
+        assert row.owner_user_id == "alice"
+
+
+@pytest.mark.asyncio
+async def test_sync_keeps_platform_server_tools_platform(db, monkeypatch):
+    """platform server 仍然出 platform 工具 —— 别把修复做成"一律私有"。
+
+    这条是防过度修正的：只断言"私有能继承"的话，把两行写成写死 user 也能过。
+    """
+    server = mk_server(db)  # 默认 platform
+    await run_sync(db, monkeypatch, server, _remote("search"))
+
+    row = db.query(Tool).filter_by(mcp_server_id=server.id).one()
+    assert row.owner_scope == OWNER_SCOPE_PLATFORM
+    assert row.owner_user_id is None
+
+
+@pytest.mark.asyncio
+async def test_resync_realigns_ownership_after_the_server_moves(db, monkeypatch):
+    """server 的归属变了，**已存在的**工具行也要跟着变。
+
+    归属只在新建分支设的话，update 分支会把老行留在旧归属上：
+
+        私有 → 上架 platform    14 行还挂在 alice 名下，「上架了但别人看不到」
+        platform → 收回私有     14 行仍然全租户可见，**收回不生效**
+
+    后者是安全问题。所以两个方向都验。
+    """
+    server = mk_server(db, owner_scope="user", owner_user_id="alice")
+    await run_sync(db, monkeypatch, server, _remote("search"))
+
+    # 上架：私有 → 平台
+    server.owner_scope = OWNER_SCOPE_PLATFORM
+    server.owner_user_id = None
+    db.commit()
+    await run_sync(db, monkeypatch, server, _remote("search"))
+
+    row = db.query(Tool).filter_by(mcp_server_id=server.id).one()
+    assert row.owner_scope == OWNER_SCOPE_PLATFORM, "上架后工具还挂在原主人名下"
+    assert row.owner_user_id is None
+
+    # 收回：平台 → 私有。这个方向不生效 = 全租户仍然能用别人的 key。
+    server.owner_scope = "user"
+    server.owner_user_id = "alice"
+    db.commit()
+    await run_sync(db, monkeypatch, server, _remote("search"))
+
+    row = db.query(Tool).filter_by(mcp_server_id=server.id).one()
+    assert row.owner_scope == "user", "收回之后工具仍然全租户可见"
+    assert row.owner_user_id == "alice"
 
 
 @pytest.mark.asyncio

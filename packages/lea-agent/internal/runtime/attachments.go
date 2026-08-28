@@ -32,14 +32,15 @@ import (
 
 // AttachmentRef 是一条挂载记录，对应 session_attachments 的一行。
 type AttachmentRef struct {
-	Kind  string `json:"kind"` // tool | kb（mcp_server / skill 是下一批）
+	Kind  string `json:"kind"` // tool | kb | skill（mcp_server 是下一批）
 	RefID int    `json:"ref_id"`
 }
 
 // resolvedAttachments 是 lea-config 解析后的结果。
 type resolvedAttachments struct {
-	Tools  []ToolDef `json:"tools"`
-	KBIDs  []int     `json:"kb_ids"`
+	Tools  []ToolDef  `json:"tools"`
+	Skills []SkillDef `json:"skills"`
+	KBIDs  []int      `json:"kb_ids"`
 	Droppd []struct {
 		Kind   string `json:"kind"`
 		RefID  int    `json:"ref_id"`
@@ -100,6 +101,28 @@ func MergeAttachments(
 		}
 		seen[t.Name] = true
 		cfg.Tools = append(cfg.Tools, t)
+	}
+
+	// skill 同理按名字去重，撞名同样保留 agent 绑定那份。
+	//
+	// 撞名的后果比工具更隐蔽：skill 是一段**注入进 prompt 的正文**，不是一个可调用的
+	// 名字。让挂载覆盖绑定的话，共享 agent 的行为会被悄悄改写 —— 作者写的流程被替换成
+	// 用户自己那份，而模型不会说它换了参考资料，输出看起来只是"表现不一样"。
+	//
+	// 一个会话里同名 skill 出现两次也不能留：引擎的 skill.Catalog 会列两条同名项，
+	// Skill 工具按名字解析时只会命中一个，模型看到的目录跟能拿到的正文对不上。
+	skillSeen := make(map[string]bool, len(cfg.Skills))
+	for _, s := range cfg.Skills {
+		skillSeen[s.Name] = true
+	}
+	for _, s := range res.Skills {
+		if skillSeen[s.Name] {
+			log.Printf("attachment_skill_shadowed tenant=%s user=%s name=%s (agent 已绑同名，保留绑定那份)",
+				tenantID, userID, s.Name)
+			continue
+		}
+		skillSeen[s.Name] = true
+		cfg.Skills = append(cfg.Skills, s)
 	}
 
 	// kb_ids 去重，顺序无所谓（lea-rag 侧是个 IN 查询）。

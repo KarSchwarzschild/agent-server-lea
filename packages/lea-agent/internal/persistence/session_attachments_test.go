@@ -98,3 +98,48 @@ func TestFingerprint_NoCollisionOnAdjacentIDs(t *testing.T) {
 		t.Errorf("相邻 id 组合撞了: %q", a)
 	}
 }
+
+func TestFingerprint_DistinguishesSkillFromTool(t *testing.T) {
+	// skill:5 和 tool:5 是两个完全不同的东西。挂载 kind 加一种就要在这儿钉一次 ——
+	// 漏了的话"把挂的工具换成同 id 的 skill"检测不到，会话不重建。
+	if Fingerprint(rows("skill", 5)) == Fingerprint(rows("tool", 5)) {
+		t.Error("skill:5 和 tool:5 的指纹不该相同")
+	}
+}
+
+// ── 认识的 kind ────────────────────────────────────────────────────────────
+
+func TestKnownAttachmentKinds_MatchesTheMap(t *testing.T) {
+	// 这个列表只给 400 的错误信息用，但它必须跟真正的判据同源。手写那份在加 skill 时
+	// 就过时了：提示里只有 tool/kb，实际已经收 skill —— 用户照着提示做反而是错的。
+	got := KnownAttachmentKinds()
+	if len(got) != len(SessionAttachmentKinds) {
+		t.Fatalf("数量不一致: %v vs map 里 %d 个", got, len(SessionAttachmentKinds))
+	}
+	for _, k := range got {
+		if !SessionAttachmentKinds[k] {
+			t.Errorf("%q 不在 map 里", k)
+		}
+	}
+}
+
+func TestKnownAttachmentKinds_IsSorted(t *testing.T) {
+	// map 迭代顺序随机，不排序的话同一个 400 每次措辞不一样 —— 而错误信息进日志、
+	// 进前端提示，飘动的文案没法被任何东西断言。
+	got := KnownAttachmentKinds()
+	for i := 1; i < len(got); i++ {
+		if got[i-1] > got[i] {
+			t.Errorf("没排序: %v", got)
+			break
+		}
+	}
+}
+
+func TestKnownAttachmentKinds_IncludesSkill(t *testing.T) {
+	for _, k := range KnownAttachmentKinds() {
+		if k == "skill" {
+			return
+		}
+	}
+	t.Error("skill 不在认识的 kind 里 —— 挂载接口会 400")
+}

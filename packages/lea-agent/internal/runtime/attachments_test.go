@@ -141,19 +141,114 @@ func TestMergeAttachments_FallsBackOnConfigError(t *testing.T) {
 }
 
 func TestMergeAttachments_IgnoresUnknownKind(t *testing.T) {
-	withConfigServer(t, 200, `{"tools":[],"kb_ids":[],"dropped":[
-		{"kind":"skill","ref_id":12,"reason":"skill 是下一批"}
+	withConfigServer(t, 200, `{"tools":[],"skills":[],"kb_ids":[],"dropped":[
+		{"kind":"mcp_server","ref_id":12,"reason":"mcp_server 是下一批"}
 	]}`)
 
 	cfg := &AgentConfig{}
-	// 表上写了 kind='skill'（persistence 层不过滤），lea-config 也不认，放 dropped 里。
-	// 这里**不报错** —— MergeAttachments 容错性是"能用的留下，用不了的丢掉"，
-	// 而不是"有一个用不了就全失败"。否则「加一种新资源」就等于让老会话打不开。
+	// 表上写了 kind='mcp_server'（persistence 层不过滤），这一版的 lea-config 也不认，
+	// 放 dropped 里。这里**不报错** —— MergeAttachments 的容错性是"能用的留下，用不了
+	// 的丢掉"，而不是"有一个用不了就全失败"。否则「加一种新资源」就等于让老会话打不开。
 	got := MergeAttachments(context.Background(), cfg, "t1", "alice",
-		[]AttachmentRef{{Kind: "skill", RefID: 12}})
+		[]AttachmentRef{{Kind: "mcp_server", RefID: 12}})
 
-	if len(got.Tools) != 0 || len(got.KBIDs) != 0 {
+	if len(got.Tools) != 0 || len(got.KBIDs) != 0 || len(got.Skills) != 0 {
 		t.Errorf("dropped 项不该合并进 cfg")
+	}
+}
+
+// ── skill ─────────────────────────────────────────────────────────────────
+//
+// skill 撞名比工具更隐蔽：它是一段**注入进 prompt 的正文**，不是一个可调用的名字。
+// 让挂载覆盖绑定的话，共享 agent 的行为会被悄悄改写 —— 模型不会说它换了参考资料，
+// 输出看起来只是"表现不一样"。
+
+func TestMergeAttachments_AddsSkill(t *testing.T) {
+	withConfigServer(t, 200, `{
+		"tools": [], "kb_ids": [], "dropped": [],
+		"skills": [{"id":8,"name":"ppt_maker","display_name":"做 PPT",
+		            "description":"按模板生成","system_prompt":"Step 1: 调研…",
+		            "bundle_uri":"s3://b/ppt.zip"}]
+	}`)
+
+	cfg := &AgentConfig{}
+	got := MergeAttachments(context.Background(), cfg, "t1", "alice", refs("skill", 8))
+
+	if len(got.Skills) != 1 {
+		t.Fatalf("want 1 skill, got %d", len(got.Skills))
+	}
+	s := got.Skills[0]
+	// 这几个字段有一个解不出来，模型就拿到一个没正文/没目录的 skill —— 静默失效。
+	if s.Name != "ppt_maker" {
+		t.Errorf("name = %q", s.Name)
+	}
+	if s.SystemPrompt != "Step 1: 调研…" {
+		t.Errorf("system_prompt 没解出来: %q", s.SystemPrompt)
+	}
+	if s.BundleURI != "s3://b/ppt.zip" {
+		t.Errorf("bundle_uri 没解出来: %q —— ProvisionSessionSkills 会因此跳过投递", s.BundleURI)
+	}
+}
+
+func TestMergeAttachments_KeepsBoundSkillWhenNameCollides(t *testing.T) {
+	withConfigServer(t, 200, `{
+		"tools": [], "kb_ids": [], "dropped": [],
+		"skills": [{"name":"ppt_maker","system_prompt":"用户自己那份"}]
+	}`)
+
+	cfg := &AgentConfig{Skills: []SkillDef{
+		{Name: "ppt_maker", SystemPrompt: "agent 绑定的那份"},
+	}}
+	got := MergeAttachments(context.Background(), cfg, "t1", "alice", refs("skill", 8))
+
+	if len(got.Skills) != 1 {
+		t.Fatalf("want 1 skill, got %d", len(got.Skills))
+	}
+	if got.Skills[0].SystemPrompt != "agent 绑定的那份" {
+		t.Errorf("撞名时留错了：%q —— 共享 agent 的流程被用户那份悄悄替换了",
+			got.Skills[0].SystemPrompt)
+	}
+}
+
+func TestMergeAttachments_MergesAllThreeKinds(t *testing.T) {
+	// 一次挂全三样。分别解析的话很容易漏掉某一种的合并（skills 那段就是后加的）。
+	withConfigServer(t, 200, `{
+		"tools": [{"name":"my__lookup","description":"查库存"}],
+		"skills": [{"name":"ppt_maker","system_prompt":"Step 1"}],
+		"kb_ids": [3, 7],
+		"dropped": []
+	}`)
+
+	cfg := &AgentConfig{}
+	got := MergeAttachments(context.Background(), cfg, "t1", "alice",
+		[]AttachmentRef{{Kind: "tool", RefID: 1}, {Kind: "skill", RefID: 2}, {Kind: "kb", RefID: 3}})
+
+	if len(got.Tools) != 1 || len(got.Skills) != 1 || len(got.KBIDs) != 2 {
+		t.Errorf("三样没都合并进来: tools=%d skills=%d kbs=%d",
+			len(got.Tools), len(got.Skills), len(got.KBIDs))
+	}
+}
+
+func TestMergeAttachments_DeduplicatesSkillsByName(t *testing.T) {
+	// lea-config 理论上不会返回重复，但同名的两个 skill（不同 id、不同租户层级）
+	// 是可能的。引擎的 skill.Catalog 会列两条同名项，而 Skill 工具按名字解析只会命中
+	// 一个 —— 模型看到的目录跟能拿到的正文对不上。
+	withConfigServer(t, 200, `{
+		"tools": [], "kb_ids": [], "dropped": [],
+		"skills": [
+			{"id":1,"name":"ppt_maker","system_prompt":"平台那份"},
+			{"id":2,"name":"ppt_maker","system_prompt":"我自己那份"}
+		]
+	}`)
+
+	cfg := &AgentConfig{}
+	got := MergeAttachments(context.Background(), cfg, "t1", "alice", refs("skill", 1, 2))
+
+	if len(got.Skills) != 1 {
+		t.Fatalf("同名 skill 该去重，got %d", len(got.Skills))
+	}
+	if got.Skills[0].SystemPrompt != "平台那份" {
+		t.Errorf("去重该保留先到的那份，got %q", got.Skills[0].SystemPrompt)
 	}
 }
 

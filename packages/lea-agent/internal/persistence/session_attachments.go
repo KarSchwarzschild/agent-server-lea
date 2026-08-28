@@ -30,7 +30,7 @@ import (
 
 // SessionAttachment 是 session_attachments 的一行。
 type SessionAttachment struct {
-	Kind  string // tool | kb（mcp_server / skill 是下一批）
+	Kind  string // tool | kb | skill（mcp_server 是下一批）
 	RefID int
 }
 
@@ -82,7 +82,20 @@ func Fingerprint(rows []SessionAttachment) string {
 // 的值 —— 那是故意留的：加一种新资源不该要求先改所有读端再排序部署。读到不认识的照常
 // 传给 lea-config，由它决定丢弃，**这里不过滤**：过滤了就等于把"未知 kind"变成一个
 // 静默的黑洞，而 lea-config 那边至少会在 dropped 里报出来。
-var SessionAttachmentKinds = map[string]bool{"tool": true, "kb": true}
+var SessionAttachmentKinds = map[string]bool{"tool": true, "kb": true, "skill": true}
+
+// KnownAttachmentKinds 返回认识的 kind，排序后返回。
+//
+// 只给错误信息用。手写那份列表在加 skill 时就过时了（提示里只有 tool/kb，实际已经收
+// skill），而 map 迭代顺序随机，不排序的话同一个 400 每次措辞不一样。
+func KnownAttachmentKinds() []string {
+	out := make([]string, 0, len(SessionAttachmentKinds))
+	for k := range SessionAttachmentKinds {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
 
 // LoadSessionAttachments 读一个会话挂了什么。按 (tenant, session) 查 —— 索引就是这个形状。
 //

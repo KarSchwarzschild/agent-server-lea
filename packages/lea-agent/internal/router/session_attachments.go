@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/persistence"
@@ -129,7 +130,12 @@ func handleAttachToSession(mgr *session.Manager) gin.HandlerFunc {
 		if !persistence.SessionAttachmentKinds[body.Kind] {
 			// 这里**要**拦未知 kind，跟解析那边的"静默丢弃"不矛盾：写入是新数据，拦住
 			// 才不会攒下一堆谁也不认的行；读取是既有数据，宽容才不会让老会话打不开。
-			c.JSON(400, gin.H{"error": "kind must be one of: tool, kb"})
+			//
+			// 列表从那个 map 生成，不手写。手写的那版在加 skill 时就过时了 —— 提示里
+			// 只有 tool/kb，而实际已经收 skill，用户照着提示做反而是错的。
+			c.JSON(400, gin.H{
+				"error": "kind must be one of: " + strings.Join(persistence.KnownAttachmentKinds(), ", "),
+			})
 			return
 		}
 

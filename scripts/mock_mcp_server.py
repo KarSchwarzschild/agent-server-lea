@@ -76,6 +76,14 @@ def err(req_id, code, message):
     return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
 
 
+# 每个工具被真的调了多少次。**这是不可伪造的证据**，验"摘除之后还能不能执行"只能靠它。
+#
+# 为什么不能看 tool_use：摘除生效之后模型**仍然会发** tool_use —— 它在历史里见过这个
+# 工具，以为还能用。引擎回一句 unknown tool 把它挡住，那是正确行为。所以 tool_use 只
+# 表示"意图"，不表示"能力"。同一个判据错误在 tool 和 skill 两轮各犯过一次。
+CALLS: dict[str, int] = {}
+
+
 @app.post("/mcp")
 async def mcp(request: Request):
     body = await request.json()
@@ -101,6 +109,10 @@ async def mcp(request: Request):
     if method == "tools/call":
         name = body.get("params", {}).get("name", "")
         args = body.get("params", {}).get("arguments", {})
+
+        # 在最前面计数：**只要请求到了这里就算一次**，不管后面是成功还是 isError。
+        # 判据要回答的是"上游有没有被打到"，而不是"调用成功没有"。
+        CALLS[name] = CALLS.get(name, 0) + 1
 
         if name == "list_queues":
             return ok(req_id, {"content": [{"type": "text", "text": "运维二组 / 平台组"}]})
@@ -136,9 +148,27 @@ async def mcp(request: Request):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "tools": [t["name"] for t in TOOLS]}
+    # calls 是给验收脚本用的：判断"摘掉挂载之后工具还能不能执行"只能看这里。
+    return {
+        "status": "ok",
+        "tools": [t["name"] for t in TOOLS],
+        "calls": dict(CALLS),
+    }
+
+
+@app.post("/reset-calls")
+async def reset_calls():
+    """把计数清零。验收脚本在关键的那一步之前调一次，好做"窗口内命中几次"的判断。
+
+    比"记下之前的值再相减"可靠：跨副本、跨轮次时那个减法很容易算在错的采样点上 ——
+    工具那轮就在这上面判错过一次。
+    """
+    CALLS.clear()
+    return {"ok": True}
 
 
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 9910
-    uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
+    # 0.0.0.0 而不是 127.0.0.1：验收栈里的 lea-tools 在容器里，要经
+    # host.docker.internal 打进来，只听回环它连不上。
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")

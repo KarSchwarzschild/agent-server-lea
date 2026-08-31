@@ -206,3 +206,76 @@ def test_port_does_not_change_the_verdict(monkeypatch):
     """
     assert check_outbound_url("http://127.0.0.1:443/", resolve=False)
     assert check_outbound_url("http://127.0.0.1:6379/", resolve=False)
+
+
+# ── 主机名白名单 ──────────────────────────────────────────────────────────
+#
+# 只给验证环境用：真链路验收要连一个跑在宿主机上的假 MCP server，而从容器看宿主机
+# 永远是内网地址（Docker Desktop 下 host.docker.internal → 192.168.65.254）。
+# 也就是说这道门会正确地拦住自己的验收环境。
+#
+# 做成主机名白名单而不是 `LEA_SSRF_DISABLE=1`：后者太容易在生产被打开一次然后忘掉，
+# 而白名单要求指名道姓，且只放行那一个名字。
+
+
+def test_allowlisted_host_passes(monkeypatch):
+    monkeypatch.setenv("LEA_SSRF_HOST_ALLOWLIST", "host.docker.internal")
+    fake_dns(monkeypatch, "192.168.65.254")  # 内网，不放行就该被拦
+    assert check_outbound_url("http://host.docker.internal:9910/mcp") is None
+
+
+def test_allowlist_is_case_insensitive(monkeypatch):
+    monkeypatch.setenv("LEA_SSRF_HOST_ALLOWLIST", "Host.Docker.Internal")
+    fake_dns(monkeypatch, "10.0.0.5")
+    assert check_outbound_url("http://HOST.docker.INTERNAL/mcp") is None
+
+
+def test_allowlist_accepts_several_hosts(monkeypatch):
+    monkeypatch.setenv("LEA_SSRF_HOST_ALLOWLIST", "a.internal, b.internal")
+    fake_dns(monkeypatch, "10.0.0.5")
+    assert check_outbound_url("http://b.internal/mcp") is None
+
+
+def test_non_allowlisted_internal_host_is_still_rejected(monkeypatch):
+    """白名单只放行**指名的那个**，别的内网地址照样拦。
+
+    这是它跟"跳过检查"开关的根本区别。
+    """
+    monkeypatch.setenv("LEA_SSRF_HOST_ALLOWLIST", "host.docker.internal")
+    fake_dns(monkeypatch, "169.254.169.254")
+    assert check_outbound_url("http://metadata.evil.example/latest/meta-data/")
+
+
+def test_allowlist_does_not_bypass_the_scheme_check(monkeypatch):
+    """白名单放行的是"这个名字指向内网"，不是"这个 URL 什么都可以"。
+
+    所以它在 scheme 检查之后 —— 放前面的话白名单里的名字配上 gopher:// 也能过。
+    """
+    monkeypatch.setenv("LEA_SSRF_HOST_ALLOWLIST", "host.docker.internal")
+    assert check_outbound_url("gopher://host.docker.internal/", resolve=False)
+
+
+def test_allowlist_does_not_let_through_a_hostless_url(monkeypatch):
+    """file:///etc/passwd 没有 hostname，不该因为白名单存在而蒙混过关。"""
+    monkeypatch.setenv("LEA_SSRF_HOST_ALLOWLIST", "host.docker.internal")
+    assert check_outbound_url("file:///etc/passwd", resolve=False)
+
+
+def test_empty_allowlist_changes_nothing(monkeypatch):
+    """没设这个变量（生产的状态）时行为完全不变。"""
+    monkeypatch.delenv("LEA_SSRF_HOST_ALLOWLIST", raising=False)
+    fake_dns(monkeypatch, "192.168.65.254")
+    assert check_outbound_url("http://host.docker.internal:9910/mcp")
+
+
+def test_allowlist_is_read_per_call_not_cached(monkeypatch):
+    """每次调用都读环境变量。
+
+    缓存进模块级常量的话，"生产没设"这件事就取决于 import 时机 —— 而那在多进程
+    /热重载下不可预测。
+    """
+    monkeypatch.delenv("LEA_SSRF_HOST_ALLOWLIST", raising=False)
+    fake_dns(monkeypatch, "10.0.0.5")
+    assert check_outbound_url("http://x.internal/mcp")          # 拦
+    monkeypatch.setenv("LEA_SSRF_HOST_ALLOWLIST", "x.internal")
+    assert check_outbound_url("http://x.internal/mcp") is None  # 放

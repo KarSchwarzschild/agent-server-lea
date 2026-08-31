@@ -43,12 +43,41 @@ server 的只有管理员，风险面是已知的」。
 from __future__ import annotations
 
 import ipaddress
+import os
 import socket
 from urllib.parse import urlsplit
 
 # 允许的 scheme。跟 lea-config 的 _validate_endpoint 一致（那边挡的是同一件事的
 # 上游一半），故意各写一份：两个服务分开部署，不互相 import。
 ALLOWED_SCHEMES = ("http", "https")
+
+# 显式放行的主机名，逗号分隔。**只给验证环境用。**
+#
+# ## 为什么需要它
+#
+# 真链路验收必须连一个真的 MCP server，而那个假 server 只能跑在宿主机上 —— 从容器里
+# 看宿主机永远是内网地址（Docker Desktop 下 host.docker.internal 解析到
+# 192.168.65.254）。也就是说这道门会正确地拦住自己的验收环境。
+#
+# ## 为什么是主机名白名单而不是"跳过检查"开关
+#
+# `LEA_SSRF_DISABLE=1` 那种形状太容易在生产被打开 —— 一个人为了排查问题设一次，然后
+# 忘了。而白名单要求**指名道姓**：写 host.docker.internal 的人知道自己在放行什么，
+# 而且它放行的只有那一个名字，别的内网地址照样拦。
+#
+# 名字匹配在 DNS 解析**之前**，所以放行的是"这个名字"而不是"它今天解析到的那个 IP"。
+# 那正是想要的：验证环境里宿主机 IP 会变，而名字不变。
+#
+# ⚠️ 生产不要设这个变量。设了就是给自己开一个指定名字的 SSRF 通道。
+_ALLOWLIST_ENV = "LEA_SSRF_HOST_ALLOWLIST"
+
+
+def _allowlisted(host: str) -> bool:
+    raw = os.getenv(_ALLOWLIST_ENV, "")
+    if not raw:
+        return False
+    allowed = {h.strip().lower() for h in raw.split(",") if h.strip()}
+    return host.lower() in allowed
 
 
 def _ip_rejection(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> str | None:
@@ -116,6 +145,14 @@ def check_outbound_url(url: str, *, resolve: bool = True) -> str | None:
     host = parts.hostname
     if not host:
         return "URL 里没有主机名"
+
+    # 白名单在 scheme 检查**之后**、地址判定之前。
+    #
+    # 顺序是有意的：放行的是"这个主机名指向内网"这一件事，不是"这个 URL 什么都可以"。
+    # 放在最前面的话 file:///etc/passwd 会因为 hostname 为空而绕过，或者某个白名单里的
+    # 名字配上 gopher:// 也能过 —— 那两样都不是想放行的东西。
+    if _allowlisted(host):
+        return None
 
     # 主机名本身就是 IP 的情况：不需要 DNS，直接判。
     try:

@@ -506,3 +506,112 @@ async def test_names_are_prefixed_with_server_id(db, monkeypatch):
 
     names = {t.name for t in db.query(Tool).filter(Tool.execution_type == "mcp")}
     assert names == {f"mcp_{a.id}_create_issue", f"mcp_{b.id}_create_issue"}
+
+
+# ── 私有 MCP 工具的两层前缀 ───────────────────────────────────────────────
+#
+# 用户私有 MCP server 放开之后，工具名上有两层前缀，各由不同的代码剥：
+#
+#     my__        归属命名空间     resolve_tool 剥（services/__init__.py）
+#     mcp_37_     server 消歧      remote_tool_name 剥（executor/mcp_proxy.py）
+#
+# 真链路验收抓到的 bug：execute.py 构造 ToolCall 时传的是 req.tool_name（模型发来的
+# 暴露名），而不是解析出来那一行的 name。于是 remote_tool_name 收到
+# `my__mcp_30_lookup_ticket`，startswith("mcp_30_") 为假 → **原样发给远端** →
+# 远端 unknown tool → 模型说"工具不可用"，而请求全程 200。
+#
+# 假上游的访问日志里记着一次对 `my__mcp_30_lookup_ticket` 的调用，那是不可伪造的证据。
+
+
+def test_remote_name_strips_only_the_server_prefix():
+    """remote_tool_name 的职责边界：它**只**剥 mcp_{id}_，不认 my__。
+
+    这是有意的 —— 剥 my__ 是 resolve_tool 的事。让 MCP 代理去认归属命名空间会把两个
+    无关的概念缠在一起。所以下面那条（execute 传裸名）才是正确的修法。
+    """
+    assert remote_tool_name("mcp_7_search", 7) == "search"
+    # 带 my__ 的进来出不去 —— 正因如此上游才必须收到裸名
+    assert remote_tool_name("my__mcp_7_search", 7) == "my__mcp_7_search"
+
+
+@pytest.mark.asyncio
+async def test_private_mcp_tool_reaches_the_remote_with_its_bare_name(db, monkeypatch):
+    """alice 私有 MCP server 的工具，发到远端的必须是 `search`。
+
+    钉的是 execute.py 那一跳：ToolCall.tool_name 要用**解析出来那一行的 name**，
+    不是模型发来的 `my__mcp_{id}_search`。
+    """
+    from lea_tools.executor.mcp_proxy import mcp_call
+    from lea_tools.executor.router import ToolCall
+
+    server = mk_server(db, owner_scope="user", owner_user_id="alice")
+    sent = {}
+
+    async def fake_call_tool(self, name, params):
+        sent["name"] = name
+        return {"content": [{"type": "text", "text": "紫貂-待复核"}]}
+
+    monkeypatch.setattr(MCPSession, "call_tool", fake_call_tool)
+    monkeypatch.setattr("lea_tools.db.SessionLocal", lambda: db)
+
+    # 库里那一行的名字（裸名，带 server 前缀但不带 my__）—— execute.py 传的就该是这个
+    call = ToolCall(
+        tool_name=f"mcp_{server.id}_lookup_ticket",
+        params={"ticket_ref": "OUC-2291"},
+        session_id="s1",
+        execution_type="mcp",
+        mcp_server_id=server.id,
+    )
+    await mcp_call(call, None)
+
+    assert sent["name"] == "lookup_ticket", (
+        f"远端收到 {sent['name']!r} —— 前缀没剥干净，它会回 unknown tool"
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_passes_the_bare_row_name_not_the_exposed_name(db, monkeypatch):
+    """**这条钉的是 execute.py 那一跳** —— 上面那条只覆盖到 mcp_call。
+
+    真链路抓到的 bug 就在这里：ToolCall.tool_name 传的是 req.tool_name（模型发来的
+    `my__mcp_30_lookup_ticket`），而不是解析出来那一行的 name（`mcp_30_lookup_ticket`）。
+    于是 remote_tool_name 剥不掉，远端收到带 my__ 的名字回 unknown tool。
+
+    变异验证过：把这里改回 req.tool_name，lea-tools 整个 tests/ **一条都不红** ——
+    这一跳原先没有任何覆盖，那正是它能溜过去的原因。
+    """
+    from lea_tools.api.execute import ExecuteRequest, execute_tool
+    from lea_tools.db.models import OWNER_SCOPE_USER, Tool
+
+    server = mk_server(db, owner_scope=OWNER_SCOPE_USER, owner_user_id="alice")
+    bare = f"mcp_{server.id}_lookup_ticket"
+    db.add(Tool(
+        tenant_id=TENANT, name=bare, display_name="[MCP] lookup_ticket",
+        execution_type="mcp", schema_json={"type": "object"},
+        mcp_server_id=server.id, enabled=True,
+        owner_scope=OWNER_SCOPE_USER, owner_user_id="alice",
+    ))
+    db.commit()
+
+    seen = {}
+
+    async def fake_execute(call, credential=None):
+        from lea_tools.executor.router import ToolResult
+        seen["tool_name"] = call.tool_name
+        return ToolResult(status="success", output="ok")
+
+    monkeypatch.setattr("lea_tools.api.execute.execute", fake_execute)
+    monkeypatch.setattr("lea_tools.api.execute.check_permission",
+                        lambda *a, **kw: True)
+
+    # 模型发来的是**暴露名**（带 my__），这是真实形状
+    await execute_tool(
+        req=ExecuteRequest(tool_name=f"my__{bare}", params={"ticket_ref": "OUC-2291"}),
+        x_tenant_id=TENANT, x_user_id="alice", x_user_role="user",
+        x_agent_id=None, db=db,
+    )
+
+    assert seen["tool_name"] == bare, (
+        f"传下去的是 {seen['tool_name']!r} —— 带着 my__ 的话 remote_tool_name 剥不掉，"
+        "远端会回 unknown tool"
+    )

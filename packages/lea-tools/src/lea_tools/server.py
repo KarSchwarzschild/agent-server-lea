@@ -38,12 +38,17 @@ from lea_tools.api.execute import router as execute_router
 # 全部**没有授权**且 tenant_id 由调用方在请求体里自选 —— 已删除，配置类操作统一走
 # lea-config（那边有 require_admin + 归属约束）。理由见 api/admin_mcp.py 的说明。
 from lea_tools.api.admin_mcp import router as admin_mcp_router
+# 只做出网的那一跳：lea-config 拿它去问远端有哪些工具，鉴权和写表在 lea-config 那边。
+# 拆两跳的理由是**不让 lea-config 开始打用户填的任意 URL** —— 它今天一次外网都不打，
+# egress 可以锁死。见 api/internal_mcp.py 的说明。
+from lea_tools.api.internal_mcp import router as internal_mcp_router
 from lea_tools.api.sandbox import router as sandbox_router
 from lea_tools.api.files import router as files_router
 
 app.include_router(session_router)
 app.include_router(execute_router)
 app.include_router(admin_mcp_router)
+app.include_router(internal_mcp_router)
 app.include_router(sandbox_router)
 app.include_router(files_router)
 

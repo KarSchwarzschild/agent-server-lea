@@ -615,3 +615,60 @@ async def test_execute_passes_the_bare_row_name_not_the_exposed_name(db, monkeyp
         f"传下去的是 {seen['tool_name']!r} —— 带着 my__ 的话 remote_tool_name 剥不掉，"
         "远端会回 unknown tool"
     )
+
+
+# ── 远端返回的名字不可信 ──────────────────────────────────────────────────
+
+
+def test_sync_skips_absurdly_long_names_instead_of_failing_the_batch(db, monkeypatch):
+    """一个荒谬的长名字不该搞掉整次同步。
+
+    tools.name 是 varchar(255)（migrations/018 从 100 放宽）。远端名字由**别人的服务**
+    决定，超了列宽的后果不是"这个工具没进来"，是 db.commit() 抛异常 → 整批 sync 500 →
+    其余工具一个都没同步进去。
+
+    所以判据有两半：超长那个被跳过，**并且正常那个照常进来**。只断言前者的话，
+    "整批失败"也能过。
+    """
+    import asyncio
+
+    server = mk_server(db)
+    long_name = "x" * 300
+    out = asyncio.run(run_sync(db, monkeypatch, server, _remote("search", long_name)))
+
+    assert out["synced"] == 1
+    assert out["tools"] == [f"mcp_{server.id}_search"], "正常的工具也没进来 —— 整批受影响了"
+    assert long_name in out["skipped_too_long"]
+
+
+def test_sync_reports_skipped_names_not_just_a_count(db, monkeypatch):
+    """skipped 要能拿去定位，不是个计数器。
+
+    用户看到"少了几个工具"时，唯一能回答"少了哪个、为什么"的就是这个字段。跟挂载那边
+    dropped 要带 reason 是同一条判断。
+    """
+    import asyncio
+
+    server = mk_server(db)
+    long_name = "y" * 300
+    out = asyncio.run(run_sync(db, monkeypatch, server, _remote(long_name)))
+
+    assert out["skipped_too_long"] == [long_name]
+    assert out["synced"] == 0
+
+
+def test_sync_accepts_names_that_fit_the_widened_column(db, monkeypatch):
+    """放宽到 255 之后，一个长度正常但超过老上限 100 的名字要能进来。
+
+    这条钉的是"放宽真的生效了"。加上 `mcp_{id}_` 前缀之后仍在 255 内的名字，在 100 那
+    一版会被跳过 —— 而那种名字在真实 MCP server 上并不罕见（带命名空间的那类）。
+    """
+    import asyncio
+
+    server = mk_server(db)
+    # 120 字符：老上限会拒，新上限该收
+    name = "z" * 120
+    out = asyncio.run(run_sync(db, monkeypatch, server, _remote(name)))
+
+    assert out["synced"] == 1, f"120 字符的名字被拒了 —— 放宽没生效: {out}"
+    assert out["skipped_too_long"] == []

@@ -112,6 +112,13 @@ services:
       # 用户自己建 MCP server 是第一条**真的要走反代到 lea-config** 的链路，所以这里
       # 才需要它。线上必然是配的，所以配上比开 ALLOW_UNTRUSTED_HEADERS 更接近真实。
       LEA_INTERNAL_TOKEN: verify-internal-token
+      # ⚠️ 必须覆盖 .env。那里的 LEA_TOOLS_URL 指向 10.192.241.137（另一台机器上的
+      # lea-tools），而 sync 的出网那一跳是**内部调本栈的 lea-tools**。
+      #
+      # 不覆盖的后果很难认：sync 会去打那台真机器，而那边的 url_guard 没配
+      # LEA_SSRF_HOST_ALLOWLIST，于是报"host.docker.internal 解析到内网" —— 看起来像
+      # 本地配置问题，实际是请求跑到了另一台机器上。
+      LEA_TOOLS_URL: http://lea-tools:8400
     restart: unless-stopped
 
   # ⚠️ 这个本地 lea-tools 只是让链路完整，**不能用来验证沙箱的文件行为。**
@@ -134,8 +141,9 @@ services:
     env_file: [../.env]
     environment:
       REDIS_URL: redis://202.205.160.9:26379/0
-      # 同一个共享密钥（见 lea-config 那段）。MCP 的 /test /sync 经 lea-agent 反代
-      # 打进来，install_internal_auth 的中间件校验的就是它。
+      # 同一个共享密钥（见 lea-config 那段）。MCP 的 /test 经 lea-agent 反代打进来、
+      # /internal/mcp/discover 由 lea-config 内部调进来，两条都由
+      # install_internal_auth 的中间件校验它。
       LEA_INTERNAL_TOKEN: verify-internal-token
       # 放行假 MCP server 的主机名。
       #

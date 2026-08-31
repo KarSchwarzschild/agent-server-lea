@@ -170,36 +170,35 @@ func UserMCPServersProxy() gin.HandlerFunc {
 	return UserConfigProxy()
 }
 
-// UserMCPActionsProxy 反代 /api/user/mcp-actions/{id}/{test,sync} → lea-tools 的
-// /admin/mcp-servers/{id}/{test,sync}。
+// UserMCPActionsProxy 反代 /api/user/mcp-actions/{id}/test → lea-tools 的
+// /admin/mcp-servers/{id}/test。
 //
-// ## 为什么必须有这一条
+// ## 只剩 /test 了
 //
-// 建完 server 得 sync 一次才有工具行（sync = 连上去问 tools/list，把答案落成 tools
-// 表的行）。而那两个端点在 **lea-tools**，同样不对外暴露。少了它，用户建出来的 server
-// 永远是 0 个工具 —— 挂上去什么也不会多，而 resolve 那边只会报一句"大概还没 sync"。
+// sync 已经搬到 lea-config（`POST /mcp-servers/{id}/sync`），所以它走上面那条
+// UserMCPServersProxy 就通 —— 用户同步自己的 server 不再需要管理员。搬的理由是授权需要
+// actor，而 lea-tools 没有；出网那一跳仍然留在 lea-tools（内部调
+// /internal/mcp/discover），因为不能让 lea-config 开始打用户填的任意 URL。
+//
+// `/test` 还在这边：它只连一下、写三列连通状态，**不碰 tools 表**。搬它的收益只有
+// "授权更细"，而它今天要 admin 这件事不挡任何人的路 —— 用户建完 server 直接 sync 就行，
+// sync 本身就会写连通状态。等有人真的需要"普通用户点一下测试"再搬。
 //
 // ## 为什么路径叫 mcp-actions 而不是直接映射 /admin/*
 //
 // 下游那个前缀就叫 /admin/mcp-servers，但**它不是"管理员专用"的意思** —— 那是历史命名
 // （见 lea_tools/api/admin_mcp.py 的文件头：那里以前有四组裸奔的 /admin/*，三组已删）。
-// 直接把 /api/user/admin/... 暴露出去会让人以为这是管理接口，而它现在是任何用户对
-// **自己的** server 都能调的。
+// 直接把 /api/user/admin/... 暴露出去会让人以为这是管理接口。
 //
-// 更要紧的是：只映射这两个动作，不是整个 /admin/ 前缀。开一个通向下游 /admin/* 的
+// 更要紧的是：只映射这一个动作，不是整个 /admin/ 前缀。开一个通向下游 /admin/* 的
 // 通道等于把那一侧将来新增的任何 admin 端点也一起暴露了。
-//
-// ⚠️ 授权在下游 _load_server：它要求 X-User-Role: admin。也就是说**普通用户现在调不通
-// sync** —— 这是个已知缺口，记在 session_attach_mcp_e2e.py 的 docstring 里。正确的修法
-// 是让 _load_server 认归属（自己的 server 自己能 sync），而那要先把 sync 搬到有 actor
-// 的 lea-config 那一侧（admin_mcp.py 文件头写的 P1）。这条反代先把路铺好。
 func UserMCPActionsProxy() gin.HandlerFunc {
 	target := os.Getenv("LEA_TOOLS_URL")
 	if target == "" {
 		target = "http://localhost:8400"
 	}
 	return userProxy(target, "bad LEA_TOOLS_URL: ", func(p string) string {
-		// /api/user/mcp-actions/7/sync → /admin/mcp-servers/7/sync
+		// /api/user/mcp-actions/7/test → /admin/mcp-servers/7/test
 		return strings.Replace(p, "/api/user/mcp-actions", "/admin/mcp-servers", 1)
 	})
 }

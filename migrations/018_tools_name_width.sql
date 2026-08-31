@@ -1,0 +1,41 @@
+-- 018: tools.name 放宽到 255
+--
+-- ## 为什么
+--
+-- MCP 工具名是 sync 生成的：`mcp_{server_id}_{远端名字}`。远端名字由**别人的服务**
+-- 决定，我们控制不了它的长度，而 `varchar(100)` 加上前缀之后很容易不够 ——
+-- `mcp_1234_` 就占了 9 个字符。超了的后果不是"这个工具没同步进来"，而是
+-- **整批 sync 在 commit 时炸**（一次 500，其余工具一个都没进去）。
+--
+-- 放开用户私有 MCP server 之后这条从"理论上可能"变成"迟早发生"：接哪个远端服务由
+-- 用户决定，而有些 MCP server 的工具名确实很长（带命名空间的那种，
+-- `notion_database_query_with_filters` 这类）。
+--
+-- ## 为什么是 255 而不是更大
+--
+-- `name` 在唯一索引 `uq_tools_owner_name(tenant_id, name, coalesce(owner_user_id,''))`
+-- 里，而 InnoDB 的索引键上限是 3072 字节。utf8mb4 每字符 4 字节，所以：
+--
+--     tenant_id      varchar(50)  = 200 字节
+--     owner_user_id  varchar(64)  = 256 字节
+--     ------------------------------------------
+--     剩给 name                    = 2616 字节 = 654 字符
+--
+-- 也就是说 255 有很大余量（1020 字节），而 654 是硬上限。选 255 是因为它是这类标识
+-- 列的常规宽度，而且留足了将来往那个索引里再加一列的空间 —— 挑 654 会把余量用光。
+--
+-- ⚠️ 代码侧 lea-tools 的 `_MAX_TOOL_NAME` 要跟着改。那个常量存在的理由不是"防止超过
+-- 这一列"（放宽之后基本不会超了），而是**在写库之前给出一个能看懂的拒绝**，而不是让
+-- 一次手滑变成整批 sync 的 500。两处不同步的后果：写小了是"明明放宽了还是被跳过"，
+-- 写大了是回到炸 commit。
+--
+-- ## 安全性
+--
+-- 纯放宽，不动数据。varchar 加宽在 MySQL 8 是 INSTANT DDL（不重建表），对现网 3xx 行
+-- 的 tools 表是毫秒级。可以随时跑，不需要停服。
+--
+-- 回滚：改回 varchar(100)。**但要先确认没有超过 100 的行**，否则会截断数据：
+--     SELECT id, name FROM tools WHERE CHAR_LENGTH(name) > 100;
+
+ALTER TABLE `tools` MODIFY COLUMN `name` VARCHAR(255)
+  COLLATE utf8mb4_unicode_ci NOT NULL;

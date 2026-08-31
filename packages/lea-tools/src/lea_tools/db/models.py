@@ -45,7 +45,14 @@ class Tool(Base):
     # 否则 .first() 会随机返回某个租户的工具配置（里面有 endpoint），
     # 从一个显式报错退化成静默的跨租户执行。
     tenant_id = Column(String(50), nullable=False, default=GLOBAL_TENANT_ID, index=True)
-    name = Column(String(100), nullable=False, index=True)
+    # 255，跟 lea-config 那份和 migrations/018 一致。100 对 MCP 工具不够 ——
+    # 名字是 sync 生成的 `mcp_{server_id}_{远端名字}`，远端名字由别人的服务决定，
+    # 超了会让**整批 sync 在 commit 时炸**（一次 500，其余工具一个都没进去）。
+    #
+    # ⚠️ 两个服务各定义一遍这张表，改宽度要一起改。create_all() 只建表不改表，所以
+    # 不同步的表现是"新环境建出来的宽度不对"，而现网因为跑过迁移是对的 —— 那种不一致
+    # 只在部署新环境时显形。
+    name = Column(String(255), nullable=False, index=True)
 
     # ⚠️ 归属三列在真实表里一直都有（lea-config 的 OwnerMixin 建的），这个模型以前
     # **不映射它们** —— 于是执行侧只能按 (租户, 名字) 找工具，表达不了"这是谁的工具"。

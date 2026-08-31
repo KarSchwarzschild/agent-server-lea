@@ -35,22 +35,22 @@
 同一个判据错误在 tool 和 skill 两轮各犯过一次：一次把 tool_use 当成"工具还在"，一次
 把延续格式当成"skill 还在"。两次的形状一样 —— 把模型的输出当成能力的证据。
 
-## ⚠️ 一个已知缺口：普通用户调不通自己 server 的 sync
+## sync 的授权：普通用户能同步自己的 server
 
-判据 ② 用的是带 admin 角色的 token，不是普通用户的。因为 lea-tools 的 `_load_server`
-第一件事就是 `if role != "admin": 403` —— 它是在"只有管理员能建 server"那个前提下写的。
+判据 ② 用的是**普通用户**的 token，这是这一轮修的东西。
 
-放开私有 server 之后那个前提没了，但那道门还在。所以今天的实际状态是：
+以前 sync 只在 lea-tools，那边的授权是 `if role != "admin": 403` —— 它判断不了"这是不是
+你的 server"，因为调用方是引擎不是浏览器，**没有 actor 概念**。于是实际状态是：
 
-    用户能建自己的 server        ✓（POST /api/user/mcp-servers/mine）
-    用户能 sync 自己的 server    ✗ 403，得管理员帮他点
+    用户能建自己的 server        ✓
+    用户能 sync 自己的 server    ✗ 403，得管理员帮他点 → 一个工具都不会有
 
-正确的修法是让 `_load_server` 认归属（自己的 server 自己能 sync），而那要先把 sync
-搬到有 actor 概念的 lea-config 那一侧 —— `admin_mcp.py` 文件头把这件事记为 P1，理由
-正是"lea-tools 没有 actor，判断不了这是不是你的"。
+现在 sync 在 lea-config（`POST /mcp-servers/{id}/sync`），那边有 actor，判据跟"能不能改
+这一行"是同一条（`_require_can_edit`）—— 因为 sync 会往库里写 tools 行。
 
-**这个脚本不绕过那道门去假装它不存在**，它用 admin token 跑通后面的链路，并把缺口写在
-这里。绕过的话就会攒出一条"验收通过但用户用不了"的路。
+**出网仍然在 lea-tools**（内部调 `/internal/mcp/discover`）。不搬过来是因为那会让
+lea-config 开始打用户填的任意 URL，而它装着所有租户的配置（含 llm_providers.api_key）。
+「哪个服务允许往用户填的地址发请求」是一条安全边界，越窄越好。见设计文档 §4.6。
 """
 
 from __future__ import annotations
@@ -97,23 +97,6 @@ def mint(user: str) -> str:
 
 def bearer(user: str) -> dict:
     return {"Authorization": f"Bearer {mint(user)}"}
-
-
-def admin_bearer(user: str) -> str:
-    """带 admin 角色的 JWT。
-
-    ⚠️ 只有 sync 需要它，而那是个**已知缺口**：lea-tools 的 _load_server 要求
-    X-User-Role: admin，所以普通用户调不通自己 server 的 sync。见模块 docstring。
-
-    反代按白名单把 JWT 里的 roles 下发成 X-User-Role（proxy.go 的 setUserRoleHeader），
-    所以这里把角色放进 token 而不是直接塞头 —— 塞头会被反代删掉，那正是它的作用。
-    """
-    import jwt
-    return jwt.encode(
-        {"sub": user, "tenant_id": TENANT, "roles": ["admin"],
-         "exp": int(time.time()) + 3600},
-        SECRET, algorithm="HS256",
-    )
 
 
 def turn_running(session_id: str, user: str) -> bool:
@@ -268,10 +251,10 @@ def main() -> int:
         else:
             print(f"    ✓ ① server_id={server_id} 归 {ALICE}")
 
-        step(2, "② sync —— 工具行归属要跟着 server 走")
+        step(2, "② sync —— 普通用户同步自己的 server，工具行归属跟着 server 走")
         r = requests.post(
-            f"{AGENT_URL}/api/user/mcp-actions/{server_id}/sync",
-            headers={"Authorization": f"Bearer {admin_bearer(ALICE)}"}, timeout=60,
+            f"{AGENT_URL}/api/user/mcp-servers/{server_id}/sync",
+            headers=bearer(ALICE), timeout=90,
         )
         print(f"    HTTP {r.status_code} {r.text[:220]}")
         if r.status_code != 200:

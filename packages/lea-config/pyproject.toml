@@ -15,7 +15,16 @@ dependencies = [
     "structlog>=24.0",
     "python-multipart>=0.0.9",
     "boto3>=1.35",
+    "esdk-obs-python>=3.26",
     "pyyaml>=6.0",
+    # 服务间调用。**只用来打内网的 lea-tools**（MCP sync 的出网那一跳，见
+    # api/mcp_servers.py::_discover_remote_tools）。
+    #
+    # ⚠️ 加这个依赖之前 lea-config 一次 HTTP 都不发 —— 那是一条有价值的性质，它让
+    # 这个服务的 egress 可以在 NetworkPolicy 里锁死。加了之后那条性质变成"只允许打
+    # lea-tools"，仍然可以锁，但**不要**让它演变成"什么都能打"：用户填的任意 URL 必须
+    # 继续由 lea-tools 那一侧出网，理由见 docs/02-技术方案/MCP_USER_SERVERS.md §4.6。
+    "httpx>=0.27",
     # 服务间鉴权（被调方中间件）。见 packages/lea-authkit。
     "lea-authkit",
 ]

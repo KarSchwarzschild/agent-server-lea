@@ -23,13 +23,15 @@
 
 from __future__ import annotations
 
+import os
+from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from lea_authkit import Actor, require_actor
+from lea_authkit import Actor, internal_headers, require_actor
 from lea_config.api._auth_helpers import require_admin
 from lea_config.database import get_db
 from lea_config.models.mcp_server import (
@@ -159,6 +161,66 @@ def _require_can_edit(s: MCPServer, actor: Actor) -> None:
     require_admin(actor)
     if not actor.is_platform_admin and s.tenant_id != actor.tenant_id:
         raise HTTPException(404, "MCP server not found")
+
+
+async def _discover_remote_tools(s: MCPServer) -> dict:
+    """内部调 lea-tools 去问远端有哪些工具。**出网发生在那一侧，不在这里。**
+
+    ## 为什么绕这一跳
+
+    「哪个服务允许往用户填的地址发请求」是一条安全边界，越窄越好。本服务装着所有租户
+    的配置（包括 llm_providers.api_key），让它能打任意 URL 才是真的把配置面暴露给
+    SSRF —— 所以出网留在 lea-tools，它本来就是那个"允许出网"的服务。
+
+    加 httpx 依赖之前本服务一次 HTTP 都不发。加了之后 egress 仍然可以在 NetworkPolicy
+    里锁到"只允许 lea-tools"，**不要**让它演变成"什么都能打"。
+
+    ## 传的是 endpoint 而不是 server_id
+
+    这样 lea-tools 那一跳查不到也改不了任何一行 —— 它连租户是什么都不知道，没有"调用方
+    自选租户"的余地。代价是 auth_config 在服务间传一次（内网 + internal_auth）。
+
+    ## 连不通不抛异常
+
+    返回 {"ok": False, "error": ...}，让调用方决定怎么表达。调用方要做两件事：把错误
+    写到那一行上（用户在列表里看得见），然后返 502。分开的理由是"发现失败"和"同步失败"
+    在语义上不是一回事，只有调用方知道它在做哪一件。
+    """
+    import httpx
+
+    base = os.getenv("LEA_TOOLS_URL", "http://localhost:8400").rstrip("/")
+    payload = {
+        "endpoint": s.endpoint,
+        "auth_config": s.auth_config,
+        "transport": s.transport,
+        "server_id": s.id,
+    }
+
+    # 60s：远端 MCP server 可能很慢，而这是个用户点了"同步"之后在等的动作。
+    # 比 30s 宽是因为一次 tools/list 可能要远端自己去查一圈。
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(
+                f"{base}/internal/mcp/discover",
+                json=payload,
+                headers=internal_headers(),
+            )
+    except httpx.HTTPError as e:
+        # lea-tools 本身不可达 —— 这不是"远端 MCP 连不通"，是我们自己的服务出问题了。
+        # 说清楚是哪一种，否则用户会以为自己的 URL 填错了。
+        return {"ok": False, "error": f"工具网关不可达: {type(e).__name__}: {e}"}
+
+    if r.status_code >= 400:
+        # 400 是 lea-tools 那边拒绝了这个 endpoint（url_guard / transport）。它的
+        # detail 是给人看的，原样带出去 —— 用户需要知道"你填的地址指向内网"这种事。
+        detail = ""
+        try:
+            detail = (r.json() or {}).get("detail", "")
+        except Exception:
+            detail = r.text[:200]
+        return {"ok": False, "error": detail or f"HTTP {r.status_code}"}
+
+    return r.json()
 
 
 @router.get("")
@@ -349,3 +411,137 @@ def delete_server(
 
     db.delete(s)
     db.commit()
+
+
+@router.post("/{mcp_id}/sync")
+async def sync_server_tools(
+    mcp_id: int,
+    db: Session = Depends(get_db),
+    actor: Actor = Depends(require_actor),
+):
+    """把远端暴露的工具同步成 `tools` 行。**用户能同步自己的 server。**
+
+    ## 为什么这个端点在这里，而出网在 lea-tools
+
+    sync 是三件事，各自该归谁不一样（设计见 docs/02-技术方案/MCP_USER_SERVERS.md §4.6）：
+
+        判断有没有资格同步    **本服务**   它有 actor，判断得了"这是不是你的"
+        打远端问 tools/list   lea-tools    它有 egress 和凭证
+        写 tools 行           **本服务**   那张表归它
+
+以前三件都在 lea-tools 的 `/admin/mcp-servers/{id}/sync`。那在"只有管理员能建 server"
+    的前提下是对的 —— 看一眼 `X-User-Role: admin` 就够了。放开用户私有 server 之后那个
+    前提没了：判断"这是不是 alice 的"需要 actor，而 lea-tools 的调用方是引擎不是浏览器，
+    它**没有 actor 概念**。于是实际状态变成「用户建得了自己的 server 但 sync 不了」。
+
+    ## 为什么不把出网也搬过来
+
+    第一版设计是那样，被推翻了：那会让本服务**开始打用户填的任意 URL**，而它今天一次
+    外网都不打 —— NetworkPolicy 可以把 egress 锁死。「哪个服务允许往用户填的地址发请求」
+    是一条安全边界，越窄越好。
+
+    代价是多一跳、`auth_config` 在服务间传一次（走 internal_auth，内网）。
+
+    ## 授权判据跟改这一行是同一条
+
+    用 `_require_can_edit` 而不是另写一套：sync **会往库里写**（tools 行，而工具行里有
+    mcp_server_id → 决定调用打到哪）。能不能 sync 和能不能改 endpoint 是同一个权限级别，
+    分开写迟早不一致。
+    """
+    s = _load_visible(db, actor, mcp_id)
+    _require_can_edit(s, actor)
+
+    if not s.enabled:
+        raise HTTPException(400, "MCP server is disabled")
+    if not s.endpoint:
+        raise HTTPException(400, "MCP server has no endpoint configured")
+
+    result = await _discover_remote_tools(s)
+    if not result.get("ok"):
+        # 连不通：把错误写到那一行上（用户在列表里看得见），然后 502。
+        #
+        # 这里返 502 而 /internal/mcp/discover 返 200 —— 不矛盾：对那个端点来说"测出
+        # 连不通"是成功完成了任务，对这个端点来说"同步"这件事确实失败了。
+        s.connection_status = "error"
+        s.last_error = (result.get("error") or "unknown")[:500]
+        db.commit()
+        raise HTTPException(502, f"连不上这个 MCP server: {s.last_error}")
+
+    tool_filter = s.tool_filter or []
+    synced: list[str] = []
+
+    # 先把这个 server 现有的工具行捞出来，按名字索引。一次查询 —— 一个 server 出几十个
+    # 工具是常态。
+    existing = {
+        t.name: t
+        for t in db.query(Tool).filter(
+            Tool.tenant_id == s.tenant_id,
+            Tool.mcp_server_id == s.id,
+        )
+    }
+
+    for rt in result.get("tools") or []:
+        name = (rt or {}).get("name", "")
+        if not name:
+            continue
+        if tool_filter and name not in tool_filter:
+            continue
+
+        # 前缀带 server_id：工具名只在单个 MCP server 内唯一，聚合多个必然撞（GitHub 和
+        # Linear 都有 create_issue）。server_id 全局唯一，所以 alice 和 bob 各接一个
+        # Notion 是两行 server、两批不撞的名字。
+        full_name = f"mcp_{s.id}_{name}"
+
+        # schema 落 schema_json —— **执行器和下发链路读的都是这一列**。写成 input_schema
+        # 的话工具建得出来、列得出来，到了模型面前没有参数。
+        schema = rt.get("inputSchema") or {"type": "object"}
+        description = rt.get("description", "")
+
+        if row := existing.get(full_name):
+            row.schema_json = schema
+            row.description = description
+            row.enabled = True
+            # 归属跟着重新对齐，**不能只在新建时设**。server 的归属会变（上架审核把私有
+            # 改成 platform、或者收回），而工具行是它的投影：
+            #
+            #   上架后不同步  →  工具还挂在原主人名下，「上架了但别人看不到」
+            #   收回后不同步  →  工具仍然全租户可见，**收回不生效**（安全问题）
+            row.owner_scope = s.owner_scope
+            row.owner_user_id = s.owner_user_id
+        else:
+            db.add(Tool(
+                tenant_id=s.tenant_id,
+                name=full_name,
+                display_name=f"[MCP] {name}",
+                description=description,
+                execution_type="mcp",
+                schema_json=schema,
+                mcp_server_id=s.id,
+                # 归属跟着 **server 那一行**走，不是跟着触发 sync 的人走：管理员帮 alice
+                # 同步她的 server，工具也该归 alice。
+                owner_scope=s.owner_scope,
+                owner_user_id=s.owner_user_id,
+                enabled=True,
+            ))
+        synced.append(full_name)
+
+    # 远端已经没有的：删掉。不删的话留下一批调用必然失败的工具，而它们仍然出现在清单里、
+    # 仍然能被绑定 —— 模型会去调一个上游已经下线的东西。
+    #
+    # 集合差集，**不是 delete-all-then-insert**：那个中间窗口里别的请求会读到一份空清单，
+    # 表现是"工具偶尔全没了"。
+    stale = [row for nm, row in existing.items() if nm not in set(synced)]
+    for row in stale:
+        db.delete(row)
+
+    s.last_sync_at = datetime.utcnow()
+    s.connection_status = "connected"
+    s.last_connected_at = datetime.utcnow()
+    s.last_error = None
+    db.commit()
+
+    return {
+        "synced": len(synced),
+        "tools": synced,
+        "removed": [r.name for r in stale],
+    }

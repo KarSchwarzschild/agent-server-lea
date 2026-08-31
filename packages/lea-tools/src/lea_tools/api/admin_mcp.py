@@ -35,6 +35,7 @@ server」，而那个 server 属于谁已经在库里定了。
 
 from datetime import datetime
 
+import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy.orm import Session
 
@@ -43,7 +44,26 @@ from lea_tools.db.models import MCPServer, Tool
 from lea_tools.executor.mcp_proxy import MCPSession, check_transport
 from lea_tools.executor.url_guard import check_outbound_url
 
+log = structlog.get_logger(__name__)
+
 router = APIRouter(prefix="/admin/mcp-servers", tags=["admin-mcp"])
+
+# tools.name 那一列的宽度（migrations/018 放宽到 255）。
+#
+# ## 放宽之后为什么还留这道检查
+#
+# 不是为了"防止超过列宽"—— 255 对正常的 MCP 工具名绰绰有余。它防的是**远端返回一个
+# 荒谬的长名字**：那是不可信输入，而超了列宽的后果不是"这个工具没进来"，是
+# `db.commit()` 抛异常 → 整批 sync 500 → 其余工具一个都没同步进去。
+#
+# 也就是说这道检查把"一个坏工具搞掉整次同步"降级成"跳过那一个，其余照常"。
+#
+# 故意写死数字而不是 import lea-config 的模型：两个服务分开部署，跟 OWNER_SCOPE_* /
+# MCP_TRANSPORT_* 各定义一遍是同一个取舍。
+#
+# ⚠️ 改库里那一列的宽度时这里要跟着改。写小了是"明明放宽了还是被跳过"，写大了是回到
+# 炸 commit。
+_MAX_TOOL_NAME = 255
 
 
 def _load_server(db: Session, server_id: int, tenant_id: str, role: str) -> MCPServer:
@@ -178,6 +198,9 @@ async def sync_mcp_tools(
 
     tool_filter = server.tool_filter or []
     synced: list[str] = []
+    # 因为名字太长被跳过的。**要报出来** —— 静默跳过的话用户看到"少了几个工具"而任何
+    # 地方都查不到原因，跟挂载那边 dropped 要带 reason 是同一条判断。
+    skipped: list[str] = []
 
     # 先把这个 server 现有的工具行捞出来，按名字索引。一次查询，避免每个远端工具
     # 各查一次 —— 一个 server 出几十个工具是常态。
@@ -200,6 +223,15 @@ async def sync_mcp_tools(
         # 撞（GitHub 和 Linear 都有 create_issue）。server_id 本身唯一，所以 alice 和
         # bob 各接一个 Notion 是两行 server、两批不撞的名字。
         full_name = f"mcp_{server.id}_{name}"
+
+        # tools.name 是 String(100)，超了会在 db.commit() 时炸 —— 而那一炸是整批
+        # sync 失败，不只是这一个工具。远端不可信：它可以返回任意长的名字。
+        #
+        # 跳过而不是截断：截断会把 `very_long_..._123` 和 `very_long_..._456` 变成同一个
+        # 名字，后者静默覆盖前者 —— 那比少一个工具糟得多（模型调 A 实际执行 B）。
+        if len(full_name) > _MAX_TOOL_NAME:
+            skipped.append(name)
+            continue
 
         # schema 落 schema_json —— **执行器和下发链路读的都是这一列**。写成
         # input_schema 的话工具建得出来、列得出来、到了模型面前没有参数。
@@ -252,8 +284,21 @@ async def sync_mcp_tools(
     server.last_sync_at = datetime.utcnow()
     _record(server, None)
     db.commit()
+    if skipped:
+        # 日志 + 响应两处都报。响应给点了同步按钮的人看；日志给"用户说少了个工具"
+        # 时的排查用 —— 那种问题用户描述不清，只能靠日志复原。
+        log.warning(
+            "mcp_sync_skipped_long_names",
+            server_id=server.id,
+            tenant_id=server.tenant_id,
+            skipped=skipped,
+            limit=_MAX_TOOL_NAME,
+        )
     return {
         "synced": len(synced),
         "tools": synced,
         "removed": [r.name for r in stale],
+        # 名字加上 mcp_{id}_ 前缀之后超过 tools.name 的宽度，只能跳过（截断会让两个
+        # 不同的工具变成同一个名字）。空列表是常态，不是特例。
+        "skipped_too_long": skipped,
     }

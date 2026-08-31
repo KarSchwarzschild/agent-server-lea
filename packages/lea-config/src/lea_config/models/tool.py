@@ -93,7 +93,14 @@ class Tool(OwnerMixin, TenantMixin, Base):
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    name = Column(String(100), nullable=False, index=True)
+    # 255 而不是 100（migrations/018 放宽的）。MCP 工具名是 sync 生成的
+    # `mcp_{server_id}_{远端名字}`，而远端名字由**别人的服务**决定 —— 100 加上前缀
+    # 很容易不够，而超了的后果是整批 sync 在 commit 时炸，不是"少一个工具"。
+    #
+    # 上限受唯一索引约束：uq_tools_owner_name 是 (tenant_id, name, owner_user_id)，
+    # InnoDB 索引键 3072 字节 ÷ utf8mb4 的 4 字节，减掉另两列，name 最多 654 字符。
+    # 255 留了余量，好让将来往那个索引里再加一列时不用先缩这一列。
+    name = Column(String(255), nullable=False, index=True)
     display_name = Column(String(200), default="")
     description = Column(Text, default="")
     category = Column(String(50), default="general")

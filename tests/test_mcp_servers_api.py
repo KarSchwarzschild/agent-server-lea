@@ -436,3 +436,232 @@ def test_cross_tenant_private_server_is_404(client):
     sid = mk_mine(client, _headers=h(user="alice", tenant=T1, role="user")).json()["id"]
     r = client.get(f"/mcp-servers/{sid}", headers=h(user="alice", tenant=T2, role="user"))
     assert r.status_code == 404
+
+
+# ── sync：用户能同步自己的 server ─────────────────────────────────────────
+#
+# 这是"用户能自助用起来"的最后一环。以前 sync 只在 lea-tools，那边的授权是
+# `if role != "admin": 403` —— 它判断不了"这是不是你的"，因为没有 actor 概念。
+# 于是实际状态是「用户建得了自己的 server 但 sync 不了」，一个工具都不会有。
+#
+# 出网**仍然在 lea-tools**（内部调 /internal/mcp/discover）。不搬过来是因为那会让
+# lea-config 开始打用户填的任意 URL，而它装着所有租户的配置 —— 见
+# docs/02-技术方案/MCP_USER_SERVERS.md §4.6。
+
+
+def fake_discover(monkeypatch, tools=None, *, ok=True, error="boom"):
+    """替掉出网那一跳。**不打真 DNS、不起 server。**
+
+    验的是这一侧的鉴权 + 写表；出网那一跳自己有测试（lea-tools 的 test_url_guard /
+    test_mcp_p0）。让这里依赖真网络会让它在断网时变红，而那种红跟代码无关。
+    """
+    async def _fake(s):
+        if not ok:
+            return {"ok": False, "error": error}
+        return {"ok": True, "tools": tools if tools is not None else [
+            {"name": "search", "description": "搜", "inputSchema": {"type": "object"}},
+            {"name": "create", "description": "建", "inputSchema": {"type": "object"}},
+        ]}
+
+    monkeypatch.setattr("lea_config.api.mcp_servers._discover_remote_tools", _fake)
+
+
+def test_owner_can_sync_own_server(client, monkeypatch):
+    """**这条就是这轮要修的东西。** 普通用户同步自己的 server → 200。"""
+    fake_discover(monkeypatch)
+    sid = mk_mine(client).json()["id"]
+
+    r = client.post(f"/mcp-servers/{sid}/sync", headers=h(user="alice", role="user"))
+    assert r.status_code == 200, r.text
+    assert r.json()["synced"] == 2
+
+
+def test_synced_tools_inherit_the_server_ownership(client, monkeypatch):
+    """alice 私有 server → 工具行也归 alice。
+
+    不继承的话那些工具**全租户可见**，别人绑定、调用一路通，用的是 alice 的 key。
+    """
+    from lea_config.models.tool import Tool
+
+    fake_discover(monkeypatch)
+    sid = mk_mine(client).json()["id"]
+    client.post(f"/mcp-servers/{sid}/sync", headers=h(user="alice", role="user"))
+
+    db = client.Session()
+    try:
+        rows = db.query(Tool).filter_by(mcp_server_id=sid).all()
+        assert len(rows) == 2
+        for row in rows:
+            assert row.owner_scope == "user"
+            assert row.owner_user_id == "alice"
+            assert row.execution_type == "mcp"
+            # 名字带 server_id 前缀 —— 两个 server 各有一个 search 时不撞
+            assert row.name.startswith(f"mcp_{sid}_")
+    finally:
+        db.close()
+
+
+def test_another_user_cannot_sync_my_server(client, monkeypatch):
+    """bob 同步 alice 的 server → 404。
+
+    sync **会往库里写**（tools 行，而工具行里有 mcp_server_id → 决定调用打到哪），
+    所以它跟改 endpoint 是同一个权限级别。
+    """
+    fake_discover(monkeypatch)
+    sid = mk_mine(client).json()["id"]
+
+    r = client.post(f"/mcp-servers/{sid}/sync", headers=h(user="bob", role="user"))
+    assert r.status_code == 404
+
+
+def test_tenant_admin_cannot_sync_someone_elses_private_server(client, monkeypatch):
+    """管理员也不能 —— 判据是归属，不是角色。见 _require_can_edit。"""
+    fake_discover(monkeypatch)
+    sid = mk_mine(client).json()["id"]
+
+    r = client.post(f"/mcp-servers/{sid}/sync", headers=h(user="admin1", role="admin"))
+    assert r.status_code == 404
+
+
+def test_platform_server_sync_still_requires_admin(client, monkeypatch):
+    """平台级的仍然要管理员 —— 放开私有不该顺带放开平台级。"""
+    fake_discover(monkeypatch)
+    sid = mk(client).json()["id"]
+
+    assert client.post(f"/mcp-servers/{sid}/sync",
+                       headers=h(user="alice", role="user")).status_code == 403
+    assert client.post(f"/mcp-servers/{sid}/sync",
+                       headers=h(user="admin1", role="admin")).status_code == 200
+
+
+def test_sync_is_idempotent(client, monkeypatch):
+    """跑两遍不该出现重复行 —— 两个副本或两次点击都可能并发。"""
+    from lea_config.models.tool import Tool
+
+    fake_discover(monkeypatch)
+    sid = mk_mine(client).json()["id"]
+    hdr = h(user="alice", role="user")
+    client.post(f"/mcp-servers/{sid}/sync", headers=hdr)
+    client.post(f"/mcp-servers/{sid}/sync", headers=hdr)
+
+    db = client.Session()
+    try:
+        assert db.query(Tool).filter_by(mcp_server_id=sid).count() == 2
+    finally:
+        db.close()
+
+
+def test_sync_removes_tools_the_remote_no_longer_exposes(client, monkeypatch):
+    """远端下线的工具要删掉。
+
+    不删的话留下一批调用必然失败的工具，而它们仍然出现在清单里、仍然能被挂载 ——
+    模型会去调一个上游已经没有的东西。
+    """
+    from lea_config.models.tool import Tool
+
+    fake_discover(monkeypatch)
+    sid = mk_mine(client).json()["id"]
+    hdr = h(user="alice", role="user")
+    client.post(f"/mcp-servers/{sid}/sync", headers=hdr)
+
+    # 远端只剩 search
+    fake_discover(monkeypatch, tools=[
+        {"name": "search", "description": "搜", "inputSchema": {"type": "object"}},
+    ])
+    r = client.post(f"/mcp-servers/{sid}/sync", headers=hdr)
+    assert r.json()["removed"] == [f"mcp_{sid}_create"]
+
+    db = client.Session()
+    try:
+        names = [t.name for t in db.query(Tool).filter_by(mcp_server_id=sid)]
+        assert names == [f"mcp_{sid}_search"]
+    finally:
+        db.close()
+
+
+def test_sync_honours_the_tool_filter(client, monkeypatch):
+    """tool_filter 非空时只同步列出的那几个。"""
+    fake_discover(monkeypatch)
+    sid = mk_mine(client, tool_filter=["search"]).json()["id"]
+
+    r = client.post(f"/mcp-servers/{sid}/sync", headers=h(user="alice", role="user"))
+    assert r.json()["tools"] == [f"mcp_{sid}_search"]
+
+
+def test_unreachable_remote_records_the_error_and_returns_502(client, monkeypatch):
+    """连不通 → 把错误写到那一行上（用户在列表里看得见），然后 502。
+
+    写库这一步不能省：否则用户点了同步、看到一个红条，而刷新之后那一行还显示
+    connection_status='unknown' —— 他不知道刚才那次到底发生了什么。
+    """
+    fake_discover(monkeypatch, ok=False, error="ConnectError: name resolution failed")
+    sid = mk_mine(client).json()["id"]
+
+    r = client.post(f"/mcp-servers/{sid}/sync", headers=h(user="alice", role="user"))
+    assert r.status_code == 502
+
+    got = client.get(f"/mcp-servers/{sid}", headers=h(user="alice", role="user")).json()
+    assert got["connection_status"] == "error"
+    assert "name resolution failed" in got["last_error"]
+
+
+def test_successful_sync_clears_a_previous_error(client, monkeypatch):
+    """修好 URL 之后再同步，那三列要跟着变回 connected。
+
+    不清的话「error」会一直挂在一个已经好了的行上 —— 而 last_error 是用户判断"我改对了
+    没有"的唯一依据。
+    """
+    sid = mk_mine(client).json()["id"]
+    hdr = h(user="alice", role="user")
+
+    fake_discover(monkeypatch, ok=False, error="boom")
+    client.post(f"/mcp-servers/{sid}/sync", headers=hdr)
+
+    fake_discover(monkeypatch)
+    assert client.post(f"/mcp-servers/{sid}/sync", headers=hdr).status_code == 200
+
+    got = client.get(f"/mcp-servers/{sid}", headers=hdr).json()
+    assert got["connection_status"] == "connected"
+    assert got["last_error"] == ""
+    assert got["last_sync_at"]
+
+
+def test_sync_on_a_disabled_server_is_400(client, monkeypatch):
+    fake_discover(monkeypatch)
+    sid = mk_mine(client).json()["id"]
+    hdr = h(user="alice", role="user")
+    client.patch(f"/mcp-servers/{sid}/enable", json={"enabled": False}, headers=hdr)
+
+    r = client.post(f"/mcp-servers/{sid}/sync", headers=hdr)
+    assert r.status_code == 400
+    assert "disabled" in r.text
+
+
+def test_sync_does_not_reach_the_remote_before_authorization(client, monkeypatch):
+    """**授权在出网之前。**
+
+    反过来的话，任何**看得见**这个 server 的人都能让服务端去连它一次 —— 那既是一次
+    越权的出网，也会把连通状态写到别人的行上。
+
+    ## 场景必须是"看得见但改不了"
+
+    第一版用 bob 打 alice 的私有 server，那条是**空验的**：bob 在 _load_visible 就被
+    404 了，永远走不到出网，所以不管 _require_can_edit 在哪它都绿（变异验证抓出来的
+    —— 把授权挪到出网之后，那一版照样 47 passed）。
+
+    平台级 server 是唯一同时满足两条的场景：普通用户看得见它（visible_to 放行
+    platform），但改不了（_require_can_edit 要 admin）。于是这条测试才真的落在
+    "授权 vs 出网"的顺序上。
+    """
+    called = []
+
+    async def _spy(s):
+        called.append(s.id)
+        return {"ok": True, "tools": []}
+
+    monkeypatch.setattr("lea_config.api.mcp_servers._discover_remote_tools", _spy)
+    sid = mk(client).json()["id"]   # 平台级：alice 看得见，但不该能同步
+
+    r = client.post(f"/mcp-servers/{sid}/sync", headers=h(user="alice", role="user"))
+    assert r.status_code == 403
+    assert called == [], "鉴权失败了却已经去连远端了"

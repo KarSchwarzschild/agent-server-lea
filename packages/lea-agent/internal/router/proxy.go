@@ -40,9 +40,21 @@ func UserConfigProxy() gin.HandlerFunc {
 	if target == "" {
 		target = "http://localhost:8500"
 	}
+	return userProxy(target, "bad LEA_CONFIG_URL: ", func(p string) string {
+		// /api/user/agents/... → /agents/...
+		return strings.TrimPrefix(p, "/api/user")
+	})
+}
+
+// userProxy 是这一组反代的公共实现：注入身份、注入服务间密钥、重写路径。
+//
+// 抽出来是因为 lea-tools 也需要一条（MCP 的 /test /sync 在那一侧），而这三件事一件都
+// 不能漏 —— 尤其身份注入的三个头必须 Set-或-Del，"不管"等于把客户端伪造的值转给下游。
+// 复制一份的话下一个人只会照抄看得见的部分。
+func userProxy(target, panicPrefix string, rewrite func(string) string) gin.HandlerFunc {
 	upstream, err := url.Parse(target)
 	if err != nil {
-		panic("bad LEA_CONFIG_URL: " + err.Error())
+		panic(panicPrefix + err.Error())
 	}
 	proxy := httputil.NewSingleHostReverseProxy(upstream)
 
@@ -55,8 +67,7 @@ func UserConfigProxy() gin.HandlerFunc {
 	origDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
 		origDirector(req)
-		// /api/user/agents/... → /agents/...
-		req.URL.Path = strings.TrimPrefix(req.URL.Path, "/api/user")
+		req.URL.Path = rewrite(req.URL.Path)
 		req.Host = upstream.Host
 		if internalToken != "" {
 			// 设在 Director 里而不是下面的 handler 里：ReverseProxy 会先 Clone 一份
@@ -99,8 +110,8 @@ func UserConfigProxy() gin.HandlerFunc {
 // 下游 lea_authkit 那边也**独立**拒绝 platform_admin 头 —— 两侧都挡，任一侧
 // 被误改都不会立刻破防。
 var proxiedRoles = map[string]bool{
-    "admin":          true,
-    "platform_admin": true,
+	"admin":          true,
+	"platform_admin": true,
 }
 
 // setUserRoleHeader 按 JWT 已验过的 roles 设置 X-User-Role，没有可下发的就删掉。
@@ -144,4 +155,51 @@ func UserSkillsProxy() gin.HandlerFunc {
 
 func UserToolsProxy() gin.HandlerFunc {
 	return UserConfigProxy()
+}
+
+// UserMCPServersProxy 反代 /api/user/mcp-servers/* → lea-config 的 /mcp-servers/*。
+//
+// 放开用户私有 MCP server 之后这条路是必需的：用户要建、列、改、删自己的 server，而
+// lea-config 不对外暴露（验证栈里只有 nginx 的 8080 通向 lea-agent，线上同理）。少了
+// 它的话「用户能建自己的 server」在接口上是**够不着的** —— 库和 CRUD 都对了，但前端
+// 没有路。
+//
+// 授权仍然在 lea-config 那一侧（require_actor + visible_to + _require_can_edit）；
+// 这里只做身份注入，跟另外三条完全一样。
+func UserMCPServersProxy() gin.HandlerFunc {
+	return UserConfigProxy()
+}
+
+// UserMCPActionsProxy 反代 /api/user/mcp-actions/{id}/{test,sync} → lea-tools 的
+// /admin/mcp-servers/{id}/{test,sync}。
+//
+// ## 为什么必须有这一条
+//
+// 建完 server 得 sync 一次才有工具行（sync = 连上去问 tools/list，把答案落成 tools
+// 表的行）。而那两个端点在 **lea-tools**，同样不对外暴露。少了它，用户建出来的 server
+// 永远是 0 个工具 —— 挂上去什么也不会多，而 resolve 那边只会报一句"大概还没 sync"。
+//
+// ## 为什么路径叫 mcp-actions 而不是直接映射 /admin/*
+//
+// 下游那个前缀就叫 /admin/mcp-servers，但**它不是"管理员专用"的意思** —— 那是历史命名
+// （见 lea_tools/api/admin_mcp.py 的文件头：那里以前有四组裸奔的 /admin/*，三组已删）。
+// 直接把 /api/user/admin/... 暴露出去会让人以为这是管理接口，而它现在是任何用户对
+// **自己的** server 都能调的。
+//
+// 更要紧的是：只映射这两个动作，不是整个 /admin/ 前缀。开一个通向下游 /admin/* 的
+// 通道等于把那一侧将来新增的任何 admin 端点也一起暴露了。
+//
+// ⚠️ 授权在下游 _load_server：它要求 X-User-Role: admin。也就是说**普通用户现在调不通
+// sync** —— 这是个已知缺口，记在 session_attach_mcp_e2e.py 的 docstring 里。正确的修法
+// 是让 _load_server 认归属（自己的 server 自己能 sync），而那要先把 sync 搬到有 actor
+// 的 lea-config 那一侧（admin_mcp.py 文件头写的 P1）。这条反代先把路铺好。
+func UserMCPActionsProxy() gin.HandlerFunc {
+	target := os.Getenv("LEA_TOOLS_URL")
+	if target == "" {
+		target = "http://localhost:8400"
+	}
+	return userProxy(target, "bad LEA_TOOLS_URL: ", func(p string) string {
+		// /api/user/mcp-actions/7/sync → /admin/mcp-servers/7/sync
+		return strings.Replace(p, "/api/user/mcp-actions", "/admin/mcp-servers", 1)
+	})
 }

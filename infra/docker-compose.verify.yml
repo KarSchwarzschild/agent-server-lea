@@ -46,6 +46,9 @@ x-agent-common: &agent-common
     LEA_TOOLS_URL: http://lea-tools:8400
     # 排空超时调短，验证时不想等 3 分钟。生产保持默认。
     LEA_AGENT_DRAIN_TIMEOUT: 30s
+    # 服务间鉴权的共享密钥，三个服务必须一致（见 lea-config 那段说明）。
+    # 反代（proxy.go）用它给发往 lea-config / lea-tools 的请求签身份。
+    LEA_INTERNAL_TOKEN: verify-internal-token
   depends_on:
     lea-config: {condition: service_healthy}
   restart: unless-stopped
@@ -100,6 +103,15 @@ services:
     image: lea-config:dev
     container_name: verify-lea-config
     env_file: [../.env]
+    environment:
+      # 服务间鉴权的共享密钥。**必须跟 agent 那边一样**，否则 lea-config 的
+      # require_actor 会 503 "identity source not trustworthy" —— 没有可信来源时它
+      # 拒绝一切头注入的身份，那是对的（不然任何人加个 X-User-Role: admin 就是管理员）。
+      #
+      # 以前验证栈不配这个，因为所有 e2e 都直接操作数据库建资源、只经 lea-agent 发消息。
+      # 用户自己建 MCP server 是第一条**真的要走反代到 lea-config** 的链路，所以这里
+      # 才需要它。线上必然是配的，所以配上比开 ALLOW_UNTRUSTED_HEADERS 更接近真实。
+      LEA_INTERNAL_TOKEN: verify-internal-token
     restart: unless-stopped
 
   # ⚠️ 这个本地 lea-tools 只是让链路完整，**不能用来验证沙箱的文件行为。**
@@ -122,4 +134,16 @@ services:
     env_file: [../.env]
     environment:
       REDIS_URL: redis://202.205.160.9:26379/0
+      # 同一个共享密钥（见 lea-config 那段）。MCP 的 /test /sync 经 lea-agent 反代
+      # 打进来，install_internal_auth 的中间件校验的就是它。
+      LEA_INTERNAL_TOKEN: verify-internal-token
+      # 放行假 MCP server 的主机名。
+      #
+      # ⚠️ **只在验证台设。** url_guard 会正确地拦住 host.docker.internal ——
+      # 从容器看宿主机是 192.168.65.254，那是内网。而真链路验收必须连一个真的 MCP
+      # server，它只能跑在宿主机上。
+      #
+      # 白名单只放行这一个名字，别的内网地址照样拦（见 test_url_guard.py 那组）。
+      # 生产设了它就是给自己开一个指定名字的 SSRF 通道。
+      LEA_SSRF_HOST_ALLOWLIST: host.docker.internal
     restart: unless-stopped

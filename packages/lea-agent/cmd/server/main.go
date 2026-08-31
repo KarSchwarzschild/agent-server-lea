@@ -61,6 +61,17 @@ func main() {
 	// /api/user/tools/* → lea-config:8500/tools/* （用户动态工具管理）
 	api.Any("/user/tools", router.UserToolsProxy())
 	api.Any("/user/tools/*path", router.UserToolsProxy())
+	// /api/user/mcp-servers/* → lea-config:8500/mcp-servers/*
+	//
+	// 放开用户私有 MCP server 之后必需：lea-config 不对外暴露，少了这条，「用户能建
+	// 自己的 server」在接口上够不着 —— 库和 CRUD 都对，但前端没有路可走。
+	api.Any("/user/mcp-servers", router.UserMCPServersProxy())
+	api.Any("/user/mcp-servers/*path", router.UserMCPServersProxy())
+	// /api/user/mcp-actions/{id}/{test,sync} → lea-tools:8400/admin/mcp-servers/{id}/...
+	//
+	// 建完 server 要 sync 一次才有工具行，而那个端点在 lea-tools。只映射这两个动作、
+	// 不映射整个 /admin/ 前缀 —— 见 UserMCPActionsProxy 的说明。
+	api.Any("/user/mcp-actions/*path", router.UserMCPActionsProxy())
 
 	router.RegisterRoutes(api, mgr)
 	router.RegisterDebugRoutes(api)

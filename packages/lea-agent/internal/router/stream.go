@@ -43,6 +43,7 @@ func handleSendStream(mgr *session.Manager) gin.HandlerFunc {
 			AgentID:   req.AgentID,
 			TenantID:  c.GetString("tenant_id"),
 			UserID:    c.GetString("user_id"),
+			ProjectID: req.ProjectID,
 		})
 		if err != nil {
 			if errors.Is(err, session.ErrForbidden) {

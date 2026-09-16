@@ -43,8 +43,8 @@ _SHA_RE = re.compile(r"^[0-9a-f]{8,128}$")
 _client = None
 
 
-def _s3_client():
-    """复用 boto3 client。Skill 包使用 OBS 的 S3 兼容接口。
+def _get_obs_client():
+    """复用华为 OBS 官方客户端。Skill 包使用 OBS 原生接口。
 
     注意不能用 lea-tools 自己的 S3_* —— 那套指向 lea-sandbox-volumes bucket，
     skill 包在 lea-uploads 里，是两个不同 bucket（甚至可能不同实例）。
@@ -53,22 +53,39 @@ def _s3_client():
     global _client
     if _client is not None:
         return _client
+    from obs import ObsClient
+
+    endpoint = os.getenv("OBS_ENDPOINT") or os.getenv("SKILL_S3_ENDPOINT") or os.getenv("MINIO_ENDPOINT", "http://localhost:9000")
+    _client = ObsClient(
+        access_key_id=os.getenv("OBS_ACCESS_KEY") or os.getenv("MINIO_ACCESS_KEY", "minioadmin"),
+        secret_access_key=os.getenv("OBS_SECRET_KEY") or os.getenv("MINIO_SECRET_KEY", "minioadmin"),
+        server=endpoint.removeprefix("https://").removeprefix("http://").rstrip("/"),
+        region=os.getenv("OBS_REGION", "cn-north-4"),
+        is_secure=endpoint.startswith("https://"),
+        path_style=os.getenv("OBS_ADDRESSING_STYLE", "path") == "path",
+    )
+    return _client
+
+
+def _get_minio_client():
     import boto3
     from botocore.client import Config as BotoConfig
 
-    endpoint = os.getenv("OBS_ENDPOINT") or os.getenv("SKILL_S3_ENDPOINT") or os.getenv("MINIO_ENDPOINT", "http://localhost:9000")
-    _client = boto3.client(
+    return boto3.client(
         "s3",
-        endpoint_url=endpoint,
-        aws_access_key_id=os.getenv("OBS_ACCESS_KEY") or os.getenv("MINIO_ACCESS_KEY", "minioadmin"),
-        aws_secret_access_key=os.getenv("OBS_SECRET_KEY") or os.getenv("MINIO_SECRET_KEY", "minioadmin"),
-        config=BotoConfig(
-            signature_version="s3v4",
-            s3={"addressing_style": os.getenv("OBS_ADDRESSING_STYLE", "path")},
-        ),
-        region_name=os.getenv("OBS_REGION", "cn-north-4"),
+        endpoint_url=os.getenv("MINIO_ENDPOINT", "http://localhost:9000"),
+        aws_access_key_id=os.getenv("MINIO_ACCESS_KEY", "minioadmin"),
+        aws_secret_access_key=os.getenv("MINIO_SECRET_KEY", "minioadmin"),
+        config=BotoConfig(signature_version="s3v4"),
+        region_name="us-east-1",
     )
-    return _client
+
+
+def _storage_backend() -> str:
+    configured = os.getenv("OBJECT_STORAGE", "").strip().lower()
+    if configured in {"obs", "minio"}:
+        return configured
+    return "obs" if os.getenv("OBS_ACCESS_KEY") else "minio"
 
 
 def parse_bundle_uri(uri: str) -> tuple[str, str]:
@@ -147,7 +164,13 @@ def ensure_cached(bucket: str, key: str, sha: str) -> Path:
     tmp.mkdir(parents=True)
 
     try:
-        raw = _s3_client().get_object(Bucket=bucket, Key=key)["Body"].read()
+        if _storage_backend() == "obs":
+            response = _get_obs_client().getObject(bucket, key)
+            if response.status >= 300:
+                raise ValueError(f"OBS get object failed: {response.status}")
+            raw = response.body.response.read()
+        else:
+            raw = _get_minio_client().get_object(Bucket=bucket, Key=key)["Body"].read()
         with zipfile.ZipFile(io.BytesIO(raw)) as zf:
             _safe_extract(zf, tmp, cfg.skills_quota_mb * 1024 * 1024)
         # 解压完必须有 SKILL.md，否则这个 bundle 对 LLM 毫无用处。

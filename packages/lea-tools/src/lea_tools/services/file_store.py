@@ -38,6 +38,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from weakref import WeakValueDictionary
 
+# 配额异常复用物化那条路已有的类型，不新造一个：调用方（api/files.py）已经有一段把
+# 它翻成 507 加中文提示的代码，两个异常类型会让那段变成两个分支，而用户看到的应该是
+# 同一句话 —— "这个会话的文件配额满了"，不该因为是谁写的而不同。
+from lea_tools.services.file_stager import QuotaExceeded
+
 _HIDDEN_DIRS = frozenset({
     "__pycache__", ".ipynb_checkpoints", ".cache",
     ".pytest_cache", ".mypy_cache", ".git", ".venv",
@@ -49,6 +54,15 @@ MAX_ENTRIES = 2000
 # skill bundle 在沙箱里的挂载点（nfs_provisioner 的 mountPath，RO）。读侧接受这个
 # 前缀并映射到宿主的 `sessions/{sid}/skills`，因为模型看到的路径就是它。
 SKILL_MOUNT = "/opt/skills"
+
+# 用户上传的原件在沙箱里的挂载点（RO）。跟 SKILL_MOUNT 完全同一个机制：workspace 的
+# 同级目录，通过绝对前缀让读侧放行、写侧仍走严格的 _resolve。
+#
+# ⚠️ 这个常量是**下发给模型的路径**的唯一来源：nfs_provisioner 用它做 mountPath、
+# 读侧用它做前缀、lea-agent 用它拼注入文本里那句"文件在 X"。三处对不上的后果是模型
+# 拿着一个不存在的路径去 open()，而报错会是"文件不存在"——看起来像物化失败，实际是
+# 路径约定不一致，排查会绕远。所以别在任何地方硬写这个字符串。
+UPLOADS_MOUNT = "/mnt/uploads"
 
 
 @dataclass
@@ -119,11 +133,78 @@ class NFSFileStore:
 
     kind = "nfs"
 
-    def __init__(self, workspace: Path):
+    def __init__(self, workspace: Path, quota_bytes: int = 0):
         self._ws = workspace
+        # 0 = 不限。构造方（get_file_store）从 NFS_WORKSPACE_QUOTA_MB 取值；
+        # 单测和一次性脚本可以直接不传。
+        self._quota = quota_bytes
 
     def available(self) -> bool:
         return self._ws.is_dir()
+
+    def session_bytes(self) -> int:
+        """会话在共享存储上的占用：`workspace/` + `uploads/`。
+
+        ## 为什么算整个会话目录，不只是 workspace
+
+        配额要回答的是"这个会话在共享存储上占了多少"，而占用分在两个目录里：模型
+        写的产物在 `workspace/`，用户上传的原件物化在 `uploads/`。只算一个的后果是
+        两条路各自看到一半的世界 —— 传满 500MB 原件之后模型仍然能写 500MB 产物，
+        实际占用一千兆，而两边的检查都显示"没超"。
+
+        `skills/` **不算**：那是平台投递进去的资源（按 sha 缓存复用，用户没法控制大小
+        也没法删），把它计入用户配额等于用平台自己的东西挤占用户的空间。
+
+        ## 现算而不是维护计数器
+
+        跟 file_stager.uploads_bytes 同一个理由，见那边的注释。多说一句这里更强的
+        地方：写路径上的计数器要在 `_write_locked` 的异常分支里回滚，而那个分支正是
+        进程可能被 kill 的地方 —— 漂移的表现是配额莫名其妙变紧，用户删了文件也不
+        恢复。遍历一个会话目录是几十到几千个 inode，比一次 NFS 写便宜。
+        """
+        total = 0
+        for sub in ("workspace", "uploads"):
+            d = self._ws.parent / sub
+            if not d.is_dir():
+                continue
+            for root, _dirs, files in os.walk(d):
+                for name in files:
+                    try:
+                        total += os.path.getsize(os.path.join(root, name))
+                    except OSError:
+                        continue
+        return total
+
+    def _check_quota(self, target: Path, incoming: int) -> None:
+        """写入前判配额。超了抛 QuotaExceeded，由 handler 翻成 507。
+
+        ## 算的是**增量**，不是新文件的大小
+
+        覆盖一个 200MB 的文件成 201MB，增量是 1MB。按新文件大小判的话，配额用到
+        一半以上之后所有覆盖写都会失败 —— 而模型改一份大文件正是"读出来、改、写回去"，
+        于是它会在一个明明没变大的写入上被反复拒绝，而错误信息说的是"配额满了"。
+
+        ## 这一层是**软闸**，不是唯一防线
+
+        沙箱里的 python 直接写 /workspace 根本不经过 lea-tools —— `open('/workspace/x',
+        'wb').write(...)` 只走 cubelet 的 host-mount，这里看不到。所以真正的硬闸只能
+        在文件系统层（XFS project quota / NFS 后端的目录配额），部署时必须配上，
+        见 docs 里的存储章节。
+
+        这一层的价值是**给模型一个能理解的错误**：文件系统配额满了报的是 ENOSPC
+        ("No space left on device")，模型会以为是平台故障然后重试；这里报的是
+        "会话文件配额已满（已用 X / 上限 Y），删掉不需要的文件再写"，它知道该做什么。
+        """
+        if self._quota <= 0:
+            return
+        used = self.session_bytes()
+        try:
+            existing = target.stat().st_size
+        except OSError:
+            existing = 0
+        delta = incoming - existing
+        if delta > 0 and used + delta > self._quota:
+            raise QuotaExceeded(used, delta, self._quota)
 
     def list(self, show_hidden: bool = False) -> tuple[list[FileEntry], bool]:
         if not self._ws.is_dir():
@@ -150,42 +231,58 @@ class NFSFileStore:
         return out, False
 
     def _resolve_readable(self, rel_path: str) -> Path:
-        """解析一个**只读**路径：workspace 内，或沙箱的 skill 挂载点。
+        """解析一个**只读**路径：workspace 内，或两个 RO 挂载点之一。
 
-        skill 目录是 workspace 的**同级**（`sessions/{sid}/skills`，挂进沙箱是
-        `/opt/skills` RO），不在 workspace 内，所以走 _resolve 一定判越界。但模型需要
-        读 skill 的 reference 文件，而它已经知道 `/opt/skills/<name>/...` 这个路径 ——
-        activate_skill 的引导和 skill 正文的 location header 写的都是它。所以读侧原样
-        接受该前缀并映射到宿主目录，不另造一套约定。
+        两个挂载点都是 workspace 的**同级**目录，不在 workspace 内，所以走 _resolve
+        一定判越界：
 
-        用绝对前缀而不是 `skills/` 这种相对形式，是为了不跟 workspace 里真有一个叫
-        skills 的目录相撞。
+            /opt/skills    sessions/{sid}/skills    skill bundle（平台投递的）
+            /mnt/uploads   sessions/{sid}/uploads   用户上传的原件
 
-        **只在读路径上放行**：write / edit / stat 仍走严格的 _resolve，所以 skill 目录
-        对 agent 不可写 —— 那是投递进去的平台资源，被 agent 改掉会影响后续会话
-        （bundle 按 sha 缓存复用，改坏了不会自动修复）。
+        但模型需要读它们，而且它已经知道这两个路径 —— skill 是 activate_skill 的引导和
+        正文 location header 写的，uploads 是附件注入文本里写的。所以读侧原样接受这两个
+        前缀并映射到宿主目录，不另造一套约定。
+
+        用绝对前缀而不是 `skills/` 这种相对形式，是为了不跟 workspace 里真有一个同名
+        目录相撞。
+
+        **只在读路径上放行**：write / edit / stat 仍走严格的 _resolve，所以这两个目录
+        对 agent 都不可写 ——
+          - skill 是投递进去的平台资源，被改掉会影响后续会话（bundle 按 sha 缓存复用，
+            改坏了不会自动修复）；
+          - uploads 是用户的原件，改完的东西必须写到 /workspace（那里才会被推 S3 进
+            文件抽屉，而且原件保住了才能重来）。
         """
         raw = rel_path.strip()
-        if raw != SKILL_MOUNT and not raw.startswith(SKILL_MOUNT + "/"):
-            return self._resolve(rel_path)
+        for mount, subdir in ((SKILL_MOUNT, "skills"), (UPLOADS_MOUNT, "uploads")):
+            if raw == mount or raw.startswith(mount + "/"):
+                return self._resolve_under_mount(raw, mount, subdir)
+        return self._resolve(rel_path)
 
-        # 越界检查用 normpath 而不是 resolve —— 前者纯字符串消掉 `..`，后者会跟随符号
-        # 链接。这个区别在这里是决定性的：skill 是 ensure_cached 解压到
-        # `{root}/cache/skills/<sha>/` 再 copytree 进 session 目录的，那条链上出现
-        # symlink 是正常的部署结构（实测生产 NFS 上就是），于是 resolve 后的真实文件
-        # 落在 skills_root 之外，比对必然失败。
-        #
-        # 症状很有误导性：同一个目录下**不存在**的文件报"文件不存在"（resolve 无链接可
-        # 跟随，路径照原样拼），**真实存在**的文件报"路径越界"。看起来像投递没成功，
-        # 实际是检查本身把正常路径拒了。
-        #
-        # 安全性不因此降低：这里要防的是 `../` 穿出挂载点，normpath 消 `..` 完全够；
-        # 而 symlink 指向 cache 是我们自己投递造成的，不是 agent 能控制的输入。写侧仍走
-        # 严格的 _resolve（含 resolve），所以 skill 目录依旧不可写。
-        skills_root = os.path.normpath(str(self._ws.parent / "skills"))
-        target = os.path.normpath(os.path.join(skills_root, raw[len(SKILL_MOUNT):].lstrip("/")))
-        if target != skills_root and not target.startswith(skills_root + os.sep):
-            raise PermissionError("path escapes skills")
+    def _resolve_under_mount(self, raw: str, mount: str, subdir: str) -> Path:
+        """把 `<mount>/x/y` 映射到 `sessions/{sid}/<subdir>/x/y`，越界就拒绝。
+
+        越界检查用 normpath 而不是 resolve —— 前者纯字符串消掉 `..`，后者会跟随符号
+        链接。这个区别在这里是决定性的：skill 是 ensure_cached 解压到
+        `{root}/cache/skills/<sha>/` 再 copytree 进 session 目录的，那条链上出现
+        symlink 是正常的部署结构（实测生产 NFS 上就是），于是 resolve 后的真实文件
+        落在挂载根之外，比对必然失败。
+
+        症状很有误导性：同一个目录下**不存在**的文件报"文件不存在"（resolve 无链接可
+        跟随，路径照原样拼），**真实存在**的文件报"路径越界"。看起来像投递没成功，
+        实际是检查本身把正常路径拒了。
+
+        安全性不因此降低：这里要防的是 `../` 穿出挂载点，normpath 消 `..` 完全够；
+        而 symlink 是我们自己投递/物化造成的，不是 agent 能控制的输入。写侧仍走
+        严格的 _resolve（含 resolve），所以这两个目录依旧不可写。
+
+        uploads 走同一条路是有意的：物化今天是直接落盘（file_stager 里 os.replace），
+        但哪天为了省空间改成"指向 OBS 缓存的硬链/符号链"，这里不需要跟着改。
+        """
+        root = os.path.normpath(str(self._ws.parent / subdir))
+        target = os.path.normpath(os.path.join(root, raw[len(mount):].lstrip("/")))
+        if target != root and not target.startswith(root + os.sep):
+            raise PermissionError(f"path escapes {subdir}")
         return Path(target)
 
     def _resolve(self, rel_path: str) -> Path:
@@ -247,7 +344,12 @@ class NFSFileStore:
             count = text.count(old)
             if count != 1:
                 raise ValueError(str(count))
-            return self._write_locked(target, text.replace(old, new, 1).encode("utf-8")), 1
+            payload = text.replace(old, new, 1).encode("utf-8")
+            # edit 也要判：一次 edit 可以把 new 写成任意长的字符串（模型往一个文件里
+            # 反复追加大段内容是常见形状），所以它跟 write 一样能把配额吃满。
+            # 判在锁内、替换之前 —— 锁外判会跟另一个写者的 replace 交叉。
+            self._check_quota(target, len(payload))
+            return self._write_locked(target, payload), 1
 
     def _write_locked(self, target: Path, data: bytes) -> Stat:
         """原子替换。调用方必须已持有 _path_lock(target)。"""
@@ -346,6 +448,10 @@ class NFSFileStore:
                     f"文件可能已被删除，请重新读取确认。"
                 )
 
+            # 配额判在新鲜度校验**之后**：两个都会拒绝这次写入，但"你基于的版本过期了"
+            # 是可以立即自救的（重读再写），而"配额满了"要先删东西。先报能自救的那个，
+            # 模型少绕一圈。
+            self._check_quota(target, len(data))
             return self._write_locked(target, data)
 
 
@@ -420,16 +526,19 @@ class SandboxFileStore:
 
     @staticmethod
     def _check_readable(rel_path: str) -> str:
-        """同 _check，但额外放行 skill 挂载点 —— 只用于读。
+        """同 _check，但额外放行两个 RO 挂载点 —— 只用于读。
 
-        沙箱里 /opt/skills 就是真实路径（RO bind mount），所以这里是原样透传而不是
-        映射。仍要挡 `..`：`/opt/skills/../../etc/passwd` 会走出挂载点。
+        沙箱里 /opt/skills 和 /mnt/uploads 就是真实路径（RO bind mount），所以这里是
+        原样透传而不是映射（跟 NFSFileStore 那边需要映射到宿主目录不同）。
+
+        仍要挡 `..`：`/opt/skills/../../etc/passwd` 会走出挂载点。
         """
         raw = rel_path.strip()
-        if raw == SKILL_MOUNT or raw.startswith(SKILL_MOUNT + "/"):
-            if ".." in raw.split("/"):
-                raise PermissionError("path escapes skills")
-            return raw
+        for mount in (SKILL_MOUNT, UPLOADS_MOUNT):
+            if raw == mount or raw.startswith(mount + "/"):
+                if ".." in raw.split("/"):
+                    raise PermissionError(f"path escapes {mount}")
+                return raw
         return SandboxFileStore._check(rel_path)
 
     def read(self, rel_path: str) -> bytes:
@@ -531,7 +640,15 @@ def get_file_store(tenant_id: str, session_id: str):
     """
     mode = os.getenv("FILE_STORE", "auto").lower()
 
-    nfs = NFSFileStore(workspace_path(tenant_id, session_id)) if tenant_id else None
+    # 配额只装在 NFS store 上。SandboxFileStore 走 envd HTTP，量不出会话目录的占用
+    # （它看到的是沙箱里的 /workspace，而那是同一份共享存储的挂载 —— 但要遍历它得在
+    # 沙箱里跑一段 os.walk，一次写入多打一次 /execute 往返）。sandbox 模式是开发用途
+    # （本机 lea-tools + 远端 Cube，无共享存储），生产走 NFS，所以不为它补这一层。
+    from lea_tools.config import get_nfs_settings
+    quota = get_nfs_settings().workspace_quota_mb * 1024 * 1024
+
+    nfs = (NFSFileStore(workspace_path(tenant_id, session_id), quota_bytes=quota)
+           if tenant_id else None)
     if mode == "nfs":
         return nfs
 

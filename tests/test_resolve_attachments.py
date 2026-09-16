@@ -78,15 +78,16 @@ def client():
 
 
 def mk_tool(client, *, tenant=T1, scope=OWNER_SCOPE_PLATFORM, owner=None,
-            enabled=True, name="stock_lookup") -> int:
+            enabled=True, name="stock_lookup", display_name="",
+            description="按库位查库存") -> int:
     from lea_config.models.tool import Tool
 
     db = client.Session()
     try:
         t = Tool(
-            tenant_id=tenant, name=name, description="按库位查库存",
-            execution_type="api", schema_json=SCHEMA, enabled=enabled,
-            owner_scope=scope, owner_user_id=owner,
+            tenant_id=tenant, name=name, display_name=display_name,
+            description=description, execution_type="api", schema_json=SCHEMA,
+            enabled=enabled, owner_scope=scope, owner_user_id=owner,
         )
         db.add(t)
         db.commit()
@@ -111,13 +112,13 @@ def mk_kb(client, *, tenant=T1, visibility="public", owner=ALICE,
 
 
 def mk_skill(client, *, tenant=T1, scope=OWNER_SCOPE_PLATFORM, owner=None,
-             enabled=True, name="ppt_maker", bundle="") -> int:
+             enabled=True, name="ppt_maker", bundle="", category="general") -> int:
     from lea_config.models.skill import Skill
 
     db = client.Session()
     try:
         s = Skill(
-            tenant_id=tenant, name=name, display_name="做 PPT",
+            tenant_id=tenant, name=name, display_name="做 PPT", category=category,
             description="按模板生成演示文稿", system_prompt="Step 1: 调研…",
             enabled=enabled, owner_scope=scope, owner_user_id=owner,
             bundle_uri=bundle or None,
@@ -468,13 +469,14 @@ def test_anonymous_user_gets_only_platform_tools(client):
 
 
 def mk_mcp(client, *, tenant=T1, scope=OWNER_SCOPE_PLATFORM, owner=None,
-           enabled=True, name="notion") -> int:
+           enabled=True, name="notion", description="") -> int:
     from lea_config.models.mcp_server import MCPServer
 
     db = client.Session()
     try:
         s = MCPServer(
-            tenant_id=tenant, name=name, endpoint="https://notion.example/mcp",
+            tenant_id=tenant, name=name, description=description,
+            endpoint="https://notion.example/mcp",
             transport="streamable_http", enabled=enabled,
             owner_scope=scope, owner_user_id=owner,
         )
@@ -665,3 +667,167 @@ def test_tool_row_from_another_tenant_is_not_returned(client):
 
     body = resolve(client, [{"kind": "mcp_server", "ref_id": sid}], tenant=T1)
     assert body["tools"] == []
+
+
+# ── POST /internal/describe-attachments ──────────────────────────────────
+#
+# 把 {kind, ref_id} 换成 {name, display_name, description, available} 给界面画 chip。
+# 跟 resolve 走不同端点：那个展平 mcp_server、带 SKILL.md 全文,渲染 chip 用不上。
+
+
+def describe(client, items: list[dict], *, tenant=T1, user=ALICE) -> dict:
+    return client.post(
+        "/internal/describe-attachments",
+        json={"tenant_id": tenant, "user_id": user, "items": items},
+    ).json()
+
+
+def test_describe_returns_name_and_description(client):
+    """最基本路径：一个看得见的工具，返回它的名字和描述。"""
+    tid = mk_tool(client, name="stock_check", display_name="查库存",
+                  description="查某仓库的现货数")
+    body = describe(client, [{"kind": "tool", "ref_id": tid}])
+
+    assert len(body["attachments"]) == 1
+    a = body["attachments"][0]
+    assert a["kind"] == "tool"
+    assert a["ref_id"] == tid
+    assert a["name"] == "stock_check"
+    assert a["display_name"] == "查库存"
+    assert a["description"] == "查某仓库的现货数"
+    assert a["available"] is True
+
+
+def test_describe_covers_all_four_kinds(client):
+    """四种资源都认。漏掉一种的表现是那类 chip 永远显示"已失效"—— 比报错难发现。"""
+    tid = mk_tool(client, name="t1")
+    sid = mk_skill(client, name="s1")
+    mid = mk_mcp(client, name="m1")
+    kid = mk_kb(client, name="k1")
+
+    body = describe(client, [
+        {"kind": "tool", "ref_id": tid},
+        {"kind": "skill", "ref_id": sid},
+        {"kind": "mcp_server", "ref_id": mid},
+        {"kind": "kb", "ref_id": kid},
+    ])
+    got = {a["kind"]: a for a in body["attachments"]}
+    assert set(got) == {"tool", "skill", "mcp_server", "kb"}
+    for kind, a in got.items():
+        assert a["available"] is True, f"{kind} 没解析出来"
+        assert a["name"], f"{kind} 的名字是空的"
+
+
+def test_describe_mcp_server_has_no_display_name(client):
+    """mcp_server 和 kb 没有 display_name 列，对应字段返回空字符串而不是报错。"""
+    mid = mk_mcp(client, name="weather-svc", description="天气服务")
+    body = describe(client, [{"kind": "mcp_server", "ref_id": mid}])
+
+    a = body["attachments"][0]
+    assert a["name"] == "weather-svc"
+    assert a["display_name"] == ""  # 这张表没有这列
+    assert a["description"] == "天气服务"
+
+
+def test_describe_marks_unavailable_but_keeps_them_in_list(client):
+    """够不着的项标 available=false 但**仍在列表里**。
+
+    跟 resolve 那边的"静默丢弃"是相反的取向，而这是故意的：那边要保证会话建得起来，
+    这边要让用户看见"你挂的这个东西现在用不了"。全丢掉的话 chip 会无声消失，用户只会
+    觉得自己记错了；标出来他才知道该去摘掉。
+
+    ref_id 必须保留 —— 前端就靠它调 DELETE 摘掉这条失效挂载。
+    """
+    tid = mk_tool(client, name="gone", enabled=False)
+    body = describe(client, [{"kind": "tool", "ref_id": tid}])
+
+    a = body["attachments"][0]
+    assert a["available"] is False
+    assert a["ref_id"] == tid, "ref_id 丢了，前端没法摘掉它"
+    assert a["name"] == ""  # 取不到行，给占位而不是 null
+
+
+def test_describe_never_returns_null_fields(client):
+    """失效项的字符串字段是 ""，不是 null —— 前端拿到 null 会渲染成 "undefined"。"""
+    body = describe(client, [{"kind": "tool", "ref_id": 999999}])
+    a = body["attachments"][0]
+    for k in ("name", "display_name", "description"):
+        assert a[k] == "", f"{k} 不是空字符串: {a[k]!r}"
+
+
+def test_describe_preserves_order(client):
+    """顺序跟传入的一致 —— 前端按挂载顺序渲染，重排会让 chip 位置每次刷新都跳。"""
+    t1 = mk_tool(client, name="a")
+    t2 = mk_tool(client, name="b")
+    t3 = mk_tool(client, name="c")
+    body = describe(client, [
+        {"kind": "tool", "ref_id": t2},
+        {"kind": "tool", "ref_id": t1},
+        {"kind": "tool", "ref_id": t3},
+    ])
+    assert [a["name"] for a in body["attachments"]] == ["b", "a", "c"]
+
+
+def test_describe_order_holds_with_unavailable_in_the_middle(client):
+    """失效项占位也要占住它那个位置，不能把后面的挤上来。"""
+    t1 = mk_tool(client, name="a")
+    t3 = mk_tool(client, name="c")
+    body = describe(client, [
+        {"kind": "tool", "ref_id": t1},
+        {"kind": "tool", "ref_id": 999999},   # 中间这个不存在
+        {"kind": "tool", "ref_id": t3},
+    ])
+    rows = body["attachments"]
+    assert len(rows) == 3
+    assert rows[0]["name"] == "a"
+    assert rows[1]["available"] is False
+    assert rows[2]["name"] == "c"
+
+
+def test_describe_respects_tool_ownership(client):
+    """别人的私有工具标 available=false。这层判据必须跟 resolve 一致。
+
+    不一致的后果是界面上显示得出名字、真用的时候却没有 —— 或者更糟，反过来：
+    描述接口成了一个"猜 id 就能读到别人工具名和描述"的信息泄露口。
+    """
+    tid = mk_tool(client, name="alice_only", scope=OWNER_SCOPE_USER, owner=ALICE)
+
+    assert describe(client, [{"kind": "tool", "ref_id": tid}],
+                    user=ALICE)["attachments"][0]["available"] is True
+    bob = describe(client, [{"kind": "tool", "ref_id": tid}], user=BOB)["attachments"][0]
+    assert bob["available"] is False
+    assert bob["name"] == "", "泄露了 alice 的工具名"
+    assert bob["description"] == "", "泄露了 alice 的工具描述"
+
+
+def test_describe_respects_tenant_isolation(client):
+    """跨租户够不着 —— 跟 resolve 同一条判据。"""
+    tid = mk_tool(client, tenant=T2, name="other_tenant")
+    body = describe(client, [{"kind": "tool", "ref_id": tid}], tenant=T1)
+    assert body["attachments"][0]["available"] is False
+
+
+def test_describe_private_kb_only_for_owner(client):
+    """kb 用的是 visibility/owner 那套老编码，单独一段代码，所以单独钉一条。"""
+    kid = mk_kb(client, name="alice_kb", visibility="private", owner=ALICE)
+
+    assert describe(client, [{"kind": "kb", "ref_id": kid}],
+                    user=ALICE)["attachments"][0]["available"] is True
+    assert describe(client, [{"kind": "kb", "ref_id": kid}],
+                    user=BOB)["attachments"][0]["available"] is False
+
+
+def test_describe_unknown_kind_is_unavailable_not_an_error(client):
+    """认不出的 kind 标 available=false，不是 500。
+
+    kind 是 VARCHAR 就是为了让新资源不必先改所有读端（见 migrations/017）。老版本的
+    lea-config 碰到将来新增的 kind 该显示"未知"，而不是让整个挂载列表打不开。
+    """
+    body = describe(client, [{"kind": "future_thing", "ref_id": 1}])
+    assert body["attachments"][0]["available"] is False
+    assert body["attachments"][0]["kind"] == "future_thing"
+
+
+def test_describe_empty_list(client):
+    """没挂东西时返回空数组，不是 null —— 前端 .map() 不该炸。"""
+    assert describe(client, [])["attachments"] == []

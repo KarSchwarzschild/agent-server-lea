@@ -405,7 +405,7 @@ const url = `/api/chat/stream/${sessionId}?from=${lastEventId ?? 0}`;
   "sessions": [{
     "id": "uuid",
     "title": "会话标题",
-    "agent_id": null,
+    "agent_id": 7,
     "message_count": 12,
     "last_active_at": "2026-07-29T10:04:05+08:00",
     "created_at": "2026-07-28T09:00:00+08:00",
@@ -416,7 +416,8 @@ const url = `/api/chat/stream/${sessionId}?from=${lastEventId ?? 0}`;
 
 三个坑：
 
-1. **`agent_id` 永远是 `null`** —— SQL 里是 `NULL AS agent_id`，表还没这一列。前端别依赖它。
+1. **`agent_id` 是这个会话的"激活 agent"**（专家/专家团），来自 `active_agent_id` 列。
+   **`null` 表示用默认 superagent**，不是"没有数据" —— 列里的 `0` 会被转成 `null`。
 2. **没有分页，硬编码返回最近 50 条**，`limit` / `offset` 不可传，也没有总数。超过 50 个
    会话的用户会静默看不到更早的。
 3. DB 不可用时返回 **200 `{"sessions": []}`** 而不是报错 —— 空列表可能意味着"没有会话"
@@ -469,7 +470,9 @@ const url = `/api/chat/stream/${sessionId}?from=${lastEventId ?? 0}`;
 | `file` | 是 | |
 | `session_id` | 否 | |
 
-**上限 30 MiB。** 扩展名白名单（按最后一个 `.` 之后的部分，不区分大小写）：
+**上限 30 MiB。扩展名不再是白名单** —— 任何类型都能传。下面这张表现在只决定
+**要不要打 parser 抽文本**，抽不出文本的文件（zip / sqlite / ipynb）照样落地，
+模型在沙箱里自己处理。不在表里时 `media_type` 是 `file`。
 
 | media_type | 扩展名 |
 |---|---|
@@ -499,12 +502,40 @@ const url = `/api/chat/stream/${sessionId}?from=${lastEventId ?? 0}`;
 | 状态码 | error |
 |---|---|
 | 400 | `missing file field` |
+| 404 | `session not found` —— 带了 `session_id` 但它是别人的 |
 | 413 | `file too large (>30MB)` |
-| 415 | `unsupported file type: <ext>`（没有扩展名时 ext 为空）|
-| 502 | `parser upstream failed: ...` |
+| 502 | `文件未能保存，请稍后重试` |
 | 503 | `persistence unavailable` |
+| **507** | **存储配额已满，见下** |
 
-**原文件不落对象存储** —— 只存提取出的文本，没有"查看原件"功能。
+#### 507：唯一一个"重试没用"的失败
+
+```json
+{ "error": "存储空间不足：已用 1980MB / 上限 2048MB，这个文件需要 12MB。请在文件管理里删掉一些不需要的文件后重试。", "code": "storage_quota_exceeded" }
+```
+
+**必须靠 `code` 判，不要匹配 `error` 文案**（文案会改）。这个错误重试一万次都是 507，
+正确的反应是把用户带到文件库去删东西，而不是弹一个"请重试"。`error` 那句话本身就是
+给用户看的，直接展示即可 —— 个人配额说"删文件"，租户配额说"联系管理员"，因为后者
+用户自己解决不了。
+
+**原文件会落对象存储**（内容寻址 `uploads/<tenant>/<sha256>.<ext>`），可以通过
+`GET /api/chat/attachments/:id/download` 取回。响应里的 `downloadable` 为 `false` 时
+说明当时对象存储不可达、只有文本存下来了，这时下载会返回 410。
+
+### GET /api/chat/attachments/:id/download
+
+按 `attachment_id` 取回用户上传的原件，透传 `Content-Type` / `Content-Length` /
+`Content-Disposition`。
+
+走 id 而不是路径，是因为原件的权威位置是对象存储上的 blob：会话归档后共享存储那份
+已经清理掉了，blob 还在。
+
+| 状态码 | 说明 |
+|---|---|
+| 400 | id 不合法 |
+| 404 | 不存在**或**不是你的（故意不区分：id 自增，分开报就是一个可枚举的存在性预言）|
+| 410 | `该附件上传时未保存原件，无法下载` |
 
 ### GET /api/files/list
 
@@ -541,6 +572,140 @@ lea-tools 定。
 
 ⚠️ 两个 files 接口都是**先写状态码再拷 body**。上游中途断开时前端看到的是 200 + 不完整
 内容，没有错误标记。要校验实收字节数和 `Content-Length` 是否一致。
+
+---
+
+## 7.5 用户文件库（跨会话）
+
+上面那几条都是**会话内**的：附件挂在某一轮对话上，工作区产物随会话 30 天回收。
+这一节是长期的那一层 —— "我的文件"，在 A 对话里生成的报告能在 B 对话里接着用。
+
+### 一个库，两张表
+
+用户看到的是**一个**列表，底下是两张表，方向相反：
+
+| kind | 来源 | 谁写的 |
+|---|---|---|
+| `upload` | 用户传给我们的原件 | `POST /api/chat/attachments/upload` |
+| `artifact` | 我们交付给用户的成品 | 模型显式调 `deliver_artifact` 工具 |
+
+合并展示是因为用户不关心这个区别；分开存是因为**降级方向相反**：上传超配额硬拒
+（用户还拿着原件，删几个重传很便宜），交付超配额软放行（那背后是几分钟的模型劳动，
+丢掉换不来任何东西 —— 这时行还在、`stored` 为 `false`）。
+
+`kind` 必须一路带着：删除和导入都要知道去哪张表。**两张表的 id 各自自增会撞**，
+`upload#7` 和 `artifact#7` 是两个不同的文件 —— 前端做列表 key 时要用 `kind:id`。
+
+> ⚠️ **成品只有模型显式声明的才进来。** 不猜、不按扩展名白名单扫、不看修改时间。
+> 零条记录的意思是"这一轮没有产出可交付的东西"，不是"我们没检测出来"。
+
+### GET /api/user/storage
+
+```json
+{
+  "upload_bytes": 12345678, "artifact_bytes": 2345678, "total_bytes": 14691356,
+  "quota_bytes": 2147483648,
+  "upload_count": 12, "artifact_count": 3,
+  "percent": 0.68
+}
+```
+
+**`quota_bytes` 为 `0` 表示不限额**，这时 `percent` 恒为 `0` —— 前端要靠
+`quota_bytes === 0` 决定画不画进度条，不要靠 `percent`。
+
+用量按 `SUM(DISTINCT sha256, size)` 算：同一份内容传十次只占一份（内容寻址）。
+所以**删掉一个文件占用未必会降** —— 可能还有别的行指向同一个对象。前端不要自己
+减，删完重新拉一次。
+
+### GET /api/user/files
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `kind` | 空 = 两种都要 | `upload` \| `artifact` |
+| `limit` | 50 | 上限 200 |
+| `offset` | 0 | |
+
+```json
+{
+  "files": [
+    {
+      "kind": "artifact", "id": 9, "filename": "季度分析.xlsx",
+      "title": "Q3 销售分析", "description": "按区域拆分的三张透视表",
+      "size": 45678, "media_type": "application/vnd...", 
+      "session_id": "sess-abc", "created_at": "2026-09-09 14:03:11",
+      "stored": true, "can_import": true
+    }
+  ],
+  "limit": 50, "offset": 0
+}
+```
+
+- `title` / `description` 只有成品有 —— 模型交付时写的，用户几周后靠这两句认出它。
+- **`stored: false` 的行不能下载也不能导入**，按钮要置灰并标出来（上传件是当时对象
+  存储不可达，成品是配额满时的软放行）。让用户点了才拿到 410 是最差的做法。
+- 两段在**内存里合并后按 `created_at` 倒序**，不是 SQL UNION。`limit` 是**每张表**
+  的上限，所以不带 `kind` 时最多可能返回 `2 × limit` 条。
+
+### DELETE /api/user/files/:kind/:id
+
+```json
+{ "status": "ok", "deleted": true, "filename": "季度分析.xlsx", "object_deleted": false }
+```
+
+`object_deleted: false` 且 `deleted: true` 是**正常情况**，不是失败：同租户内还有
+别的行指向同一份内容（内容寻址去重），对象得留着。前端不用区分这两种，用户视角
+文件已经没了。
+
+`deleted: false` 也返回 200 —— 并发下另一个请求先删了，用户要的结果已经成立。
+
+| 状态码 | 说明 |
+|---|---|
+| 400 | `kind 只能是 upload 或 artifact` / `bad id` |
+| 404 | 不存在或不是你的（同样不区分）|
+
+### POST /api/sessions/:id/files/import
+
+把库里的文件物化进某个会话，让模型能读能改。
+
+```json
+{ "kind": "artifact", "id": 9 }
+```
+
+**200**
+
+```json
+{
+  "status": "ok", "attachment_id": 456,
+  "filename": "季度分析.xlsx", "file_type": "xlsx",
+  "media_type": "text", "file_size": 45678,
+  "staged_name": "季度分析.xlsx", "sandbox_path": "/mnt/uploads/季度分析.xlsx",
+  "has_text": false
+}
+```
+
+> **`attachment_id` 是这个响应里唯一必须用的字段。** 把它放进下一条消息的
+> `attachment_ids`，模型才知道这个文件存在 —— 光物化字节是不够的，注入只认
+> `attachment_ids`。这条跟上传后那条路完全一样，前端可以共用同一套处理。
+
+几件值得知道的事：
+
+- **导入是拷贝，不是引用。** 模型在 B 对话里改的是副本，文件库里的原件一个字节不动。
+- **不多占存储配额**：新登记行带同一个 `sha256`，配额只算一次。
+- 可以在**会话还没落库时**导入（新开对话 → 导入 → 发第一条消息）。会话行是第一条
+  消息才写的，这条路径必须能走通。
+- `has_text: false` 的成品意味着没有提取过文本，模型只能进沙箱处理它 —— 对一份它
+  自己刚生成的文件来说，那本来就是对的做法。
+
+| 状态码 | 说明 |
+|---|---|
+| 400 | `kind 只能是 upload 或 artifact` / `bad id` |
+| 404 | 会话不是你的，或文件不是你的 |
+| **410** | `这个文件没有保存原件，无法导入到会话` —— 即 `can_import: false` |
+| 502 / 503 | 对象存储故障 / 没有共享存储 |
+| 507 | **会话**工作区配额满（跟用户配额是两条线）|
+
+导入**不需要重建引擎**，下一条消息自然生效 —— 沙箱按路径实时读共享存储，注入靠
+`attachment_ids`，两条都不经过引擎对象。所以响应里没有 `applies` 字段。
 
 ---
 
@@ -719,8 +884,8 @@ GET /api/chat/status/:session_id
 | 订阅缓冲 128 条（仅未配 Redis 时） | 消费慢会静默丢事件 |
 | 会话列表无分页，固定 50 条 | 重度用户看不到更早会话 |
 | 消息无分页，全量返回 | 长会话首屏慢 |
-| `agent_id` 恒为 null | 列表里显示不了是哪个助手 |
 | `artifacts` 联合类型 | 需要逐项类型判断 |
 | `tool_calls[].status` 可能停在 running | 需要终态兜底 |
-| 附件原文件不存储 | 没有"查看原件" |
 | 下载限流每副本独立 | 多副本时实际配额是 30 × 副本数 |
+| 文件库两张表各自分页 | 不带 `kind` 时最多返回 2 × `limit` 条 |
+| 删文件不保证释放空间 | 内容寻址去重，同租户还有引用时对象保留 |

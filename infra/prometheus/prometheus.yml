@@ -1,0 +1,74 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'lea-platform'
+    environment: 'staging'
+
+# Prometheus 会保留 15 天的数据
+# 生产环境改成 30 天或更长，取决于存储空间
+rule_files:
+  - 'alerts.yml'
+
+scrape_configs:
+  # lea-agent: 聊天引擎，核心服务
+  - job_name: 'lea-agent'
+    static_configs:
+      - targets: ['lea-agent:8200']
+    metrics_path: '/metrics'
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+      - target_label: service
+        replacement: 'lea-agent'
+
+  # lea-config: agent 配置 + 缓存
+  - job_name: 'lea-config'
+    static_configs:
+      - targets: ['lea-config:8500']
+    metrics_path: '/metrics'
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+      - target_label: service
+        replacement: 'lea-config'
+
+  # lea-rag: 知识库检索 + 文档处理
+  - job_name: 'lea-rag'
+    static_configs:
+      - targets: ['lea-rag:8300']
+    metrics_path: '/metrics'
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+      - target_label: service
+        replacement: 'lea-rag'
+
+  # lea-tools: 工具执行 + 沙箱 + MCP
+  - job_name: 'lea-tools'
+    static_configs:
+      - targets: ['lea-tools:8400']
+    metrics_path: '/metrics'
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+      - target_label: service
+        replacement: 'lea-tools'
+
+  # Redis（可选，如果 redis_exporter 在运行）
+  # - job_name: 'redis'
+  #   static_configs:
+  #     - targets: ['redis-exporter:9121']
+
+  # MySQL（可选，如果 mysqld_exporter 在运行）
+  # - job_name: 'mysql'
+  #   static_configs:
+  #     - targets: ['mysql-exporter:9104']

@@ -41,10 +41,11 @@ func TestPlanModeBlocksMutatingTools(t *testing.T) {
 		{"Write", `{"path":"a.txt","content":"x"}`},
 		{"Edit", `{"path":"a.txt","old_string":"a","new_string":"b"}`},
 		{"Bash", `{"command":"rm -rf /tmp/x"}`},
-		// 沙箱里跑任意代码：能写文件、能发网络请求、能改产物
-		{"code_interpreter", `{"code":"open('/x','w').write('boom')","language":"python"}`},
 		// 写的是跨会话的长期记忆，下个会话和别的 agent 都会读到
 		{"memory_add", `{"content":"记住这个"}`},
+		// 往用户的长期文件库里塞一份成品：占配额、在所有对话里都看得到。
+		// 跟 save_plan 分在两边 —— 计划是规划态的产出，成品是执行态的。
+		{"deliver_artifact", `{"path":"output/a.pptx","title":"报告"}`},
 		// 租户在 lea-config 里自定义的网关工具 —— 名字运行时才知道，读写意图无从判断，
 		// 保守当成会改外面的东西
 		{"send_email", `{"to":"x@y.z"}`},
@@ -105,10 +106,10 @@ func TestExecutionModeBlocksNothing(t *testing.T) {
 	for _, c := range []struct{ name, input string }{
 		{"Write", `{"path":"a.txt","content":"x"}`},
 		{"Bash", `{"command":"go test ./..."}`},
-		{"code_interpreter", `{"code":"print(1)","language":"python"}`},
 		{"memory_add", `{"content":"x"}`},
 		{"kb_search", `{"query":"x"}`},
 		{"save_plan", `{"content":"x","steps":[]}`},
+		{"deliver_artifact", `{"path":"output/a.pptx","title":"报告"}`},
 		{"send_email", `{"to":"x@y.z"}`},
 	} {
 		t.Run(c.name, func(t *testing.T) {

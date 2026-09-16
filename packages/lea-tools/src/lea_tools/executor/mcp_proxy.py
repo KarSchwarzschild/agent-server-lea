@@ -10,33 +10,38 @@
 `sse` 是长连接，绑在某一个副本上。本服务是多副本的，下一次工具调用可能落到别的副本，
 那边没有这条连接。要支持得引入会话亲和或连接注册表，为一个没人要的传输方式不值。
 
-## 这里为什么没有连接池
+## 这里为什么不缓存 session
 
 以前有一个 `_sessions: dict[int, MCPSession]`，按 `server_id` 分键，进程内。删掉了，
 理由不是「改进」是「它是错的」：
 
-  1. **`MCPSession` 里根本没有连接** —— 只装了 (server_id, endpoint, auth_config)
-     三个字段，每次调用还是去拿下面这个共享的 httpx pool。所以它缓存不了任何有价值
-     的东西，只缓存了**凭证**。
+  1. `MCPSession` 缓存不了任何有价值的东西，只缓存了**凭证**。
   2. 缓存键（server_id）比数据的归属粒度粗。今天一行 server 只属于一个租户，最坏是
      用了过期凭证；**放开每用户 key 之后就是 alice 的 token 发 bob 的请求** ——
      跟「按名字查工具不带 user_id」是同一类 bug。
   3. 多副本下各副本的配置更新时间不一致，表现为「我改了 key，有时生效有时不生效」。
 
-同一个事实还推翻了 admin_mcp.py 里那句「/sync 只能留在 lea-tools，因为连接池在本进程
-里」—— 那不是连接池，那个端点可以随便搬。
+现在每次调用现场构造 MCPSession，用官方 SDK 的 streamablehttp_client + ClientSession
+开一个**短连接**（连 → initialize 握手 → 调用 → 关），字段全部来自库里那一行。所以
+「改了配置立刻生效」是结构上保证的，跨调用不持有连接、也不持有凭证。代价是每次调用一次
+握手往返 —— 对当前规模可接受；真成瓶颈了再引入带归属边界的连接复用，而不是退回旧的
+按-server 缓存。
 
-真正的连接复用在 `_get_http_pool()`：httpx 的 keep-alive 按 host 复用 TCP 连接，
-那才是这里唯一有意义的池，而且它不持有任何凭证。
+同一个事实还推翻了 admin_mcp.py 里那句「/sync 只能留在 lea-tools，因为连接池在本进程
+里」—— 从来就没有那个连接池，那个端点可以随便搬。
 """
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
+from pydantic import AnyUrl
 
-from lea_tools.executor.router import ToolCall, ToolResult, _get_http_pool
+from lea_tools.executor.router import ToolCall, ToolResult
 from lea_tools.executor.url_guard import check_outbound_url
 
 # 跟 lea-config 的 MCP_TRANSPORT_VALUES 是同一套值，**故意重新定义一遍**：lea-tools
@@ -44,12 +49,33 @@ from lea_tools.executor.url_guard import check_outbound_url
 # OWNER_SCOPE_* 的处理一致。
 SUPPORTED_TRANSPORTS = ("streamable_http",)
 
+# MCP 的 resources 不是 tool，但模型只会调 tool。sync 把"这个 server 能读资源"投影成
+# 两个**合成工具行**，让它们复用整条 tool 下发/执行管道。这两个常量是判据：写进合成
+# 工具行的 `endpoint` 列（真 MCP 工具行 endpoint 恒为 NULL），mcp_call 读到它就走
+# resources 分支而不是 call_tool。admin_mcp.py 建行时引用同一对常量。
+MCP_RESOURCE_LIST = "mcp:resource-list"
+MCP_RESOURCE_READ = "mcp:resource-read"
+
 
 class MCPSession:
     """一次 MCP 调用需要的全部东西。**不要缓存它的实例**（见模块头）。
 
     每次调用现场构造，字段全部来自库里那一行 —— 这样「改了配置立刻生效」是结构上
     保证的，不是靠记得去失效某个缓存。构造成本是三次属性赋值。
+
+    ## 为什么用官方 SDK 而不是裸 POST
+
+    以前这里是自己拼 JSON-RPC + `resp.json()`，两个硬伤让它连不了任何**规范实现**的
+    streamable-HTTP server（deepwiki / context7 等公开 server 都是）：
+
+      1. **不解析 SSE**：规范 server 用 `event:/data:` 流回，`resp.json()` 撞上流的
+         第一行就 `Expecting value: line 1 column 1`。
+      2. **跳过 initialize 握手**：MCP 要求先 initialize → 拿 Mcp-Session-Id →
+         notifications/initialized → 才能 tools/list。直接发 tools/list 规范 server 不认。
+
+    这两件（SSE 解析、握手、session-id 管理）正是官方 SDK 已经做好的，自己写只会引 bug。
+    每次调用现开一个短连接、握手、用完关 —— 保住模块头「不缓存 session」的原则：SDK 的
+    ClientSession 是 async context manager，随用随建随关，不持有跨调用的凭证。
     """
 
     def __init__(self, server_id: int, endpoint: str, auth_config: dict | None = None):
@@ -58,54 +84,166 @@ class MCPSession:
         self.auth_config = auth_config or {}
 
     def _headers(self) -> dict[str, str]:
-        # MCP 规范要求 Accept 同时声明这两种 —— streamable_http 的服务端可以选择用
-        # 单个 JSON 响应，也可以升级成 SSE 流。少一个的话严格实现的 server 会 406。
-        # 我们只处理 JSON 那种（见 call_tool），但握手时必须都声明。
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json, text/event-stream",
-        }
+        # 凭证头。Accept / Content-Type / Mcp-Session-Id 等协议头由 SDK 自己管，这里
+        # 只补鉴权。bearer 优先于 api_key，跟 mcp_call 的凭证优先级一致。
+        headers: dict[str, str] = {}
         if "bearer_token" in self.auth_config:
             headers["Authorization"] = f"Bearer {self.auth_config['bearer_token']}"
         elif "api_key" in self.auth_config:
             headers["X-API-Key"] = self.auth_config["api_key"]
         return headers
 
-    async def _rpc(self, method: str, params: dict) -> dict:
-        client = _get_http_pool()
-        resp = await client.post(
-            self.endpoint,
-            json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
-            headers=self._headers(),
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if "error" in data:
-            err = data["error"]
-            # JSON-RPC 的 error 是个对象；只取 message 会丢掉 code，而 code 是区分
-            # 「方法不存在」和「参数错」的唯一依据。
-            raise MCPError(f"{err.get('message', err)} (code={err.get('code')})")
-        return data.get("result", {})
+    async def list_tools(self) -> list[dict]:
+        # 短连接：连 → initialize 握手 → tools/list → 关。SDK 负责 SSE 解析和 session-id。
+        headers = self._headers()
+        async with streamablehttp_client(self.endpoint, headers=headers or None) as (
+            read, write, _get_session_id,
+        ):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                result = await session.list_tools()
+                # 回成跟旧实现一致的 list[dict]（sync 那边按 name/description/inputSchema 读）。
+                return [t.model_dump(by_alias=True) for t in result.tools]
 
     async def call_tool(self, tool_name: str, params: dict[str, Any]) -> dict:
-        result = await self._rpc("tools/call", {"name": tool_name, "arguments": params})
+        headers = self._headers()
+        async with streamablehttp_client(self.endpoint, headers=headers or None) as (
+            read, write, _get_session_id,
+        ):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                result = await session.call_tool(tool_name, params or {})
 
         # MCP 用 isError 表达「工具自己失败了」，跟传输层的错误是两回事。不认它的话
         # 一次失败的调用会被当成成功结果喂给模型 —— 模型会拿着一句错误信息当数据用。
-        if result.get("isError"):
-            texts = [c.get("text", "") for c in result.get("content", []) if isinstance(c, dict)]
+        if result.isError:
+            texts = [
+                getattr(c, "text", "") for c in (result.content or [])
+                if getattr(c, "type", None) == "text"
+            ]
             raise MCPError("\n".join(t for t in texts if t) or "tool reported an error")
 
-        content = result.get("content", [])
         texts = [
-            c.get("text", "")
-            for c in content
-            if isinstance(c, dict) and c.get("type") == "text"
+            c.text for c in (result.content or [])
+            if getattr(c, "type", None) == "text"
         ]
-        return {"content": "\n".join(texts) if texts else result}
+        if texts:
+            return {"content": "\n".join(texts)}
+        # 没有文本块（结构化返回等）—— 交出可序列化的原始结果，别丢数据。
+        return {"content": result.model_dump(by_alias=True)}
 
-    async def list_tools(self) -> list[dict]:
-        return (await self._rpc("tools/list", {})).get("tools", [])
+    @asynccontextmanager
+    async def _open(self):
+        """开一条短连接、完成 initialize 握手，交出可用的 ClientSession。
+
+        连 → initialize → yield → 关，跟 list_tools/call_tool 里那段 nested async with
+        同形，抽出来给下面几个 resources 方法复用 —— 保住模块头「不缓存 session」的原则：
+        随用随建随关，不持有跨调用的连接或凭证。
+        """
+        headers = self._headers()
+        async with streamablehttp_client(self.endpoint, headers=headers or None) as (
+            read, write, _get_session_id,
+        ):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                yield session
+
+    async def describe(self) -> dict:
+        """一次连接内取回 tools + resources + 能力位，给 /sync 用。
+
+        为什么不复用 list_tools：sync 要同时知道「有哪些工具」和「支不支持 resources、
+        有哪些资源」。分两次连接就要握两次手；这里单次 initialize 拿全部。/test 仍走
+        list_tools（它只答"通不通"，不关心 resources）。
+
+        supports_resources 取自 initialize 广告的 capabilities.resources —— 规范要求
+        客户端不去调没广告的能力。但广告了却列不出来（实现不全 / 当前为空）也不该拖垮
+        整次 describe：tools 已经拿到，resources 退化成空。
+        """
+        headers = self._headers()
+        async with streamablehttp_client(self.endpoint, headers=headers or None) as (
+            read, write, _get_session_id,
+        ):
+            async with ClientSession(read, write) as session:
+                init = await session.initialize()
+                tools_result = await session.list_tools()
+                tools = [t.model_dump(by_alias=True) for t in tools_result.tools]
+
+                supports_resources = (
+                    getattr(init.capabilities, "resources", None) is not None
+                )
+                resources: list[dict] = []
+                if supports_resources:
+                    try:
+                        res_result = await session.list_resources()
+                        # mode="json" 把 AnyUrl 之类序列化成字符串 —— 这份要塞进 sync
+                        # 的响应体，得是可 JSON 化的。
+                        resources = [
+                            r.model_dump(by_alias=True, mode="json")
+                            for r in res_result.resources
+                        ]
+                    except Exception:
+                        resources = []
+        return {
+            "tools": tools,
+            "resources": resources,
+            "supports_resources": supports_resources,
+        }
+
+    async def list_resources(self) -> list[dict]:
+        # 执行侧 list_resources 合成工具走这条。暂不翻页（cursor）—— 到有 server 真的
+        # 返回上百个资源再说，现在多一层分页只是没人用的复杂度。
+        async with self._open() as session:
+            result = await session.list_resources()
+        return [r.model_dump(by_alias=True, mode="json") for r in result.resources]
+
+    async def read_resource(self, uri: str) -> list[dict]:
+        # SDK 的 read_resource 收 AnyUrl，模型传进来的是裸字符串，这里包一层。
+        async with self._open() as session:
+            result = await session.read_resource(AnyUrl(uri))
+        return [c.model_dump(by_alias=True, mode="json") for c in (result.contents or [])]
+
+
+def _render_resource_catalog(resources: list[dict]) -> str:
+    """资源清单 → 给模型看的一段文本。
+
+    每行一个 uri（模型拿它去 read_resource）+ 名称/说明（帮它判断该读哪个）+ mimeType
+    （预判文本还是二进制）。空清单明说，别让模型以为是读失败了。
+    """
+    if not resources:
+        return "（这个 server 当前没有可读的 resource）"
+    lines = []
+    for r in resources:
+        bits = [f"- {r.get('uri', '')}"]
+        if name := r.get("name"):
+            bits.append(f"  名称: {name}")
+        if desc := r.get("description"):
+            bits.append(f"  说明: {desc}")
+        if mime := r.get("mimeType"):
+            bits.append(f"  类型: {mime}")
+        lines.append("\n".join(bits))
+    return "\n".join(lines)
+
+
+def _render_resource_contents(contents: list[dict]) -> str:
+    """resource 的内容块 → 给模型看的字符串。
+
+    MCP 一个 resource 可返回多个内容块，每块要么文本（text）要么二进制（blob，base64）：
+      · 文本块：原样拼进去，模型能直接读。
+      · 二进制块：不内联 base64（模型读不懂一坨 base64，只会烧 token），换成一行占位，
+        标出 uri / mimeType / 大小 —— 让模型知道"这里有个二进制资源"而不是当成读失败。
+    多块之间空行隔开。
+    """
+    parts: list[str] = []
+    for c in contents:
+        if c.get("text") is not None:
+            parts.append(c["text"])
+        elif c.get("blob") is not None:
+            uri = c.get("uri", "")
+            mime = c.get("mimeType", "application/octet-stream")
+            parts.append(f"[二进制资源 {uri} ({mime}, ~{len(c['blob'])} base64 字节)，未内联]")
+    if not parts:
+        return "（resource 没有返回任何内容）"
+    return "\n\n".join(parts)
 
 
 class MCPError(Exception):
@@ -195,12 +333,26 @@ async def mcp_call(call: ToolCall, credential: dict | None) -> ToolResult:
             auth["bearer_token"] = credential["api_key"]
 
         session = MCPSession(server.id, server.endpoint, auth)
+        # 资源合成工具的判据：真 MCP 工具行 endpoint 为 NULL，合成行写了 marker。
+        # 在 db 关掉之前读出来（call.endpoint 来自工具行的 endpoint 列）。
+        marker = call.endpoint
         # 在 session 关掉之前算出来 —— 之后 server 就是个游离对象了。
         remote_name = remote_tool_name(call.tool_name, server.id)
     finally:
         db.close()
 
     try:
+        # resources 分支：这两个"工具"是我们合成的，远端没有同名 tool，不能走 call_tool
+        # （见 admin_mcp._sync_resource_tools）。改调 MCP 的 resources/* 方法。
+        if marker == MCP_RESOURCE_LIST:
+            resources = await session.list_resources()
+            return ToolResult(output={"content": _render_resource_catalog(resources)})
+        if marker == MCP_RESOURCE_READ:
+            uri = (call.params or {}).get("uri")
+            if not uri:
+                return ToolResult(status="error", error="read_resource 需要 uri 参数")
+            contents = await session.read_resource(uri)
+            return ToolResult(output={"content": _render_resource_contents(contents)})
         # 发**远端认识的**名字，不是我们加了前缀的那个。见 remote_tool_name。
         result = await session.call_tool(remote_name, call.params)
         return ToolResult(output=result.get("content", result))

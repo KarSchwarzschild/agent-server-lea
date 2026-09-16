@@ -93,3 +93,26 @@ scripts/backup_*
 
 # 打包出来的包快照（packages/lea-config.zip 之类）。源码就在旁边，别提交副本。
 packages/*.zip
+
+# 本地 dev 网关桩（scripts/dev_gateway_stub.py）的密钥与铸出来的 token。
+# 前者是 RS256 私钥，后者是 7 天有效的 Bearer —— 都是真凭据，一次 `git add -A`
+# 就会进公共历史，而 git 历史里的密钥删不干净。整目录前缀挡住。
+# 用前缀而不是逐个点名：逐个点名挡不住下一个随手加进来的 .dev-xxx
+# （.dev-browser-snippet.txt 就是这么漏出来的）。
+infra/.dev-*
+
+# 网关探针（dev_gateway_chat_probe.py / dev_gateway_get.py）的落盘输出。
+# 里面是原始 SSE 和接口响应，每跑一次覆盖一次，不是资产。
+/.gw_*
+
+# Go 构建缓存（GOCACHE 指到仓内的产物）。一次 `git add -A` 会捞进 16000+ 个文件，
+# 全是可重建的中间产物。容器里跑 go build 时把 GOCACHE 设进仓内目录就会长出来。
+# 用通配挡住所有变体：.go-cache-codex / .go-cache-verify / .go-cache-project /
+# .go-build-cache 都见过，逐个点名挡不住下一个。
+packages/*/.go-cache-*
+packages/*/.go-build-cache/
+.go-cache-*/
+.go-build-cache/
+
+# pnpm 的本地 store。依赖快照在 pnpm-lock.yaml 里，store 是缓存。
+.pnpm-store/

@@ -9,11 +9,13 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
+from sqlalchemy import and_
 from sqlalchemy.orm import Session
 
 from lea_authkit import Actor, require_actor
 from lea_config.database import get_db
 from lea_config.models.agent import Agent
+from lea_config.models.agent import visible_to as agent_visible_to
 from lea_config.models.team import AgentTeam, AgentTeamMember
 
 router = APIRouter(prefix="/teams", tags=["teams"])
@@ -66,14 +68,35 @@ def list_teams(
     db: Session = Depends(get_db),
     actor: Actor = Depends(require_actor),
 ):
-    q = db.query(AgentTeam)
+    # 可见性跟 agent 用同一条规则（团 = 团长 agent + 成员，见 agent_visible_to）：
+    # 本租户共享 + 自己私有 + **全局平台层(default)**。以前这里是 Agent.tenant_id ==
+    # actor.tenant_id，没有 default 全局逃逸——于是官方公共专家团对别的租户不可见，跟
+    # agent 列表当初漏掉全局层是同一个 bug。平台管理员看全部。
+    q = db.query(AgentTeam).join(Agent, Agent.id == AgentTeam.agent_id)
     if not actor.is_platform_admin:
-        q = q.join(Agent, Agent.id == AgentTeam.agent_id).filter(
-            Agent.tenant_id == actor.tenant_id
-        )
+        # enabled 过滤跟 list_agents 一致：禁用团长 agent = 这个团也不再露出（隐藏测试团
+        # 就靠禁用团长）。少了它，禁用了团长、团却还挂在专家团目录里。
+        q = q.filter(Agent.enabled.is_(True), and_(*agent_visible_to(actor.tenant_id, actor.user_id)))
     total = q.count()
-    items = q.order_by(AgentTeam.id).offset((page - 1) * page_size).limit(page_size).all()
-    return {"total": total, "items": [_row_to_dict(t) for t in items]}
+    teams = q.order_by(AgentTeam.id).offset((page - 1) * page_size).limit(page_size).all()
+
+    # 补上团长 agent 的展示信息 —— _row_to_dict(team) 只有 strategy/prompts，没有名字/头像，
+    # 前端拿到没法渲染。顺带带上成员数，目录里能显示"N 位专家"。
+    items = []
+    for t in teams:
+        d = _row_to_dict(t)
+        ag = db.query(Agent).filter(Agent.id == t.agent_id).first()
+        if ag:
+            d["name"] = ag.name
+            d["description"] = ag.description or ""
+            d["avatar"] = ag.avatar or "\U0001f916"
+            d["category"] = ag.category or "general"
+            d["enabled"] = bool(ag.enabled)
+        d["member_count"] = (
+            db.query(AgentTeamMember).filter(AgentTeamMember.team_id == t.id).count()
+        )
+        items.append(d)
+    return {"total": total, "items": items}
 
 
 @router.post("", status_code=201)
@@ -127,6 +150,20 @@ def delete_team(
 
 
 # ---------- Member CRUD ----------
+
+@router.get("/{team_id}/members")
+def list_members(
+    team_id: int,
+    db: Session = Depends(get_db),
+    actor: Actor = Depends(require_actor),
+):
+    team = db.query(AgentTeam).filter(AgentTeam.id == team_id).first()
+    if not team:
+        raise HTTPException(404, "Team not found")
+    _ensure_team_tenant(db, team, actor)
+    members = db.query(AgentTeamMember).filter(AgentTeamMember.team_id == team_id).all()
+    return {"items": [_row_to_dict(member) for member in members]}
+
 
 @router.post("/{team_id}/members", status_code=201)
 def add_member(

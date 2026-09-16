@@ -60,6 +60,42 @@ func TestCollector_SandboxCalls(t *testing.T) {
 	}
 }
 
+func TestCollector_BashCallsUseSandboxBucket(t *testing.T) {
+	c := newCollector()
+	c.onToolEvent(tool.Event{
+		Type: tool.EventTypeStarted, ToolName: "Bash", ToolUseID: "bash-1",
+		Input: json.RawMessage(`{"command":"python /workspace/process.py"}`),
+	})
+	c.onToolEvent(tool.Event{
+		Type: tool.EventTypeProgress, ToolName: "Bash", ToolUseID: "bash-1",
+		Data: map[string]any{
+			"artifacts":   []any{"result.xlsx"},
+			"stdout":      "done\n",
+			"duration_ms": float64(25),
+		},
+	})
+	c.onToolEvent(tool.Event{
+		Type: tool.EventTypeCompleted, ToolName: "Bash", ToolUseID: "bash-1",
+		DurationMs: 25,
+	})
+
+	extra := c.toExtra()
+	scs := extra["sandbox_calls"].([]map[string]any)
+	if len(scs) != 1 || scs[0]["status"] != "success" {
+		t.Fatalf("Bash should be a successful sandbox call: %v", scs)
+	}
+	if _, ok := extra["tool_calls"]; ok {
+		t.Fatal("Bash should not appear in tool_calls")
+	}
+	arts, ok := scs[0]["artifacts"].([]string)
+	if !ok || len(arts) != 1 || arts[0] != "result.xlsx" {
+		t.Fatalf("Bash artifacts missing: %v", scs[0])
+	}
+	if scs[0]["language"] != "bash" || scs[0]["codePreview"] != "python /workspace/process.py" {
+		t.Fatalf("Bash metadata missing: %v", scs[0])
+	}
+}
+
 func TestCollector_SandboxArtifactsFromProgress(t *testing.T) {
 	c := newCollector()
 	c.onToolEvent(tool.Event{

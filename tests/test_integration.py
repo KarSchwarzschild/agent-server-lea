@@ -85,7 +85,7 @@ class TestLeaConfig:
         # 2. 创建 Skill
         r = self.client.post("/skills", json={
             "name": "代码分析",
-            "display_name": "代码分析",
+            "display_name": "代码分析", "category": "general",
             "system_prompt": "分析代码质量", "status": "draft",
         }, headers=h)
         assert r.status_code == 201

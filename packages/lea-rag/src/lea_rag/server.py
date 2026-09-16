@@ -31,6 +31,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from lea_authkit import install_internal_auth
+from lea_rag.metrics import MetricsMiddleware, metrics_endpoint
 from lea_rag.server_admin_kb import router as admin_kb_router
 from lea_rag.server_admin_memory import router as admin_memory_router
 from lea_rag.server_kb import router as kb_router
@@ -141,6 +142,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.add_middleware(MetricsMiddleware)
+
 app.include_router(kb_router)
 app.include_router(memory_router)
 app.include_router(admin_kb_router)
@@ -180,6 +183,13 @@ async def list_available_models(model_type: str | None = None):
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "retrieval", "version": "0.1.0"}
+
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus 指标端点"""
+    return metrics_endpoint()
+
 
 
 # 服务间鉴权挂在最后 —— 见 lea_authkit/internal_auth.py 顶部关于"为什么内网也要挡"。

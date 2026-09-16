@@ -144,3 +144,31 @@ func TestJWTAuth_DefaultTenant(t *testing.T) {
 		t.Errorf("tenant_id fallback: got %q want default", gotTenant)
 	}
 }
+
+func TestJWTAuth_TrustedGatewayIdentity(t *testing.T) {
+	t.Setenv("SECRET_KEY", "test-secret-h3")
+	t.Setenv("LEA_INTERNAL_TOKEN", "gateway-secret")
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(JWTAuth())
+	var userID, tenantID, role string
+	r.GET("/ping", func(c *gin.Context) {
+		userID, tenantID, role = c.GetString("user_id"), c.GetString("tenant_id"), c.GetString("role")
+		c.Status(http.StatusOK)
+	})
+
+	req := httptest.NewRequest("GET", "/ping", nil)
+	req.Header.Set("X-Internal-Token", "gateway-secret")
+	req.Header.Set("X-User-ID", "gateway-user")
+	req.Header.Set("X-Tenant-ID", "tenant-1")
+	req.Header.Set("X-User-Role", "user")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d body=%s", w.Code, w.Body.String())
+	}
+	if userID != "gateway-user" || tenantID != "tenant-1" || role != "user" {
+		t.Fatalf("identity user=%q tenant=%q role=%q", userID, tenantID, role)
+	}
+}

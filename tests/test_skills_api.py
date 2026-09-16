@@ -72,14 +72,14 @@ def h(user: str, tenant: str = T1, role: str | None = None) -> dict:
 
 
 def seed(client, name, tenant=T1, scope=OWNER_SCOPE_USER, owner="alice",
-         enabled=True, bundle="s3://b/k/abc.zip"):
+         enabled=True, bundle="s3://b/k/abc.zip", category="general"):
     """直接落库建一个 skill —— 三层里有两层建不出来（要走审核），所以只能种。"""
     from lea_config.models.skill import Skill
 
     db = client.Session()
     try:
         s = Skill(
-            tenant_id=tenant, name=name, display_name=name,
+            tenant_id=tenant, name=name, display_name=name, category=category,
             description="", system_prompt="body", required_tools=[],
             owner_scope=scope, owner_user_id=owner if scope == OWNER_SCOPE_USER else None,
             enabled=enabled, is_builtin=False, created_by=owner, bundle_uri=bundle,
@@ -158,7 +158,8 @@ def test_disabled_skill_still_listed_for_owner(client):
 # ── 归属：谁都不能自己指定 ────────────────────────────────────────────────
 
 def test_create_always_lands_private(client):
-    r = client.post("/skills", json={"name": "mine"}, headers=h("alice"))
+    r = client.post("/skills", json={"name": "mine", "category": "general"},
+                    headers=h("alice"))
     assert r.status_code == 201, r.text
     assert r.json()["visibility"] == "private"
 
@@ -180,7 +181,8 @@ def test_admin_created_skill_also_lands_private(client):
     这跟 tools 那边不同（那边管理员建的直接落 platform）。区别是 skill 有审核流程，
     而"管理员自己批自己"是个空动作，不如让他也走一遍留下记录。
     """
-    r = client.post("/skills", json={"name": "adm"}, headers=h("root", role="admin"))
+    r = client.post("/skills", json={"name": "adm", "category": "general"},
+                    headers=h("root", role="admin"))
     assert r.json()["visibility"] == "private"
 
 
@@ -190,7 +192,8 @@ def test_create_ignores_ownership_fields_in_body(client):
 
     r = client.post(
         "/skills",
-        json={"name": "x", "owner_scope": "platform", "tenant_id": DEFAULT_TENANT_ID},
+        json={"name": "x", "category": "general",
+              "owner_scope": "platform", "tenant_id": DEFAULT_TENANT_ID},
         headers=h("alice"),
     )
     assert r.json()["visibility"] == "private"
@@ -373,3 +376,27 @@ def test_download_404_when_no_bundle(client):
     r = client.get(f"/skills/{sid}/download", headers=h("alice"))
     assert r.status_code == 404
     assert "bundle" in r.json()["detail"]
+
+
+def test_obs_download_accepts_signed_url_without_status(client, monkeypatch):
+    """华为 OBS SDK 成功生成签名链接时 status 可能为 None。"""
+    from lea_config.api import skills
+
+    class FakeObsClient:
+        def createSignedUrl(self, *_args, **_kwargs):
+            return type(
+                "SignedUrlResponse", (),
+                {"status": None, "signedUrl": "https://obs.example/signed"},
+            )()
+
+        def close(self):
+            pass
+
+    monkeypatch.setenv("OBJECT_STORAGE", "obs")
+    monkeypatch.setattr(skills, "_get_obs_client", lambda: (FakeObsClient(), "b"))
+    sid = seed(client, "obs_download", owner="alice", bundle="s3://b/k/abc.zip")
+
+    response = client.get(f"/skills/{sid}/download", headers=h("alice"))
+
+    assert response.status_code == 200
+    assert response.json()["url"] == "https://obs.example/signed"

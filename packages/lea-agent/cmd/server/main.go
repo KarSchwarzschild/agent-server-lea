@@ -7,14 +7,19 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/redis/go-redis/v9"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/control"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/middleware"
+	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/persistence"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/router"
+	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/runtime"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/session"
 )
 
@@ -44,9 +49,62 @@ func main() {
 		port = "8100"
 	}
 
+	// 初始化 Redis 和缓存层
+	redisAddr := os.Getenv("REDIS_URL")
+	if redisAddr == "" {
+		redisAddr = "localhost:6379"
+	}
+
+	var redisClient *redis.Client
+	// 如果是完整的 redis:// URL，使用 ParseURL
+	if strings.HasPrefix(redisAddr, "redis://") {
+		opts, err := redis.ParseURL(redisAddr)
+		if err != nil {
+			log.Printf("[cache] Failed to parse REDIS_URL: %v — cache disabled", err)
+			redisClient = nil
+		} else {
+			redisClient = redis.NewClient(opts)
+		}
+	} else {
+		// 否则当作 host:port 处理
+		redisClient = redis.NewClient(&redis.Options{
+			Addr:         redisAddr,
+			Password:     os.Getenv("REDIS_PASSWORD"),
+			DB:           0,
+			DialTimeout:  5 * time.Second,
+			ReadTimeout:  3 * time.Second,
+			WriteTimeout: 3 * time.Second,
+		})
+	}
+
+	// 测试 Redis 连接
+	if redisClient != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if err := redisClient.Ping(ctx).Err(); err != nil {
+			log.Printf("[cache] Redis connection failed (addr=%s): %v — cache disabled", redisAddr, err)
+			redisClient = nil
+		} else {
+			log.Printf("[cache] Redis connected at %s", redisAddr)
+		}
+		cancel()
+	}
+
+	// 初始化缓存（Redis 失败时传 nil，缓存层会降级）
+	runtime.InitCache(redisClient)
+
+	// 初始化消息缓存
+	if db, err := persistence.DB(); err == nil && db != nil {
+		cacheLayer := runtime.GetCache()
+		router.InitMessageCache(cacheLayer, db, redisClient)
+		log.Printf("[cache] Message cache initialized")
+	} else {
+		log.Printf("[cache] Message cache init skipped (db unavailable)")
+	}
+
 	mgr := session.NewManager()
 
 	r := gin.Default()
+	r.Use(middleware.Metrics()) // 记录所有 HTTP 请求指标
 	r.Use(middleware.CORS())
 
 	api := r.Group("/api")
@@ -55,6 +113,9 @@ func main() {
 	// /api/user/agents/* → lea-config:8500/agents/* （用户视角 Agent CRUD）
 	api.Any("/user/agents", router.UserAgentsProxy())
 	api.Any("/user/agents/*path", router.UserAgentsProxy())
+	// /api/user/teams/* → lea-config:8500/teams/* （用户视角专家团 CRUD）
+	api.Any("/user/teams", router.UserTeamsProxy())
+	api.Any("/user/teams/*path", router.UserTeamsProxy())
 	// /api/user/skills/* → lea-config:8500/skills/* （技能市场）
 	api.Any("/user/skills", router.UserSkillsProxy())
 	api.Any("/user/skills/*path", router.UserSkillsProxy())
@@ -82,6 +143,9 @@ func main() {
 	var draining atomic.Bool
 
 	r.GET("/health", healthHandler(mgr, &draining))
+
+	// Prometheus 监控指标端点（不需要鉴权，供 Prometheus 抓取）
+	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	srv := &http.Server{Addr: ":" + port, Handler: r}
 

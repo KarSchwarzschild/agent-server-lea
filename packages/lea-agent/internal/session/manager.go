@@ -22,6 +22,7 @@ type Params struct {
 	AgentID   int
 	TenantID  string
 	UserID    string
+	ProjectID *int
 }
 
 type SSEEvent struct {
@@ -240,9 +241,29 @@ func (m *Manager) GetOrCreate(ctx context.Context, p Params) (*AgentSession, err
 		return nil, err
 	}
 
-	cfg, err := runtime.LoadAgentConfig(ctx, p.AgentID, p.TenantID)
+	// 有效激活 agent：库里 active_agent_id 是权威（用户挂的专家/专家团），非 0 就用它；
+	// 为 0（新会话还没落库，或显式默认）才回退请求带的 p.AgentID —— 那条回退只在"召唤"
+	// 首消息用得上（新会话首消息带 agent_id，之后 TouchSession 把它落进列，列即成权威）。
+	//
+	// 覆盖 p.AgentID：从这里起它就是"有效激活 agent"（0=默认），供 NewAgentSession 的
+	// memory scope 和 persistTurn 回填 active_agent_id 用。
+	eff := m.agentToLoad(ctx, p)
+	p.AgentID = eff
+
+	cfg, err := runtime.LoadAgentConfig(ctx, eff, p.TenantID)
 	if err != nil {
-		return nil, fmt.Errorf("load agent config: %w", err)
+		if eff == 0 {
+			return nil, fmt.Errorf("load agent config: %w", err)
+		}
+		// 挂的专家加载不出来（被删、被取消共享、lea-config 抖动）——回退默认 super-agent，
+		// 别让整段对话打不开。底座不能像挂载那样 fail-soft：底座 agent 失败会让
+		// NewAgentSession 直接报错，用户看到的是"会话开不了"而不是"少个专家"。
+		// 指纹仍按 eff 记（见 mergeSessionAttachments），所以列没变时不会每条消息反复重建。
+		log.Printf("active_agent_load_failed session=%s agent=%d err=%v —— 回退默认 super-agent", p.SessionID, eff, err)
+		cfg, err = runtime.LoadAgentConfig(ctx, 0, p.TenantID)
+		if err != nil {
+			return nil, fmt.Errorf("load fallback agent config: %w", err)
+		}
 	}
 
 	// 会话级挂载：用户在这一个会话里临时挂上的工具/知识库，并进 cfg。
@@ -257,7 +278,7 @@ func (m *Manager) GetOrCreate(ctx context.Context, p Params) (*AgentSession, err
 	//
 	// 整段失败只记日志不阻断：少几个临时工具，比**整段对话打不开**轻得多。
 	// 同理见 runtime.MergeAttachments 和 lea-config 那边对失效项的静默丢弃。
-	cfg, attachFP := m.mergeSessionAttachments(ctx, cfg, p)
+	cfg, attachFP := m.mergeSessionAttachments(ctx, cfg, p, eff)
 
 	s, err := NewAgentSession(ctx, cfg, p)
 	if err != nil {
@@ -446,18 +467,48 @@ func (m *Manager) Delete(id string) {
 	}
 }
 
+// agentToLoad 解出这个会话该加载哪个 agent（有效激活 agent，0=默认 super-agent）。
+//
+// 库里 active_agent_id 非 0 就用它（用户挂的专家/专家团，权威）；为 0（新会话还没落库、
+// 或显式默认）才回退请求带的 p.AgentID —— 那条回退只在"召唤"首消息用得上。之后每轮
+// 走到这里，列已经被 TouchSession 落成 eff，就一直命中列，客户端的 p.AgentID 不再参与。
+//
+// 拿不到库（未配 / 抖动）返回 p.AgentID：跟单实例本地开发一致，让对话照常开起来。
+func (m *Manager) agentToLoad(ctx context.Context, p Params) int {
+	db, err := persistence.DB()
+	if err != nil || db == nil {
+		return p.AgentID
+	}
+	if a := persistence.GetSessionActiveAgent(ctx, db, p.SessionID); a != 0 {
+		return a
+	}
+	return p.AgentID
+}
+
+// rebuildFingerprint 把"触发重建的两类输入"压成一个可比较的字符串：会话级挂载 + 激活 agent。
+//
+// 激活 agent 折进同一个指纹，是为了白嫖挂载那条已验证的重建链（Drop / MarkPendingRebuild /
+// 多副本自愈，见 persistence.Fingerprint 的长注释）：切专家和挂工具都是"改了会话的重建
+// 输入"，走同一条路发现并修正，不必为切专家另写一套跨副本逻辑。
+//
+// 用 activeAgent 的 raw 值（0=默认，N=专家 id），不是解析后的 cfg.ID —— 默认态请求带的是
+// 0 而 cfg.ID 是具体的 super-agent 主键，混用会让默认会话第二条消息就假变化、白重建一次。
+func rebuildFingerprint(rows []persistence.SessionAttachment, activeAgent int) string {
+	return persistence.Fingerprint(rows) + "|a:" + strconv.Itoa(activeAgent)
+}
+
 // mergeSessionAttachments 读这个会话挂了什么，解析后并进 cfg。
 //
 // 任何一步失败都返回 cfg 原样 —— 挂载是增量能力，它的问题不该让一段已有的对话打不开。
 // 但每一步失败都记日志：用户报"我昨天挂的工具今天不见了"时，只有日志能复原。
 //
-// 第二个返回值是这次用的挂载指纹，交给 AgentSession 记住，供 attachmentsChanged 比对。
+// 第二个返回值是这次用的重建指纹（挂载 + 激活 agent），交给 AgentSession 记住，供
+// attachmentsChanged 比对。activeAgent 传的是 eff（构建时的有效激活 agent）：TouchSession
+// 会把 eff 落进 active_agent_id，所以下一条消息 attachmentsChanged 从列读回来的就是它，
+// 两边对得上，不会平白重建。
 func (m *Manager) mergeSessionAttachments(
-	ctx context.Context, cfg *runtime.AgentConfig, p Params,
+	ctx context.Context, cfg *runtime.AgentConfig, p Params, activeAgent int,
 ) (*runtime.AgentConfig, string) {
-	if p.SessionID == "" {
-		return cfg, ""
-	}
 	db, err := persistence.DB()
 	if err != nil || db == nil {
 		return cfg, "" // 没配库：本地开发和单测都会走到，不是错误
@@ -467,7 +518,7 @@ func (m *Manager) mergeSessionAttachments(
 		log.Printf("session_attachments_load_failed session=%s err=%v (跳过挂载)", p.SessionID, err)
 		return cfg, ""
 	}
-	fp := persistence.Fingerprint(rows)
+	fp := rebuildFingerprint(rows, activeAgent)
 	if len(rows) == 0 {
 		return cfg, fp
 	}
@@ -478,10 +529,15 @@ func (m *Manager) mergeSessionAttachments(
 	return runtime.MergeAttachments(ctx, cfg, p.TenantID, p.UserID, refs), fp
 }
 
-// attachmentsChanged 判断内存里这份会话是不是按当前的挂载集合建的。
+// attachmentsChanged 判断内存里这份会话是不是按当前的挂载集合 + 激活 agent 建的。
 //
 // 读一次库比指纹。查询走 idx_session(tenant_id, session_id)，而 ReloadHistory 本来每轮
 // 就要读一次库 —— 多这一下可以忽略。
+//
+// 激活 agent 用**列里的 raw 值**比对（不是回退 p.AgentID 后的 eff）：列是权威，一旦落了库，
+// 中途切专家只认 PUT /active-agent 改列，不认请求字段 —— 否则客户端每条消息带的 agent_id
+// 都会顶掉列，语义就乱了。构建时存的指纹用的是 eff，而 eff 已被 TouchSession 落进列，所以
+// 常态下两边一致；只有别处（PUT、或另一副本）改了列，这里才判为变、触发重建。
 //
 // **查库失败时返回 false（当作没变）**：拿不到真相时保持现状，而不是每条消息都重建一遍。
 // 后者会在 lea-config 或 MySQL 抖动时把每一轮都变成完整重建，把一次小故障放大成全线变慢。
@@ -495,7 +551,8 @@ func (m *Manager) attachmentsChanged(ctx context.Context, s *AgentSession, p Par
 		log.Printf("attachments_fingerprint_check_failed session=%s err=%v (当作没变)", p.SessionID, err)
 		return false
 	}
-	return persistence.Fingerprint(rows) != s.AttachmentFingerprint()
+	activeRaw := persistence.GetSessionActiveAgent(ctx, db, p.SessionID)
+	return rebuildFingerprint(rows, activeRaw) != s.AttachmentFingerprint()
 }
 
 // Drop 丢掉内存里那份引擎对象，**不当作会话结束**。

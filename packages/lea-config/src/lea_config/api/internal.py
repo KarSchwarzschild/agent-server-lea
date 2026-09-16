@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import os
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from lea_config.database import get_db
 from lea_config.models.agent import Agent
-from lea_config.models.binding import AgentKbBinding, AgentSkillBinding, AgentToolBinding
+from lea_config.models.binding import (
+    AgentKbBinding,
+    AgentMcpBinding,
+    AgentSkillBinding,
+    AgentToolBinding,
+)
 from lea_config.models.knowledge import KnowledgeBase
 from lea_config.models.llm_provider import LLMProvider
 from lea_config.models.mcp_server import MCPServer
@@ -57,6 +65,41 @@ def _resolve_super_agent(db: Session, tenant_id: str) -> Agent | None:
     return q.first()
 
 
+def _ensure_super_agent(db: Session, tenant_id: str) -> Agent | None:
+    if not tenant_id:
+        return None
+    agent = _resolve_super_agent(db, tenant_id)
+    if agent:
+        return agent
+
+    agent = Agent(
+        tenant_id=tenant_id,
+        name="super-agent",
+        description="默认通用专家",
+        model=os.getenv("LEA_MODEL_CHAT", "qwen3-max"),
+        is_system=True,
+        enabled=True,
+    )
+    db.add(agent)
+    try:
+        db.commit()
+        db.refresh(agent)
+        return agent
+    except IntegrityError:
+        db.rollback()
+        return _resolve_super_agent(db, tenant_id)
+
+
+def _tenant_llm_fallback(model_name: str) -> dict:
+    base_url = os.getenv("LEA_TENANT_API_BASE", "").rstrip("/")
+    api_key = os.getenv("LEA_TENANT_API_KEY", "")
+    if not base_url or not api_key or not model_name:
+        return {}
+    if not base_url.endswith("/v1"):
+        base_url += "/v1"
+    return {"llm_base_url": base_url, "llm_api_key": api_key}
+
+
 @router.get("/agent-config/{agent_id}")
 def get_agent_config(
     agent_id: int,
@@ -71,7 +114,7 @@ def get_agent_config(
     if agent_id > 0:
         agent = db.query(Agent).filter(Agent.id == agent_id).first()
     if agent is None:
-        agent = _resolve_super_agent(db, tenant_id)
+        agent = _ensure_super_agent(db, tenant_id)
     if not agent:
         raise HTTPException(404, "Agent not found (and no super-agent seeded)")
     agent_id = agent.id
@@ -161,6 +204,43 @@ def get_agent_config(
             d["name"] = exposed_name(t)
             tools.append(d)
 
+    # MCP server 绑定 —— 展开成它同步出的工具行，并进 tools。
+    #
+    # 粒度是整个 server（跟会话级挂载一致）：绑一个 server = 用它当前同步出的全部工具，
+    # server 事后 sync 出新工具会自动跟上，不用回来改绑定。
+    #
+    # **不按 user 过滤可见性**：跟上面 tool_bindings 那段同理 —— 可见性在 bind_mcp 那一步
+    # 校验过了，agent-config 是引擎内部拉的整包配置。私有 server 混进共享 agent 由分享闸
+    # （agents.py::_share_blockers）在上架时硬拦，不在这里。
+    #
+    # 按 tool id 去重：同一个工具既被逐个绑（agent_tool_bindings）又随 server 绑进来时，
+    # 只留一份。留先来的那份（逐个绑的），跟会话级 MergeAttachments"碰撞保留已有"一致。
+    mcp_ids = [
+        b.mcp_server_id
+        for b in db.query(AgentMcpBinding).filter_by(agent_id=agent_id).all()
+        if b.enabled
+    ]
+    if mcp_ids:
+        seen_tool_ids = {t["id"] for t in tools}
+        servers = (
+            db.query(MCPServer)
+            .filter(MCPServer.id.in_(mcp_ids), MCPServer.enabled.is_(True))
+            .all()
+        )
+        for srv in servers:
+            rows = (
+                db.query(Tool)
+                .filter(Tool.mcp_server_id == srv.id, Tool.enabled.is_(True))
+                .all()
+            )
+            for t in rows:
+                if t.id in seen_tool_ids:
+                    continue
+                seen_tool_ids.add(t.id)
+                d = _row_to_dict(t)
+                d["name"] = exposed_name(t)
+                tools.append(d)
+
     # Team
     team_row = db.query(AgentTeam).filter_by(agent_id=agent_id).first()
     team = None
@@ -198,6 +278,8 @@ def get_agent_config(
                 # 而且都由上面这次 provider 匹配得出。
                 "model_context_window": _context_window_of(matched, model_name),
             }
+        else:
+            llm_config = _tenant_llm_fallback(model_name)
 
     return {
         "agent": _row_to_dict(agent),
@@ -405,3 +487,120 @@ def resolve_attachments(body: ResolveAttachmentsBody, db: Session = Depends(get_
             kb_ids.append(k.id)
 
     return {"tools": tools_out, "skills": skills_out, "kb_ids": kb_ids, "dropped": dropped}
+
+
+# ── 挂载的展示信息 ────────────────────────────────────────────────────────
+#
+# 界面上那排 chip（"你挂了 天气查询 ✕ / PDF处理 ✕"）要的是名字，而挂载行里只有
+# {kind, ref_id}。这个端点把 id 换成人能读的标签。
+#
+# ## 为什么不复用 /resolve-attachments
+#
+# 那个是给**引擎**用的，形状被三件事绑住，都跟展示冲突：
+#
+#     mcp_server 被展平成 N 个工具   → 丢了"哪个 ref_id 产生的"，chip 画不出来
+#     skill 返回整段 SKILL.md        → 一个 chip 传几 KB 正文，纯浪费
+#     失效项进 dropped 另一个数组     → 前端要自己把两个数组缝回原来的顺序
+#
+# 硬改那个形状会动到引擎建会话那条路 —— 那是主链路。加一个只读端点便宜得多。
+#
+# ## 失效项**留在列表里**，标 available=false
+#
+# 跟 resolve 那边的"静默丢弃"相反，而这是故意的：那边要保证会话能建起来，这边要
+# 让用户看见"你挂的这个东西现在用不了"。全丢掉的话 chip 会无声消失，用户只会觉得
+# 自己记错了；标出来他才知道该去摘掉或者找人恢复。
+
+
+class DescribeAttachmentsBody(BaseModel):
+    tenant_id: str
+    user_id: str = ""
+    items: list[AttachmentRef] = []
+
+
+# 每种 kind 的 (模型, 可见性判据, 有没有 display_name)。
+#
+# 表驱动而不是四段 if：加一种资源只需要多一行，而漏掉一种的表现是那类 chip 永远
+# 显示"未知"——比报错难发现。mcp_server / knowledge_bases 没有 display_name 列
+# （见各自的模型），所以这里要记下来，不能对所有 kind 都去取那个属性。
+_DESCRIBABLE = {
+    "tool": (Tool, visible_to, True),
+    "skill": (Skill, skill_visible_to, True),
+    "mcp_server": (MCPServer, mcp_visible_to, False),
+}
+
+
+@router.post("/describe-attachments")
+def describe_attachments(body: DescribeAttachmentsBody, db: Session = Depends(get_db)):
+    """把 {kind, ref_id} 换成 {name, display_name, description, available}。
+
+    顺序跟传进来的一致 —— 前端按用户挂载的顺序渲染，重排会让 chip 位置随每次刷新跳动。
+
+    ⚠️ 这个端点**不能**用来判断"能不能用"以外的任何事。它返回的名字是给人看的，
+    工具真正的调用名（带 my__ / mcp_{id}_ 前缀）由 resolve 那条路决定。两处各算一次
+    前缀是错的 —— 那正是 remote_tool_name 那个坑的形状。
+    """
+    out: list[dict] = []
+
+    # 按 kind 分组批量查，避免 N 次单行查询。同一个 kind 里保持传入顺序靠下面
+    # 回填时按 ref_id 取，不依赖查询返回的顺序。
+    by_kind: dict[str, list[int]] = {}
+    for i in body.items:
+        by_kind.setdefault(i.kind, []).append(i.ref_id)
+
+    found: dict[tuple[str, int], object] = {}
+    for kind, ids in by_kind.items():
+        spec = _DESCRIBABLE.get(kind)
+        if spec is None:
+            continue
+        model, vis, _ = spec
+        rows = (
+            db.query(model)
+            .filter(
+                model.id.in_(ids),
+                model.enabled.is_(True),
+                *vis(body.tenant_id, body.user_id or None),
+            )
+            .all()
+        )
+        for r in rows:
+            found[(kind, r.id)] = r
+
+    # kb 的可见性用的是 visibility/owner 那套老编码，不是 owner_scope 三段式，所以
+    # 单独一段。统一两套编码是另一件事（resolve 那边同样分开处理）。
+    kb_ids = by_kind.get("kb", [])
+    if kb_ids:
+        for k in (
+            db.query(KnowledgeBase)
+            .filter(
+                KnowledgeBase.id.in_(kb_ids),
+                KnowledgeBase.tenant_id == body.tenant_id,
+                KnowledgeBase.enabled.is_(True),
+            )
+            .all()
+        ):
+            if k.visibility == "private" and k.owner != body.user_id:
+                continue
+            found[("kb", k.id)] = k
+
+    for i in body.items:
+        row = found.get((i.kind, i.ref_id))
+        if row is None:
+            # 名字都取不到（删了 / 停用 / 够不着）。给一个能显示的占位，而不是让
+            # 前端拿到 null 去猜 —— chip 上写"已失效"比空白强。
+            out.append({
+                "kind": i.kind, "ref_id": i.ref_id,
+                "name": "", "display_name": "", "description": "",
+                "available": False,
+            })
+            continue
+        has_display = _DESCRIBABLE.get(i.kind, (None, None, False))[2]
+        out.append({
+            "kind": i.kind,
+            "ref_id": i.ref_id,
+            "name": row.name,
+            "display_name": (row.display_name or "") if has_display else "",
+            "description": row.description or "",
+            "available": True,
+        })
+
+    return {"attachments": out}

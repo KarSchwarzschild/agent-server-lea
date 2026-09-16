@@ -1,6 +1,6 @@
-"""CubeSandbox 原生客户端 — 不依赖 E2B SDK，直接用 httpx 调 API。
+"""CubeSandbox SDK 适配层。
 
-通过 HTTPS + Host header 绕过 DNS，从任何机器都能连。
+通过官方 ``cubesandbox`` SDK 管理实例、执行 Python 与 Shell 命令、读写文件。
 
 产物持久化策略（v2 · NFS host-mount —— 详见 SANDBOX_NFS_STORAGE.md）：
 - 2 组 host-mount：/workspace (RW session) + /opt/skills (RO session，只含本
@@ -12,7 +12,6 @@
 
 from __future__ import annotations
 
-import json as _json
 import os
 import time
 from dataclasses import dataclass, field
@@ -20,7 +19,6 @@ from dataclasses import dataclass, field
 import httpx
 import structlog
 
-from lea_tools.services.artifact_pusher import ArtifactPusher
 from lea_tools.services.nfs_provisioner import build_host_mount, ensure_session_dir
 
 logger = structlog.get_logger()
@@ -46,6 +44,9 @@ os.environ['npm_config_cache']  = '/tmp/npm-cache'
 """
 
 
+_SHELL_LANGUAGES = frozenset({"bash", "shell", "sh"})
+
+
 @dataclass
 class CubeExecution:
     stdout: str = ""
@@ -54,6 +55,11 @@ class CubeExecution:
     # 相对 /workspace 的路径，如 "report.xlsx"、"charts/plot.png"、"src/App.vue"。
     # 差集扫描 + 剪枝目录后已 push 到 S3；前端拿来在气泡里显示"本次新增 N 个文件"
     # 提示（详细文件列表在右侧抽屉里从 S3 list_objects 拿）。
+    #
+    # ⚠️ 这些是"这次执行**碰过**哪些文件"，**不是**用户文件库意义上的"成品"。
+    # 后者只认模型显式调 deliver_artifact 声明的那些（写进 session_artifacts）——
+    # 不猜、不按扩展名扫、不看修改时间。中间产物、调试图、临时 csv 都会出现在这个
+    # 列表里，但它们不该进用户的长期文件库。两个概念同名不同义，别混。
     artifacts: list[str] = field(default_factory=list)
     duration_ms: int = 0
 
@@ -104,6 +110,12 @@ def find_session_sandbox(session_id: str) -> dict | None:
 
     paused 的沙箱也会被返回，这是对的 —— Cube 的 on_timeout=pause + auto_resume
     意味着 paused 只是"冻着"，下次请求会自动醒，工作区和装好的依赖都还在。
+
+    ⚠️ 返回的 state 可能是**过渡态** `pausing` / `resuming`，不只是 running/paused
+    —— Cube 的状态机是五个态，快照要存内存+文件系统，一个装过依赖的沙箱转完要一两
+    分钟。调用方别拿 `state == "paused"` 当"暂停了没"的唯一判据：看见 pausing 就说明
+    转换已经开始了。反过来把过渡态当异常，得到的结论会跟事实相反（验收脚本踩过：
+    等到 end_at 之后读到 pausing，报的是"on_timeout=pause 没生效"，而它恰好生效了）。
     """
     if not session_id:
         return None
@@ -136,10 +148,62 @@ def find_session_sandbox(session_id: str) -> dict | None:
     return {
         "sandbox_id": sandbox_id,
         "tenant_id": (row.get("metadata") or {}).get(META_TENANT, ""),
+        # state/startedAt/endAt 顺手带出来：它们本来就在这一行里，取它们不多花一次
+        # 请求。调用方（GET /sandbox/sessions/{id}）要靠 state 才能观察到
+        # running→paused→running 这条自动生命周期 —— 没有它，"暂停/恢复能不能用"
+        # 这个问题只能靠等着看下一次调用会不会超时来猜。
+        "state": row.get("state", ""),
+        "started_at": row.get("startedAt", ""),
+        "end_at": row.get("endAt", ""),
     }
 
 
+def _sandbox_timeout() -> int:
+    """建沙箱时给 Cube 的 timeout（秒）—— 到点转 paused（不是销毁，见 lifecycle）。
+
+    这是三层生命周期的第一道线：0~timeout 运行中，timeout~IDLE_TIMEOUT 由 Cube 暂停
+    着（下次调用 auto_resume 拉起来），再往后本地回收器真删。
+
+    ## 为什么要能配
+
+    原来是硬编码 900。900 秒对生产是对的（用户去开会回来还能接着用），但它让
+    "暂停/恢复"这条路**在验收里根本走不到** —— 要观察一次自动暂停得干等 15 分钟，
+    于是这条路一直没被真跑过，而没跑过的路等于不存在（SB-2 那次就是这么栽的）。
+
+    调小它是验收暂停/恢复的唯一办法：设成 60，一分钟后沙箱进 paused，再发一次调用
+    看它 auto_resume 起来。生产不设这个变量，就还是 900。
+    """
+    raw = os.getenv("CUBE_SANDBOX_TIMEOUT", "")
+    if not raw:
+        return 900
+    try:
+        val = int(raw)
+    except ValueError:
+        logger.warning("cube_sandbox_timeout_invalid", raw=raw, fallback=900)
+        return 900
+    # 下限兜一手：0 或负数在 Cube 那边的含义没验证过，而"沙箱建出来立刻就暂停"
+    # 表现为每次调用都要等一次 resume，看起来像随机的超时。
+    if val < 30:
+        logger.warning("cube_sandbox_timeout_too_small", raw=val, clamped=30)
+        return 30
+    return val
+
+
 def _kill_sandbox(api_url: str, sandbox_id: str) -> None:
+    """真删一个沙箱。回收器和用户显式删除都走这里。
+
+    ## paused 的沙箱也能删
+
+    Cube 对 paused 沙箱的 DELETE 会先内部 restore 再删（实测 ≤5s），所以不需要
+    先 resume 再删这种两步操作。但它多出两个状态码：
+
+      409  restore 失败（快照坏了/资源不够）—— 沙箱还在，重试可能成功
+      503  正在状态转换中，带 Retry-After
+
+    这两个都**不算成功**，所以照旧 raise_for_status。回收器那边一次失败会记
+    sandbox_reap_failed，下一轮（60s）自己再试 —— 所以这里不做重试，重试语义
+    由调用循环承担。
+    """
     resp = httpx.delete(f"{api_url}/sandboxes/{sandbox_id}", timeout=10)
     # 已经没了也算成功 —— 多副本同时回收时这是常态，不是错误。
     if resp.status_code not in (200, 202, 204, 404):
@@ -209,9 +273,8 @@ class CubeSandbox:
                  sandbox_id: str | None = None):
         """sandbox_id 为空则建新沙箱；给了就是**接管**一个已经存在的。
 
-        接管路径存在的理由见 find_session_sandbox：句柄里除了 sandbox_id 没有别的
-        不可重建的东西（每个方法都只用 sandbox_id + domain 拼 envd 的 Host 头，
-        _client 是个普通 httpx.Client），所以换个进程照样能接着用。
+        接管路径存在的理由见 find_session_sandbox：SDK 的 ``Sandbox.connect`` 以
+        sandbox_id 重新连接 Cube，paused 状态会自动恢复，所以换个进程也能继续执行。
         """
         self._api_url = os.getenv("CUBE_API_URL", "http://localhost:3000")
         self._proxy_host = os.getenv("CUBE_PROXY_HOST", "")
@@ -219,18 +282,23 @@ class CubeSandbox:
         self._domain = os.getenv("CUBE_DOMAIN", DEFAULT_DOMAIN)
         self._session_id = session_id
         self._tenant_id = tenant_id
-        self._artifact_pusher = ArtifactPusher()
-
         if not self._proxy_host:
             from urllib.parse import urlparse
             parsed = urlparse(self._api_url)
             self._proxy_host = parsed.hostname or "localhost"
 
-        self._client = httpx.Client(verify=False, timeout=60)
+        from cubesandbox import Config, Sandbox
+        self._sdk_config = Config(
+            api_url=self._api_url,
+            template_id=self._template or None,
+            proxy_node_ip=self._proxy_host or None,
+            sandbox_domain=self._domain,
+        )
 
         if sandbox_id:
             self.sandbox_id = sandbox_id
-            self.host_mounted = False  # 接管时不知道，也没人读这个字段
+            self._sdk = Sandbox.connect(sandbox_id, config=self._sdk_config)
+            self.host_mounted = True
             logger.info("cube_sandbox_attached",
                         session_id=session_id, sandbox_id=sandbox_id)
             return
@@ -258,164 +326,62 @@ class CubeSandbox:
                 metadata["host-mount"] = build_host_mount(tenant_id, session_id)
                 self.host_mounted = True
             else:
-                logger.info(
-                    "host-mount skipped: shared storage not writable from lea-tools",
-                    session_id=session_id,
+                raise RuntimeError(
+                    "NFS workspace is unavailable; refusing to create a sandbox "
+                    "without the session host-mount"
                 )
-
-        resp = httpx.post(
-            f"{self._api_url}/sandboxes",
-            json={
-                "templateID": self._template,
-                "timeout": 900,
-                "lifecycle": {"on_timeout": "pause", "auto_resume": True},
-                **({"metadata": metadata} if metadata else {}),
-            },
-            timeout=30,
+        self._sdk = Sandbox.create(
+            template=self._template,
+            timeout=_sandbox_timeout(),
+            lifecycle={"on_timeout": "pause", "auto_resume": True},
+            metadata=metadata or None,
+            config=self._sdk_config,
         )
-        resp.raise_for_status()
-        data = resp.json()
-        self.sandbox_id = data["sandboxID"]
-        self._domain = data.get("domain", self._domain)
-
-    def _envd_host(self, port: int = 49999) -> str:
-        return f"{port}-{self.sandbox_id}.{self._domain}"
-
-    def _scan_workspace(self) -> set[str]:
-        """在沙箱里跑 os.walk 扫 /workspace，返回相对路径集合。失败返空集不阻塞。
-
-        剪枝大目录（node_modules/venv/skill/…）+ 上限保护，避免扫崩。
-        """
-        prune = sorted(_ARTIFACT_PRUNE_DIRS)
-        code = (
-            "import os\n"
-            f"_PRUNE = set({prune!r})\n"
-            f"_MAX = {_ARTIFACT_MAX_FILES}\n"
-            "_n = 0\n"
-            "for root, dirs, files in os.walk('/workspace'):\n"
-            "    dirs[:] = [d for d in dirs if d not in _PRUNE]\n"
-            "    for f in files:\n"
-            "        p = os.path.join(root, f)\n"
-            "        print(os.path.relpath(p, '/workspace'))\n"
-            "        _n += 1\n"
-            "        if _n >= _MAX:\n"
-            "            import sys\n"
-            "            print('__SCAN_TRUNCATED__', file=sys.stderr)\n"
-            "            break\n"
-            "    if _n >= _MAX:\n"
-            "        break\n"
-        )
-        try:
-            host = self._envd_host()
-            resp = self._client.post(
-                f"https://{self._proxy_host}:443/execute",
-                headers={"Host": host, "Content-Type": "application/json"},
-                json={"code": code, "context_id": None, "language": None, "env_vars": None},
-                timeout=15,
-            )
-            files: set[str] = set()
-            for line in resp.text.strip().split("\n"):
-                if not line:
-                    continue
-                try:
-                    msg = _json.loads(line)
-                except _json.JSONDecodeError:
-                    continue
-                if msg.get("type") == "stdout":
-                    for name in msg.get("text", "").splitlines():
-                        name = name.strip().replace("\\", "/")
-                        if name:
-                            files.add(name)
-            return files
-        except Exception as e:
-            logger.warning("cube_workspace_scan_failed", error=str(e))
-            return set()
-
-    def _push_artifacts(self, rel_paths: list[str]) -> list[str]:
-        """把 rel_paths 里的文件从沙箱里读出来 push 到 S3。返回真正 push 成功的列表。
-
-        失败的文件跳过（记 warn），不阻塞整体流程 —— 保证用户至少能看到部分产物。
-        """
-        if not rel_paths or not self._session_id:
-            return []
-        succeeded: list[str] = []
-        for rel in rel_paths:
-            try:
-                data = self.read_file(f"/workspace/{rel}")
-                self._artifact_pusher.upload(self._session_id, rel, data)
-                succeeded.append(rel)
-            except Exception as e:
-                logger.warning("cube_artifact_push_failed",
-                              session_id=self._session_id, path=rel, error=str(e))
-        return succeeded
+        self.sandbox_id = self._sdk.sandbox_id
+        self._domain = self._sdk.domain
 
     def run_code(self, code: str, language: str = "python", timeout: int = 60) -> CubeExecution:
         t0 = time.time()
 
         # 运行时注入：cwd 到 output + 禁 pyc + npm 环境变量
-        if language == "python":
+        lang = (language or "python").lower()
+        if lang in _SHELL_LANGUAGES:
+            result = self._sdk.commands.run(
+                code, cwd="/workspace", timeout=timeout, user="root"
+            )
+            return CubeExecution(
+                stdout=result.stdout, stderr=result.stderr,
+                exit_code=result.exit_code, artifacts=[],
+                duration_ms=int((time.time() - t0) * 1000),
+            )
+        if lang == "python":
             code = _RUNTIME_INJECT + "\n" + code
+        else:
+            # 跟 MockSandbox 保持一致（exit_code=2）。以前是**静默透传**：不认识的
+            # language 原样发给 envd，而 envd 只会当 Python 跑 —— 于是"不支持"表现成
+            # 一个莫名其妙的 SyntaxError，看日志的人会去查用户的脚本。
+            return CubeExecution(
+                exit_code=2, stderr=f"unsupported language: {language}",
+                duration_ms=int((time.time() - t0) * 1000),
+            )
 
-        host = self._envd_host()
-        resp = self._client.post(
-            f"https://{self._proxy_host}:443/execute",
-            headers={"Host": host, "Content-Type": "application/json"},
-            json={"code": code, "context_id": None, "language": None, "env_vars": None},
-            timeout=timeout,
-        )
-
-        stdout, stderr, exit_code = "", "", 0
-        for line in resp.text.strip().split("\n"):
-            if not line:
-                continue
-            try:
-                msg = _json.loads(line)
-            except _json.JSONDecodeError:
-                continue
-            if msg.get("type") == "stdout":
-                stdout += msg.get("text", "")
-            elif msg.get("type") == "stderr":
-                stderr += msg.get("text", "")
-            elif msg.get("type") == "error":
-                exit_code = 1
-                stderr += msg.get("traceback", msg.get("value", ""))
-
-        # NFS host-mount 模式下不再 push S3。文件直接在 NFS 上，
-        # 前端抽屉 readdir NFS 即可。artifacts 字段从 NFS diff 构建（Phase 3）。
+        result = self._sdk.run_code(code, timeout=timeout)
+        stdout = "".join(result.logs.stdout)
+        stderr = "".join(result.logs.stderr)
+        if result.error:
+            stderr += str(result.error)
         return CubeExecution(
-            stdout=stdout, stderr=stderr, exit_code=exit_code,
-            artifacts=[],
-            duration_ms=int((time.time() - t0) * 1000),
+            stdout=stdout, stderr=stderr,
+            exit_code=1 if result.error else 0,
+            artifacts=[], duration_ms=int((time.time() - t0) * 1000),
         )
 
     def write_file(self, path: str, data: bytes) -> None:
-        host = self._envd_host(port=49983)
-        resp = self._client.post(
-            f"https://{self._proxy_host}:443/files",
-            headers={"Host": host, "Content-Type": "application/octet-stream"},
-            params={"path": path},
-            content=data,
-        )
-        # 之前这里丢掉了响应，于是 4xx/5xx（磁盘满、路径不可写、envd 挂了）全都
-        # 表现为"写成功"，调用方毫不知情。read_file 一直有这道，写侧漏了。
-        resp.raise_for_status()
+        self._sdk.files.write(path, data)
 
     def read_file(self, path: str) -> bytes:
-        host = self._envd_host(port=49983)
-        resp = self._client.get(
-            f"https://{self._proxy_host}:443/files",
-            headers={"Host": host},
-            params={"path": path},
-        )
-        resp.raise_for_status()
-        return resp.content
+        value = self._sdk.files.read(path)
+        return value.encode() if isinstance(value, str) else value
 
     def kill(self) -> None:
-        try:
-            httpx.delete(
-                f"{self._api_url}/sandboxes/{self.sandbox_id}",
-                timeout=10,
-            )
-        except Exception as e:
-            logger.warning("cube_sandbox_delete_failed",
-                          sandbox_id=self.sandbox_id, error=str(e))
+        self._sdk.kill()

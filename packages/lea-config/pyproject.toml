@@ -17,6 +17,7 @@ dependencies = [
     "boto3>=1.35",
     "esdk-obs-python>=3.26",
     "pyyaml>=6.0",
+    "prometheus-client>=0.20",
     # 服务间调用。**只用来打内网的 lea-tools**（MCP sync 的出网那一跳，见
     # api/mcp_servers.py::_discover_remote_tools）。
     #

@@ -273,14 +273,43 @@ async def test_is_error_result_becomes_an_error(db, monkeypatch):
 
     不认它的话，模型会拿着一句错误信息当数据用 —— 比如把 "API key invalid"
     当成查询结果写进回答里。
+
+    ⚠️ 这里 mock 到 **SDK 那层**（streamablehttp_client + ClientSession），而不是
+    MCPSession.call_tool —— 因为要测的正是 call_tool 里"读 result.isError → 抛
+    MCPError"这一段。mock 掉 call_tool 就把被测逻辑一起 mock 没了。（旧版本 mock 的
+    `_rpc` 是裸 POST 时代的方法，SDK 重写后已不存在。）
     """
     server = mk_server(db)
     monkeypatch.setattr("lea_tools.db.SessionLocal", lambda: db)
 
-    async def fake_rpc(self, method, params):
-        return {"isError": True, "content": [{"type": "text", "text": "API key invalid"}]}
+    from types import SimpleNamespace
+    import lea_tools.executor.mcp_proxy as m
 
-    monkeypatch.setattr(MCPSession, "_rpc", fake_rpc)
+    class _FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def initialize(self):
+            return SimpleNamespace(capabilities=SimpleNamespace(resources=None))
+
+        async def call_tool(self, name, params):
+            return SimpleNamespace(
+                isError=True,
+                content=[SimpleNamespace(type="text", text="API key invalid")],
+            )
+
+    class _FakeStream:
+        async def __aenter__(self):
+            return (None, None, None)
+
+        async def __aexit__(self, *a):
+            return False
+
+    monkeypatch.setattr(m, "streamablehttp_client", lambda *a, **k: _FakeStream())
+    monkeypatch.setattr(m, "ClientSession", lambda *a, **k: _FakeSession())
 
     from lea_tools.executor.mcp_proxy import mcp_call
 
@@ -303,11 +332,21 @@ def _remote(*names):
     ]
 
 
-async def run_sync(db, monkeypatch, server, remote):
-    async def fake_list(self):
-        return remote
+async def run_sync(db, monkeypatch, server, remote, *, resources=None, supports_resources=None):
+    # sync 现在调 describe()（一次连接同时取 tools + resources + 能力位），不再单调
+    # list_tools。默认 supports_resources 跟着 resources 是否给了走 —— 老用例不传
+    # resources 就当这个 server 没有 resources 能力，行为跟以前一致。
+    if supports_resources is None:
+        supports_resources = bool(resources)
 
-    monkeypatch.setattr(MCPSession, "list_tools", fake_list)
+    async def fake_describe(self):
+        return {
+            "tools": remote,
+            "resources": resources or [],
+            "supports_resources": supports_resources,
+        }
+
+    monkeypatch.setattr(MCPSession, "describe", fake_describe)
     monkeypatch.setattr("lea_tools.api.admin_mcp.get_db", lambda: db)
 
     from lea_tools.api.admin_mcp import sync_mcp_tools
@@ -475,6 +514,146 @@ async def test_tool_filter_narrows_what_gets_synced(db, monkeypatch):
 
     assert out["synced"] == 1
     assert out["tools"] == [f"mcp_{server.id}_search"]
+
+
+# ── resources → 两个合成工具行 ────────────────────────────────────────────
+#
+# MCP 的 resources 是另一套原语（list/read by URI），而模型只会调 tool。sync 把
+# "这个 server 能读资源"投影成 mcp_{id}_list_resources / mcp_{id}_read_resource 两个
+# 合成工具行，判据写在 endpoint 列（真工具行 endpoint 恒为 NULL）。它们复用整条 tool
+# 下发/执行管道，所以 agent-binding / session-mount 白拿。
+
+def _res(uri, **kw):
+    return {"uri": uri, **kw}
+
+
+@pytest.mark.asyncio
+async def test_sync_adds_resource_tools_when_supported(db, monkeypatch):
+    """server 广告了 resources → 多出两个合成工具行，带 marker。"""
+    from lea_tools.executor.mcp_proxy import MCP_RESOURCE_LIST, MCP_RESOURCE_READ
+
+    server = mk_server(db)
+    out = await run_sync(
+        db, monkeypatch, server, _remote("search"),
+        resources=[_res("wiki://a", name="A"), _res("wiki://b")],
+    )
+
+    assert out["supports_resources"] is True
+    assert out["resource_count"] == 2
+
+    lst = db.query(Tool).filter_by(name=f"mcp_{server.id}_list_resources").one()
+    rd = db.query(Tool).filter_by(name=f"mcp_{server.id}_read_resource").one()
+    # marker 落在 endpoint 列 —— mcp_call 靠它分流到 resources 分支。
+    assert lst.endpoint == MCP_RESOURCE_LIST
+    assert rd.endpoint == MCP_RESOURCE_READ
+    assert lst.execution_type == "mcp" and rd.execution_type == "mcp"
+    # read_resource 的 schema 必须要 uri —— 没有它模型不知道读哪个。
+    assert rd.schema_json["required"] == ["uri"]
+
+
+@pytest.mark.asyncio
+async def test_sync_no_resource_tools_when_unsupported(db, monkeypatch):
+    """server 没广告 resources → 一个合成行都不建（老行为不变）。"""
+    server = mk_server(db)
+    await run_sync(db, monkeypatch, server, _remote("search"))
+
+    names = {t.name for t in db.query(Tool).filter_by(mcp_server_id=server.id)}
+    assert names == {f"mcp_{server.id}_search"}
+
+
+@pytest.mark.asyncio
+async def test_resource_tools_removed_when_capability_disappears(db, monkeypatch):
+    """server 关掉 resources 能力 → 下次 sync 那两个合成行进 stale 被删。
+
+    合成行跟真工具行一样进 synced 集合，所以"远端不再有"的清理逻辑天然覆盖它们，
+    不用为它们单写一条删除。
+    """
+    server = mk_server(db)
+    await run_sync(db, monkeypatch, server, _remote("search"),
+                   resources=[_res("wiki://a")])
+    assert db.query(Tool).filter_by(mcp_server_id=server.id).count() == 3
+
+    # 能力消失（supports_resources=False）—— 两个合成行该被删掉，真工具行留着。
+    await run_sync(db, monkeypatch, server, _remote("search"),
+                   supports_resources=False)
+    names = {t.name for t in db.query(Tool).filter_by(mcp_server_id=server.id)}
+    assert names == {f"mcp_{server.id}_search"}
+
+
+@pytest.mark.asyncio
+async def test_mcp_call_routes_list_resources(db, monkeypatch):
+    """endpoint marker = list → 走 list_resources，不走 call_tool。"""
+    from lea_tools.executor.mcp_proxy import MCP_RESOURCE_LIST, mcp_call
+
+    server = mk_server(db)
+
+    async def boom(self, name, params):
+        raise AssertionError("resources 工具不该走 call_tool")
+
+    async def fake_list_resources(self):
+        return [{"uri": "wiki://a", "name": "A", "description": "关于 A", "mimeType": "text/markdown"}]
+
+    monkeypatch.setattr(MCPSession, "call_tool", boom)
+    monkeypatch.setattr(MCPSession, "list_resources", fake_list_resources)
+    monkeypatch.setattr("lea_tools.db.SessionLocal", lambda: db)
+
+    result = await mcp_call(
+        ToolCall(tool_name=f"mcp_{server.id}_list_resources", params={},
+                 execution_type="mcp", endpoint=MCP_RESOURCE_LIST,
+                 mcp_server_id=server.id),
+        credential=None,
+    )
+    assert result.status == "success"
+    # 渲染成给模型看的文本，uri 必须在里面（模型拿它去 read）。
+    assert "wiki://a" in result.output["content"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_call_routes_read_resource(db, monkeypatch):
+    """endpoint marker = read → 走 read_resource，uri 从 params 取。"""
+    from lea_tools.executor.mcp_proxy import MCP_RESOURCE_READ, mcp_call
+
+    server = mk_server(db)
+    seen = {}
+
+    async def fake_read_resource(self, uri):
+        seen["uri"] = uri
+        return [{"uri": uri, "text": "正文内容", "mimeType": "text/plain"}]
+
+    monkeypatch.setattr(MCPSession, "read_resource", fake_read_resource)
+    monkeypatch.setattr("lea_tools.db.SessionLocal", lambda: db)
+
+    result = await mcp_call(
+        ToolCall(tool_name=f"mcp_{server.id}_read_resource", params={"uri": "wiki://a"},
+                 execution_type="mcp", endpoint=MCP_RESOURCE_READ,
+                 mcp_server_id=server.id),
+        credential=None,
+    )
+    assert seen["uri"] == "wiki://a"
+    assert "正文内容" in result.output["content"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_call_read_resource_requires_uri(db, monkeypatch):
+    """read_resource 少了 uri → 明确报错，不去连远端。"""
+    from lea_tools.executor.mcp_proxy import MCP_RESOURCE_READ, mcp_call
+
+    server = mk_server(db)
+
+    async def boom(self, uri):
+        raise AssertionError("缺 uri 时不该连远端")
+
+    monkeypatch.setattr(MCPSession, "read_resource", boom)
+    monkeypatch.setattr("lea_tools.db.SessionLocal", lambda: db)
+
+    result = await mcp_call(
+        ToolCall(tool_name=f"mcp_{server.id}_read_resource", params={},
+                 execution_type="mcp", endpoint=MCP_RESOURCE_READ,
+                 mcp_server_id=server.id),
+        credential=None,
+    )
+    assert result.status == "error"
+    assert "uri" in result.error
 
 
 @pytest.mark.asyncio

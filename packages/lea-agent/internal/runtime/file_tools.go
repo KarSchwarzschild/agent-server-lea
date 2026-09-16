@@ -41,15 +41,21 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"gitlab.ouc-online.com.cn/aibase/agentloop/tool"
+	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/persistence"
 )
+
+var sandboxCreateClient = &http.Client{Timeout: 180 * time.Second}
 
 // 文件工具的 HTTP 客户端。不共用 config_loader 那个 10s client：读写走 NFS 通常是
 // 毫秒级，但 sandbox 回落模式要经 envd 往返，且 bash 自带最长 120s 的执行超时。
@@ -73,6 +79,21 @@ type fileToolBase struct {
 	// 一个会话内多个工具共享同一份（指针传递），因为 Read 读的和
 	// Write 要写的是同一个文件 —— 分开存就等于没有校验。
 	readSet *readSet
+}
+
+func stageName(id int64, filename string) string {
+	name := path.Base(filename)
+	name = strings.Map(func(r rune) rune {
+		if r < 32 || r == '/' || r == '\\' {
+			return '-'
+		}
+		return r
+	}, name)
+	name = strings.TrimLeft(name, ".")
+	if name == "" {
+		name = "file"
+	}
+	return fmt.Sprintf("%d-%s", id, name)
 }
 
 // readSet 是"本会话读过哪些文件的哪一版"。
@@ -203,8 +224,9 @@ type ReadFileTool struct{ fileToolBase }
 
 func (t *ReadFileTool) Name() string { return "Read" }
 func (t *ReadFileTool) Description() string {
-	return "读取工作空间（/workspace）里的一个文本文件。修改文件前必须先读 —— " +
-		"未读过的文件不允许覆盖，这可以防止抹掉你没看过的内容。"
+	return "读取一个文件的内容。既能读工作空间（/workspace）里的文本文件，也能读用户上传的原件" +
+		"（/mnt/uploads/... —— pdf、docx、pptx、xlsx 这类二进制文档会自动返回解析出来的文本）。" +
+		"修改工作空间里的文件前必须先读 —— 未读过的文件不允许覆盖，这可以防止抹掉你没看过的内容。"
 }
 
 // IsConcurrencySafe 为 true：只读，多个并行读互不影响。
@@ -237,11 +259,23 @@ func (t *ReadFileTool) InputSchema() tool.Schema {
 	return tool.Schema{
 		Type: tool.SchemaTypeObject,
 		Properties: map[string]tool.Schema{
-			"path": {Type: tool.SchemaTypeString, Description: "工作空间内的相对路径，如 output/report.md"},
+			"path": {
+				Type: tool.SchemaTypeString,
+				Description: "工作空间内的相对路径（如 output/report.md），" +
+					"或用户上传附件的逻辑路径（如 attachment:123），也可读已物化原件路径",
+			},
 		},
-		Required: []string{"path"},
+		Required:             []string{"path"},
+		AdditionalProperties: false,
 	}
 }
+
+// uploadsPrefix 是用户上传原件在沙箱里的挂载点，与 persistence.UploadsMount 一致。
+//
+// 用常量而不是引 persistence.UploadsMount：runtime 已经依赖 persistence（同一模块内
+// 不成环），但这里只需要一个前缀字符串，多一条依赖不划算。两边对不上的后果见
+// persistence/attachments.go 顶部那段。
+const uploadsPrefix = "/mnt/uploads/"
 
 func (t *ReadFileTool) Run(ctx context.Context, input json.RawMessage, tctx *tool.Context, out chan<- tool.Event) (tool.Result, error) {
 	var p struct {
@@ -252,6 +286,23 @@ func (t *ReadFileTool) Run(ctx context.Context, input json.RawMessage, tctx *too
 	}
 	if p.Path == "" {
 		return errResult("path 不能为空"), nil
+	}
+	if strings.HasPrefix(p.Path, "attachment:") {
+		id, err := strconv.ParseInt(strings.TrimPrefix(p.Path, "attachment:"), 10, 64)
+		if err != nil || id <= 0 {
+			return errResult("附件路径格式错误，应为 attachment:<id>"), nil
+		}
+		return t.readAttachment(ctx, id, tctx, out), nil
+	}
+
+	// 上传件走单独一条路：查库拿上传时就抽好的文本，而不是把二进制字节读回来。
+	// 见 readUpload 的注释。
+	if strings.HasPrefix(p.Path, uploadsPrefix) {
+		if res, handled := t.readUpload(ctx, p.Path, tctx, out); handled {
+			return res, nil
+		}
+		// 没命中库（模型自己往 uploads 写过东西？不太可能，那目录只读）——
+		// 落到下面的普通读，让服务端给出真实的错误。
 	}
 
 	q := url.Values{
@@ -290,6 +341,152 @@ func (t *ReadFileTool) Run(ctx context.Context, input json.RawMessage, tctx *too
 	emitToolResult(out, t.Name(), tctx.ToolUseID,
 		fmt.Sprintf("读取 %s（%d 字节）", p.Path, len(res.Content)), nil)
 	return textResult(content + truncated), nil
+}
+
+func (t *ReadFileTool) readAttachment(
+	ctx context.Context, id int64, tctx *tool.Context, out chan<- tool.Event,
+) tool.Result {
+	db, err := persistence.DB()
+	if err != nil || db == nil {
+		return errResult("暂时无法读取附件：存储服务不可用")
+	}
+	att, err := persistence.GetAttachmentForRead(ctx, db, t.tenantID, t.sessionID, id)
+	if err != nil {
+		return errResult(fmt.Sprintf("找不到附件 %d，或附件不属于当前会话", id))
+	}
+	if att.ExtractedText == "" {
+		if att.MediaType == "image" {
+			return textResult(fmt.Sprintf("附件 %s 是图片，没有文本层；如需理解画面，请先将其放入沙箱处理", att.Filename))
+		}
+		return errResult(fmt.Sprintf("附件 %s 尚未生成可读取的文本；如需处理原始文件，请先将其放入沙箱", att.Filename))
+	}
+	content := att.ExtractedText
+	if len(content) > maxReadBytes {
+		content = content[:maxReadBytes]
+		for len(content) > 0 && !utf8.ValidString(content) {
+			content = content[:len(content)-1]
+		}
+		content += fmt.Sprintf("\n\n[内容已截断：显示前 %d 字节，共 %d 字节]", len(content), len(att.ExtractedText))
+	}
+	emitToolResult(out, t.Name(), tctx.ToolUseID,
+		fmt.Sprintf("读取附件 %s（%d 字节文本）", att.Filename, len(att.ExtractedText)), nil)
+	return textResult(content)
+}
+
+// readUpload 读用户上传的原件，返回 (结果, 是否已处理)。
+//
+// ## 为什么不直接读字节
+//
+// /mnt/uploads 下躺的是**原始文件**：pptx 是 zip、pdf 是二进制、xlsx 是 zip。把它们
+// 当文本读的结果是服务端 415（files.py 的 UnicodeDecodeError 分支），而模型收到
+// "不是 UTF-8 文本文件"之后通常会去开沙箱重新解析一遍 —— 慢，而且它未必装得上库。
+//
+// 而这些文件的文本**上传时就抽好了**，躺在 chat_attachments.extracted_text 里
+// （router/attachment.go 的第 2 步打的 lea-parser）。所以这里查库，不碰字节。
+//
+// 这就是"read_file 按后缀路由到对应解析服务"那个设计的落点 —— 只不过路由发生在
+// **上传时**而不是读取时，因为那时字节还在手上。读取时只需要把结果取回来。
+//
+// ## 返回 handled=false 的两种情况
+//
+//	库不可用      降级到普通文件读，让服务端报真实错误
+//	查不到这一行   路径是模型编的、或者附件属于别的会话 —— 同样交给服务端报错
+//
+// 两种都不该在这里造一个自己的错误消息：服务端的 404 带着真实路径，比"附件不存在"
+// 有用（模型能据此发现自己拼错了文件名）。
+func (t *ReadFileTool) readUpload(
+	ctx context.Context, path string, tctx *tool.Context, out chan<- tool.Event,
+) (tool.Result, bool) {
+	db, err := persistence.DB()
+	if err != nil || db == nil {
+		return tool.Result{}, false
+	}
+
+	stagedName := strings.TrimPrefix(path, uploadsPrefix)
+	att, err := persistence.GetAttachmentByStagedPath(ctx, db, t.tenantID, t.sessionID, stagedName)
+	if err != nil {
+		return tool.Result{}, false
+	}
+
+	text, summary := renderUpload(att, path)
+	emitToolResult(out, t.Name(), tctx.ToolUseID, summary, nil)
+	return textResult(text), true
+}
+
+// renderUpload 把一行附件渲染成给模型的文本，外加一句给前端时间线的摘要。
+//
+// 从 readUpload 里分出来是为了能测：查库那一步依赖 persistence.DB() 单例（没有注入
+// 口），而真正值得钉住的是**四个分支各自说了什么** —— 说错的代价见每个分支的注释。
+func renderUpload(att persistence.Attachment, path string) (text, summary string) {
+	// 有文本 → 直接给。这是绝大多数情况（pdf/docx/pptx/txt/csv 都走这里）。
+	if att.ExtractedText != "" {
+		content := att.ExtractedText
+		note := ""
+		if len(content) > maxReadBytes {
+			// 截断的说明必须给出**怎么拿到剩下的**，否则模型会在残缺内容上给出完整
+			// 口吻的回答 —— 静默、且从输出看不出来的失败。
+			content = content[:maxReadBytes]
+			// 退到合法的 UTF-8 边界。
+			//
+			// ⚠️ 不能写成"最后一个字节不是起始字节就往回退" —— 切点正好落在字符边界上
+			// 时（maxReadBytes=61440 能被 3 整除，所以中文正文必然撞上），最后一个字节
+			// 是一个合法的续接字节，那种写法会把完整字符的尾巴剥掉，**反而**切出非法
+			// 序列。这个 bug 被 TestRenderUpload_TruncationNeverBreaksMultibyteChar 抓到过。
+			//
+			// 按"整个串合法吗"判就没有歧义，而且最多退 3 次。
+			for len(content) > 0 && !utf8.ValidString(content) {
+				content = content[:len(content)-1]
+			}
+			note = fmt.Sprintf(
+				"\n\n[内容已截断：显示前 %d 字节，全文共 %d 字节。"+
+					"需要其余部分请用 code_interpreter 在沙箱里读 %s。"+
+					"做整体总结/翻译这类需要通读的任务时，请先把文件读完。]",
+				len(content), len(att.ExtractedText), path)
+		}
+		return content + note,
+			fmt.Sprintf("读取上传件 %s（%d 字节文本）", att.Filename, len(att.ExtractedText))
+	}
+
+	// 没文本。**分清是哪一种**：三种情况模型该走的路完全不同，笼统一句"读不到"
+	// 会让它在错误的方向上重试。
+	//
+	// 三个分支都不点名 OCR / PIL / ffmpeg —— 装没装是可配置项，点名一个不在的东西
+	// 会让模型在同一个 import 上打转，而不是换条路。只给**性质**，手段由它在真实
+	// 环境里自己探明（它看得到报错，我们看不到）。
+	switch att.MediaType {
+	case "image":
+		// 图片没有文本层是这类文件的性质，不是提取失败。
+		return fmt.Sprintf(
+				"%s 是图片，没有文本层 —— 要了解画面内容需要对它做视觉处理。"+
+					"文件在 %s，可在沙箱里按可用的方式处理。", att.Filename, path),
+			fmt.Sprintf("读取上传件 %s（图片，无文本层）", att.Filename)
+
+	case "audio", "video":
+		return fmt.Sprintf(
+				"%s 是%s文件，本次没有可用的转写文本。文件在 %s，"+
+					"可在沙箱里按可用的方式处理。",
+				att.Filename, mediaWord(att.MediaType), path),
+			fmt.Sprintf("读取上传件 %s（%s，无转写文本）", att.Filename, mediaWord(att.MediaType))
+
+	default:
+		// 文档类但一个字都没抽出来：扫描件、纯图片 PDF、或者上传时 parser 挂了。
+		// 这三种在这里分不出来，所以都说 —— 模型据此可以判断要不要去沙箱试。
+		//
+		// 要跟"文件是空的"区分开：后者模型会回"你的文件好像是空的"，而实际上可能有
+		// 20 页内容，只是没有文本层。
+		return fmt.Sprintf(
+				"%s 没有提取到文本 —— 可能是扫描件/纯图片文档，也可能上传时解析失败。"+
+					"内容若存在于图像中，需要在沙箱里对 %s 做识别处理。",
+				att.Filename, path),
+			fmt.Sprintf("读取上传件 %s（未提取到文本）", att.Filename)
+	}
+}
+
+func mediaWord(mediaType string) string {
+	if mediaType == "audio" {
+		return "音频"
+	}
+	return "视频"
 }
 
 // ── Write ──────────────────────────────────────────────
@@ -683,7 +880,8 @@ type BashTool struct {
 func (t *BashTool) Name() string { return "Bash" }
 func (t *BashTool) Description() string {
 	return "在沙箱里执行 shell 命令，工作目录是 /workspace。适合文件整理、格式转换、" +
-		"查看环境等一行能说清的操作。要写多行程序、装依赖或做数据分析请用 code_interpreter。"
+		"运行 Python/Node 脚本、安装依赖、查看环境和数据处理。复杂代码请先写入脚本，" +
+		"再用 python 或 node 命令执行。"
 }
 
 // IsConcurrencySafe 为 false：命令内容任意，可能改动文件系统。
@@ -730,6 +928,22 @@ func (t *BashTool) ensureSandbox(ctx context.Context) error {
 		return nil
 	}
 
+	// ⚠️ 物化必须在建沙箱**之前**。
+	//
+	// host-mount 把 sessions/<sid>/uploads/ 这个**目录**绑进沙箱的 /mnt/uploads，
+	// 而绑定是在建沙箱那一刻定的，且只在目录已存在时才请求（lea-tools 侧
+	// ensure_session_dir 建不出目录就跳过 host-mount）。
+	//
+	// 如果先建沙箱、后物化：建沙箱时 uploads/ 目录还不存在 → host-mount 被跳过 →
+	// 这个沙箱压根没挂 uploads → 之后物化把文件放进 NFS 也白搭，沙箱里 /mnt/uploads
+	// 根本不存在。真链路验收里就是这个症状：staged_path 回填了，但沙箱里 ls 不到、
+	// cp 报 "No such file or directory"。
+	//
+	// stage 端点不依赖沙箱（它只是 OBS→NFS + mkdir），所以放前面完全安全。
+	if err := t.stageSessionAttachments(ctx); err != nil {
+		return err
+	}
+
 	body, _ := json.Marshal(map[string]any{
 		"session_id": t.sessionID,
 		"tenant_id":  t.tenantID,
@@ -750,7 +964,57 @@ func (t *BashTool) ensureSandbox(ctx context.Context) error {
 	if resp.StatusCode >= 400 {
 		return fmt.Errorf("创建沙箱返回 %d", resp.StatusCode)
 	}
+
 	t.sandboxReady = true
+	return nil
+}
+
+func (t *BashTool) stageSessionAttachments(ctx context.Context) error {
+	db, err := persistence.DB()
+	if err != nil || db == nil {
+		return nil
+	}
+	atts, err := persistence.LoadSessionAttachmentsForStage(ctx, db, t.tenantID, t.sessionID)
+	if err != nil {
+		return fmt.Errorf("load attachments for staging: %w", err)
+	}
+	for _, att := range atts {
+		if att.FileKey == "" || att.StagedPath != "" {
+			continue
+		}
+		destName := stageName(att.ID, att.Filename)
+		payload, _ := json.Marshal(map[string]string{
+			"tenant_id": t.tenantID, "session_id": t.sessionID,
+			"file_key": att.FileKey, "dest_name": destName,
+		})
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+			toolsGatewayURL+"/api/files/uploads/stage", bytes.NewReader(payload))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if token := getEnv("LEA_INTERNAL_TOKEN", ""); token != "" {
+			req.Header.Set(InternalTokenHeader, token)
+		}
+		resp, err := gatewayClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("stage %s: %w", att.Filename, err)
+		}
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil || resp.StatusCode >= 400 {
+			return fmt.Errorf("stage %s returned %d: %s", att.Filename, resp.StatusCode, strings.TrimSpace(string(body)))
+		}
+		var result struct {
+			StagedName string `json:"staged_name"`
+		}
+		if err := json.Unmarshal(body, &result); err != nil || result.StagedName == "" {
+			return fmt.Errorf("stage %s returned invalid response", att.Filename)
+		}
+		if err := persistence.MarkAttachmentStaged(ctx, db, t.tenantID, t.sessionID, att.ID, result.StagedName); err != nil {
+			return fmt.Errorf("record staged attachment %d: %w", att.ID, err)
+		}
+	}
 	return nil
 }
 
@@ -798,6 +1062,7 @@ func (t *BashTool) Run(ctx context.Context, input json.RawMessage, tctx *tool.Co
 		Stdout     string `json:"stdout"`
 		Stderr     string `json:"stderr"`
 		ExitCode   int    `json:"exit_code"`
+		Artifacts  []any  `json:"artifacts"`
 		DurationMs int    `json:"duration_ms"`
 	}
 	if err := json.Unmarshal(raw, &res); err != nil {
@@ -833,9 +1098,23 @@ func (t *BashTool) Run(ctx context.Context, input json.RawMessage, tctx *tool.Co
 		text = "命令执行完毕，没有输出。"
 	}
 
-	emitToolResult(out, t.Name(), tctx.ToolUseID,
-		fmt.Sprintf("执行 %s（退出码 %d，%dms）", firstLine(p.Command), res.ExitCode, res.DurationMs),
-		map[string]any{"exit_code": res.ExitCode, "duration_ms": res.DurationMs})
+	if out != nil && tctx != nil {
+		select {
+		case out <- tool.Event{
+			Type:      tool.EventTypeProgress,
+			ToolName:  t.Name(),
+			ToolUseID: tctx.ToolUseID,
+			Data: map[string]any{
+				"stdout":      res.Stdout,
+				"stderr":      res.Stderr,
+				"artifacts":   res.Artifacts,
+				"exit_code":   res.ExitCode,
+				"duration_ms": res.DurationMs,
+			},
+		}:
+		default:
+		}
+	}
 
 	// 退出码非 0 标成工具错误，模型才知道要处理而不是当成成功继续。
 	if res.ExitCode != 0 {

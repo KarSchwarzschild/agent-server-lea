@@ -38,7 +38,7 @@ class Skill(OwnerMixin, TenantMixin, Base):
     display_name = Column(String(200), default="")
     description = Column(Text, default="")
     version = Column(String(50), default="1.0.0")
-    category = Column(String(50), default="general")
+    category = Column(String(50), nullable=False)
     system_prompt = Column(Text, default="")
     model_tier = Column(String(50), default="standard")
     required_tools = Column(JSON, default=list)

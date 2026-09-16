@@ -10,7 +10,7 @@ import (
 // ── 为什么用 Transport 而不是在每个调用点加一行 ──────────────────────────
 //
 // 这个包里往 lea-tools / lea-rag / lea-config 发请求的地方有八处以上，散在
-// gateway.go、file_tools.go、code_interpreter.go、platform_tools.go、
+// gateway.go、file_tools.go、platform_tools.go、
 // skill_provision.go、memory_middleware.go、config_loader.go 里。
 //
 // 逐个加头的问题不是麻烦，是**漏掉的那个只在开启鉴权之后才炸**，而且炸的是

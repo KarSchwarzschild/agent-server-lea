@@ -3,11 +3,13 @@ package router
 import (
 	"database/sql"
 	"errors"
+	"log"
 	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/persistence"
+	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/runtime"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/session"
 )
 
@@ -84,9 +86,17 @@ func applyAndReport(c *gin.Context, mgr *session.Manager, sessionID string, payl
 
 // handleListSessionAttachments 列出这个会话挂了什么。
 //
-// 返回的是**库里的原始记录**，不做归属解析 —— 界面要显示"你挂了这几样"，包括其中某样
-// 已经失效的情况。解析在建会话时做（那时失效项会被静默丢弃），两边目的不同：这里要
-// 忠实反映用户挂过什么，那里要保证能用。
+// 默认返回的是**库里的原始记录** —— 界面要显示"你挂了这几样"，包括其中某样已经失效的
+// 情况。解析在建会话时做（那时失效项会被静默丢弃），两边目的不同：这里要忠实反映用户
+// 挂过什么，那里要保证能用。
+//
+// `?resolve=true` 额外带上名字和描述，给界面画 chip 用。分成两种模式而不是总是解析：
+// 解析要打一次 lea-config，而重建会话那条路（LoadSessionAttachments 直接调）只需要
+// {kind, ref_id}，不该为它付那一跳。
+//
+// 解析失败时**退回原始记录 + 200**，不是 502。理由：ref_id 已经是真的，用户至少能看到
+// "挂了 3 样"并且能摘掉它们（DELETE 只要 kind + ref_id）。整个报错的话一次 lea-config
+// 抖动会让挂载列表打不开，连摘除入口都没了。partial 字段告诉前端这次没拿到名字。
 func handleListSessionAttachments(_ *session.Manager) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		db, ok := sessionOwnerGuard(c)
@@ -99,11 +109,32 @@ func handleListSessionAttachments(_ *session.Manager) gin.HandlerFunc {
 			c.JSON(500, gin.H{"error": err.Error()})
 			return
 		}
-		out := make([]gin.H, 0, len(rows))
+
+		raw := make([]gin.H, 0, len(rows))
 		for _, r := range rows {
-			out = append(out, gin.H{"kind": r.Kind, "ref_id": r.RefID})
+			raw = append(raw, gin.H{"kind": r.Kind, "ref_id": r.RefID})
 		}
-		c.JSON(200, gin.H{"session_id": c.Param("id"), "attachments": out})
+
+		if c.Query("resolve") != "true" || len(rows) == 0 {
+			c.JSON(200, gin.H{"session_id": c.Param("id"), "attachments": raw})
+			return
+		}
+
+		refs := make([]runtime.AttachmentRef, 0, len(rows))
+		for _, r := range rows {
+			refs = append(refs, runtime.AttachmentRef{Kind: r.Kind, RefID: r.RefID})
+		}
+		described, dErr := runtime.DescribeAttachments(
+			c.Request.Context(), c.GetString("tenant_id"), c.GetString("user_id"), refs)
+		if dErr != nil {
+			log.Printf("describe_attachments_failed session=%s n=%d err=%v (退回原始记录)",
+				c.Param("id"), len(refs), dErr)
+			c.JSON(200, gin.H{
+				"session_id": c.Param("id"), "attachments": raw, "partial": true,
+			})
+			return
+		}
+		c.JSON(200, gin.H{"session_id": c.Param("id"), "attachments": described})
 	}
 }
 

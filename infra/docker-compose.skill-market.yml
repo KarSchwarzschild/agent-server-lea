@@ -1,4 +1,9 @@
 services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "no"]
+
   lea-config:
     image: ${LEA_CONFIG_IMAGE:?set LEA_CONFIG_IMAGE in .env.skill-market}
     restart: unless-stopped
@@ -31,5 +36,7 @@ services:
     depends_on:
       lea-config:
         condition: service_healthy
+      redis:
+        condition: service_started
     ports:
       - "${SKILL_MARKET_PORT:-8080}:8080"

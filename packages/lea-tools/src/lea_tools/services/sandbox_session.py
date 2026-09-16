@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -18,15 +19,25 @@ logger = structlog.get_logger()
 
 # 本地闲置超时（秒），超过后主动 kill 沙箱。
 #
-# Cube 侧另有 lifecycle.timeout=900 (15min) 触发 pause（内存冻结、下次请求自动
-# resume，见 _cube_sandbox.py）。本地 kill 兜住"用户彻底走了"的情况 —— 单纯 pause
-# 不释放 Cube master 侧的 sandbox slot，长期堆积会撑爆 client 上限。
+# Cube 侧另有 lifecycle.timeout（默认 900 = 15min，见 _cube_sandbox._sandbox_timeout）
+# 触发 pause（内存冻结、下次请求自动 resume）。本地 kill 兜住"用户彻底走了"的情况
+# —— 单纯 pause 不释放 Cube master 侧的 sandbox slot，长期堆积会撑爆 client 上限。
 #
-# 分层：
+# 分层（前两段的边界跟着 CUBE_SANDBOX_TIMEOUT 走，这里按默认值写）：
 #   0-15min idle : running（正常）
 #   15-60min idle: Cube 自动 pause（0 CPU，占 slot 不占算力）
-#   60min+       : 本地 kill（释放 slot，文件已经 push 到 S3 用户仍能看）
-IDLE_TIMEOUT = 3600  # 1 小时
+#   60min+       : 本地 kill（释放 slot）
+#
+# ⚠️ 这里原来写着"文件已经 push 到 S3 用户仍能看"—— 不对，而且是会害人的那种不对。
+# 沙箱被 kill 之后留下的是：
+#   · 会话工作区（NFS host-mount 那份）—— 还在，30 天后才被 reap_stale_sessions 删；
+#     沙箱只是个跑代码的壳，文件本来就不在它里面。没挂 host-mount 时（本机开发）
+#     确实随沙箱一起没了。
+#   · OBS 里的那份 —— **只有模型显式 deliver_artifact 过的才有**。没有任何东西会
+#     自动把工作区推上去（ArtifactPusher 不是这么用的）。
+# 也就是说 kill 是安全的，但安全的理由是 NFS，不是 S3。按老注释理解的话，会以为
+# 沙箱里的东西都自动备份了，从而放心地把 IDLE_TIMEOUT 调短。
+IDLE_TIMEOUT = int(os.getenv("SANDBOX_IDLE_TIMEOUT", "3600"))
 
 
 @dataclass
@@ -222,10 +233,35 @@ class SandboxSessionManager:
         return await asyncio.to_thread(backend.read_file, path)
 
     async def destroy(self, session_id: str) -> None:
+        """删掉会话的沙箱。找不到 → KeyError（跟 _require 同一个语义）。
+
+        ## 为什么这里也要 _adopt
+
+        原来是 `self._sessions.pop(...)`，`if sess:` 之外什么都不做 —— 于是**请求落到
+        一个没建过这个沙箱的副本上时，DELETE 返回成功而沙箱继续跑**。多副本下这不是
+        边缘情况，是大概率：nginx 轮询，建沙箱那次和删沙箱那次落到同一个副本的概率
+        只有 1/N。
+
+        表现是最坏的那种"看起来成功了"：用户点了删除、UI 说删了、下次进这个会话
+        沙箱还在（还带着之前的文件），而且它要一直占着资源到 IDLE_TIMEOUT 才被
+        回收器捡走。execute/upload/download 早就都走 _require 认回来了，删除是唯一
+        漏掉的那个动作。
+
+        pop 放在 kill 之前：kill 失败（Cube 返 409/503）时本进程的句柄已经没了，
+        下次 _adopt 会重新认回来 —— 而反过来（kill 成功但 pop 没执行）会留一个指向
+        已删沙箱的死句柄，后续调用全部打到一个不存在的 sandbox_id 上。
+        """
         sess = self._sessions.pop(session_id, None)
-        if sess:
-            await self._kill_backend(sess)
-            logger.info("sandbox_session_destroyed", session_id=session_id)
+        if sess is None:
+            # 本进程没有，去 Cube 认一次。认回来的立刻从表里摘掉 —— 它唯一的用途
+            # 就是拿来删。
+            sess = await self._adopt(session_id)
+            self._sessions.pop(session_id, None)
+        if sess is None:
+            raise KeyError(f"sandbox session not found: {session_id}")
+        await self._kill_backend(sess, propagate=True)
+        logger.info("sandbox_session_destroyed", session_id=session_id,
+                    sandbox_id=sess.sandbox_id)
 
     def get(self, session_id: str) -> SandboxSession | None:
         return self._sessions.get(session_id)
@@ -285,7 +321,19 @@ class SandboxSessionManager:
     # 现在 skill 走 NFS —— provision_session_skills 拷到 session skills 目录，
     # RO 挂成 /opt/skills。写 /workspace 是错的（用户可写，且会混进产物列表）。
 
-    async def _kill_backend(self, sess: SandboxSession) -> None:
+    async def _kill_backend(self, sess: SandboxSession, propagate: bool = False) -> None:
+        """kill 远端沙箱。失败默认只记日志，propagate=True 时抛出。
+
+        ## 两个调用方要的语义相反
+
+        **回收循环**（propagate=False）：一个沙箱删不掉不该中断整轮回收 —— 后面还
+        排着别的。而且下一轮（60s）会再试，所以吞掉是安全的，日志足够定位。
+
+        **用户显式删除**（propagate=True）：吞掉就等于骗人。Cube 对 paused 沙箱的
+        DELETE 会返 409（restore 失败）或 503（状态转换中，带 Retry-After），都是
+        "没删成、可以重试"—— 报成功的话用户不会重试，而沙箱要占到 IDLE_TIMEOUT
+        才被回收器捡走。这正是 destroy() 刚修掉的那个形状，不能在下一层再犯一次。
+        """
         try:
             if hasattr(sess._backend, "kill"):
                 # httpx.delete，同步；回收循环里跑，卡住会连带拖慢所有回收。
@@ -293,6 +341,8 @@ class SandboxSessionManager:
         except Exception as e:
             logger.warning("sandbox_kill_failed",
                           session_id=sess.session_id, error=str(e))
+            if propagate:
+                raise
 
     async def _cleanup_loop(self):
         while True:

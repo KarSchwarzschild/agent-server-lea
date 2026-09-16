@@ -53,7 +53,7 @@ func BuildAgentRoster() []agent.Agent {
 		Source:      agent.SourceBuiltin,
 		// Tools 留空 = 继承父会话能委派的全部工具（agent.InheritsAllTools）。
 		// 专家把 skill 执行派下来时，子代理需要 Skill / Read / Write /
-		// code_interpreter 一整套。
+		// Bash 一整套。
 	}}
 }
 

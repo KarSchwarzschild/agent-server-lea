@@ -27,11 +27,18 @@ import (
 )
 
 type AgentSession struct {
-	id       string
-	tenantID string
-	userID   string
-	agentID  int
-	cfg      *runtime.AgentConfig
+	id        string
+	tenantID  string
+	userID    string
+	projectID *int
+	agentID   int
+	// activeAgentID 是这个会话的"激活 agent"的 raw 值（0=默认 super-agent，N=用户挂的专家
+	// /专家团 id），也就是 GetOrCreate 里算出的 eff。跟 agentID 的区别只在默认态：agentID 是
+	// 解析后的 cfg.ID（默认会解析成具体的 super-agent 主键，非 0），activeAgentID 保留请求
+	// 语义的 0。落库进 chat_sessions.active_agent_id 用它，好让重建指纹（rebuildFingerprint）
+	// 前后对得上——用 cfg.ID 的话默认会话第二条消息就会假变化、白重建。
+	activeAgentID int
+	cfg           *runtime.AgentConfig
 	// engine 是常驻的引擎会话，星型和单 agent 都用它 —— 历史留在里面，所以多轮对话
 	// 连得上。
 	//
@@ -210,7 +217,7 @@ func NewAgentSession(ctx context.Context, cfg *runtime.AgentConfig, p Params) (*
 
 	// 只有主会话该有的工具（memory_add）。其余平台工具走 ToolRuntime 的 Provision
 	// 通道，子代理和专家才继承得到 —— 见 GatewayToolset.Tools。
-	extraTools := runtime.BuildMainSessionTools(cfg, p.TenantID, p.UserID, sessionID)
+	extraTools := runtime.BuildMainSessionTools(cfg, p.TenantID, p.UserID, sessionID, p.ProjectID)
 	toolEvents := make(chan tool.Event, 64)
 
 	// skill bundle 投递到本会话的 skills 目录，让 Read 能读到 SKILL.md 引用的
@@ -326,15 +333,18 @@ func NewAgentSession(ctx context.Context, cfg *runtime.AgentConfig, p Params) (*
 	}
 
 	s := &AgentSession{
-		id:          sessionID,
-		tenantID:    p.TenantID,
-		userID:      p.UserID,
-		agentID:     agentID,
-		cfg:         cfg,
-		subscribers: make(map[chan SSEEvent]struct{}),
-		lastActive:  time.Now(),
-		locker:      lock.Shared(),
-		control:     control.Shared(),
+		id:        sessionID,
+		tenantID:  p.TenantID,
+		userID:    p.UserID,
+		projectID: p.ProjectID,
+		agentID:   agentID,
+		// p.AgentID 到这里已经是 GetOrCreate 覆盖过的 eff（有效激活 agent，0=默认）。
+		activeAgentID: p.AgentID,
+		cfg:           cfg,
+		subscribers:   make(map[chan SSEEvent]struct{}),
+		lastActive:    time.Now(),
+		locker:        lock.Shared(),
+		control:       control.Shared(),
 		// 只 handoff 团需要拒服 plan mode：它没有常驻 engine，SetPlanMode 会 panic。
 		// 星型团有 engine，团长 = 主 agent，ask_expert = Agent tool，可以正常规划。
 		isHandoff: teamMode == team.ModeHandoff,
@@ -661,20 +671,26 @@ func (s *AgentSession) Send(message string, attachmentIDs []int64, plan PlanCont
 			log.Printf("db_unavailable err=%v (persistence disabled for this turn)", dbErr)
 		}
 
-		// H4: 附件文本注入 — 拉 chat_attachments 拼进 message（read-only，与 Python chat.py 对齐）
+		// H4: 附件注入 — 拉 chat_attachments 把路径和元信息拼进 message
 		userMsg := message
 		if db != nil && len(attachmentIDs) > 0 {
 			atts, err := persistence.LoadAttachments(ctx, db, s.tenantID, attachmentIDs)
 			if err != nil {
 				log.Printf("load_attachments_failed session=%s ids=%v err=%v", s.id, attachmentIDs, err)
 			} else {
+				// 只注入路径和元信息，**不注入正文** —— 内容由 Read 工具按需取
+				// （runtime/file_tools.go 的 readUpload 查的是同一份 extracted_text）。
+				//
+				// 所以这里不再需要 ctxBudget：以前要传它是因为正文无条件拼进消息，
+				// 一份 200 页教材抽出的 50KB 会挤掉历史或直接把请求撑爆，得按预算截断。
+				// 现在消息里只有一行路径，那道闸连同它的截断话术一起没用了。
 				userMsg = persistence.BuildContentWithAttachments(message, atts)
 				message = userMsg
 			}
 		}
 
 		if db != nil {
-			if err := persistence.TouchSession(ctx, db, s.id, s.userID, s.tenantID, userMsg); err != nil {
+			if err := persistence.TouchSession(ctx, db, s.id, s.userID, s.tenantID, s.projectID, s.activeAgentID, userMsg); err != nil {
 				log.Printf("touch_session_failed session=%s err=%v", s.id, err)
 			}
 		}
@@ -1225,6 +1241,9 @@ func (s *AgentSession) forwardToolEvents(ch <-chan tool.Event) {
 	for ev := range ch {
 		s.currentCollector().onToolEvent(ev)
 		s.broadcast(SSEEvent{Type: "tool_event", Data: ev})
+		if refs := referencesFromToolEvent(ev); len(refs) > 0 {
+			s.broadcast(SSEEvent{Type: "references", Data: map[string]any{"references": refs}})
+		}
 	}
 }
 

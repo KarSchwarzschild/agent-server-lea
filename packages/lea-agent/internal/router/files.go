@@ -7,7 +7,6 @@ import (
 	"log"
 	"net/http"
 	"net/url"
-	"os"
 	"sync"
 	"time"
 
@@ -91,11 +90,10 @@ func assertSessionOwner(c *gin.Context, sessionID string, whenMissing onMissing)
 // 前端只传 session_id；tenant_id 从 JWT 取（前端传的不可信）。
 // 参数：?session_id=<sid>[&show_hidden=true]
 func handleListArtifacts() gin.HandlerFunc {
-	toolsURL := os.Getenv("LEA_TOOLS_URL")
-	if toolsURL == "" {
-		toolsURL = "http://localhost:8400"
-	}
-	client := &http.Client{Timeout: 30 * time.Second}
+	toolsURL := toolsBaseURL()
+	// newToolsClient 而不是裸 &http.Client{}：不带 X-Internal-Token 的话，开了服务间
+	// 鉴权之后这条路 401，而症状是"文件抽屉永远是空的"。见 attachment.go 的注释。
+	client := newToolsClient(30 * time.Second)
 
 	return func(c *gin.Context) {
 		sessionID := c.Query("session_id")
@@ -152,11 +150,8 @@ func handleListArtifacts() gin.HandlerFunc {
 // 参数：?session_id=<sid>&path=<relative>
 // 校验失败：403（越权）/ 404（session 或文件不存在）
 func handleDownloadArtifact() gin.HandlerFunc {
-	toolsURL := os.Getenv("LEA_TOOLS_URL")
-	if toolsURL == "" {
-		toolsURL = "http://localhost:8400"
-	}
-	client := &http.Client{Timeout: 60 * time.Second}
+	toolsURL := toolsBaseURL()
+	client := newToolsClient(60 * time.Second)
 
 	return func(c *gin.Context) {
 		sessionID := c.Query("session_id")

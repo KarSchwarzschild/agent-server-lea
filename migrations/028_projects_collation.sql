@@ -1,0 +1,13 @@
+-- 028 · 修 projects 的 collation
+--
+-- 022 建表时只写了 DEFAULT CHARSET=utf8mb4、没写 COLLATE，于是 MySQL 8 用了服务端默认
+-- utf8mb4_0900_ai_ci；而 chat_sessions 等老表是 utf8mb4_unicode_ci。两边 JOIN
+-- （persistence.ListProjects 里 `s.tenant_id = p.tenant_id`）报
+-- "Illegal mix of collations (utf8mb4_unicode_ci,IMPLICIT) and (utf8mb4_0900_ai_ci,IMPLICIT)"，
+-- /api/projects 永久 500。
+--
+-- 症状会骗人：建表成功、单表 SELECT 正常，只有跨表 JOIN 才炸 —— 所以建完表那一刻
+-- 看起来一切正常。
+--
+-- 022 已就地补上 COLLATE（新库不会再踩），这条是给**已经建过表**的库用的。
+ALTER TABLE projects CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;

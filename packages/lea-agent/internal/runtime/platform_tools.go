@@ -7,11 +7,24 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/sony/gobreaker"
 	"gitlab.ouc-online.com.cn/aibase/agentloop/tool"
+	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/breaker"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/persistence"
 )
 
 var ragServiceURL = getEnv("LEA_RAG_URL", "http://localhost:8300")
+
+var (
+	// 熔断器实例（全局单例）
+	kbBreaker     *gobreaker.CircuitBreaker
+	memoryBreaker *gobreaker.CircuitBreaker
+)
+
+func init() {
+	kbBreaker = breaker.NewKBBreaker()
+	memoryBreaker = breaker.NewMemoryBreaker()
+}
 
 // emitToolResult 把 tool 的真实结果通过 Progress 事件推给 collector。
 // 引擎自己在 Run 返回后 emit 默认 Completed（Message="completed"），只反映"跑完了"，
@@ -47,13 +60,8 @@ func emitToolResult(out chan<- tool.Event, name, toolUseID string, summary strin
 // build.go 里的顺序是：Provision → 并入 sessionTools → 快照 eligibleSubagentTools →
 // append ExtraTools。落在快照之前的才被子代理继承。
 //
-// 这条分界是"专家把 skill 执行派给子代理"能不能成立的前提：一个跑 pptx skill 的子代理
-// 必须能调 code_interpreter，否则派了活却没有干活的手段。code_interpreter 此前在
-// ExtraTools 里，子代理和专家一个都拿不到 —— 那时"派活给子代理"只是看起来可行。
-//
-// 附带一层：npm 工作区、NODE_PATH、os.environ 追加而非替换那些踩出来的规则写在
-// CodeInterpreterTool.Description() 里。工具描述随工具走，所以工具进了子代理，坑的
-// 说明也自动跟进去，不需要在别处复述一遍。
+// 这条分界是"专家把 skill 执行派给子代理"能不能成立的前提：子代理必须能拿到
+// Bash，才能在沙箱中执行 Python、Node 和 skill 脚本。
 //
 // 只有主会话该有的工具见 BuildMainSessionTools。
 func BuildPlatformTools(cfg *AgentConfig, tenantID, userID, sessionID string) []tool.Tool {
@@ -73,16 +81,6 @@ func BuildPlatformTools(cfg *AgentConfig, tenantID, userID, sessionID string) []
 		tools = append(tools, &MemorySearchTool{tenantID: tenantID, userID: userID})
 	}
 
-	if cfg.SandboxEnabled {
-		tools = append(tools, &CodeInterpreterTool{
-			tenantID:  tenantID,
-			userID:    userID,
-			sessionID: sessionID,
-			skillID:   cfg.ActiveSkillID,
-			skills:    cfg.Skills,
-		})
-	}
-
 	// get_plan 是只读的，**专家和子代理都该有**：转交链里执行第 3 步的那个专家，
 	// 得看得到整体计划才不会跑偏。写那两个（save_plan / update_plan_step）在
 	// BuildMainSessionTools —— 子代理改不了用户批准过的契约，标"完成"也轮不到一个
@@ -93,7 +91,6 @@ func BuildPlatformTools(cfg *AgentConfig, tenantID, userID, sessionID string) []
 	builtins := map[string]bool{
 		"kb_search": true, "memory_search": true, "memory_add": true,
 		"save_plan": true, "get_plan": true, "update_plan_step": true,
-		"code_interpreter": true,
 	}
 	for _, td := range cfg.Tools {
 		if builtins[td.Name] {
@@ -120,7 +117,7 @@ func BuildPlatformTools(cfg *AgentConfig, tenantID, userID, sessionID string) []
 // 这跟引擎对自己的 Remember 工具的处理是同一条线：build.go 把它放在快照之后，注释写着
 // "sub-agents read memory but cannot write it — only the main session saves new
 // memories"。读走 BuildPlatformTools 的 memory_search，写留在这里。
-func BuildMainSessionTools(cfg *AgentConfig, tenantID, userID, sessionID string) []tool.Tool {
+func BuildMainSessionTools(cfg *AgentConfig, tenantID, userID, sessionID string, projectID *int) []tool.Tool {
 	var tools []tool.Tool
 	// 计划的两个**写**工具。始终注册 —— 计划模式是所有 agent 都支持的能力，
 	// 不跟着 memory 配置走（计划持久化跟记忆是两回事），也没有按 agent 的开关：
@@ -130,6 +127,24 @@ func BuildMainSessionTools(cfg *AgentConfig, tenantID, userID, sessionID string)
 		&SavePlanTool{tenantID: tenantID, sessionID: sessionID},
 		&UpdatePlanStepTool{tenantID: tenantID, sessionID: sessionID},
 	)
+
+	// deliver_artifact 也始终注册，理由跟 save_plan 同一条：它是 session_artifacts
+	// 的唯一写入口，而"交付成品"跟 memory/KB 配置无关，任何 agent 都可能产出成品。
+	//
+	// 留在主会话而不进 Provision —— 子代理的产出是**给主会话看的中间结果**，不是
+	// 给用户的成品。让它直接往用户的长期文件库里写，等于绕开了那个唯一有资格判断
+	// "这份东西用户要不要"的角色：主会话拿到子代理的结果之后还要复核、还可能推翻。
+	// 真要交付，由主会话再调一次 —— 那时它已经看过内容了。
+	tools = append(tools, &DeliverArtifactTool{
+		base: fileToolBase{
+			tenantID:  tenantID,
+			userID:    userID,
+			sessionID: sessionID,
+			// 不给 readSet：这个工具一个字节都不读（发布是 lea-tools 在共享存储上
+			// 就地做的），新鲜度校验对它没有意义。
+		},
+		projectID: nullInt64FromPtr(projectID),
+	})
 	// memory_add 只在 memory 开启时注册
 	if cfg != nil && cfg.MemoryMode != "off" {
 		tools = append(tools, &MemoryAddTool{tenantID: tenantID, userID: userID})
@@ -432,22 +447,46 @@ func (t *KBSearchTool) Run(ctx context.Context, input json.RawMessage, tctx *too
 	}
 	body, _ := json.Marshal(payload)
 
-	req, _ := http.NewRequestWithContext(ctx, "POST",
-		ragServiceURL+"/kb/search", strings.NewReader(string(body)))
-	req.Header.Set("Content-Type", "application/json")
+	// 通过熔断器执行 HTTP 调用
+	result, err := kbBreaker.Execute(func() (interface{}, error) {
+		req, _ := http.NewRequestWithContext(ctx, "POST",
+			ragServiceURL+"/kb/search", strings.NewReader(string(body)))
+		req.Header.Set("Content-Type", "application/json")
 
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return tool.Result{IsError: true, Content: []tool.ResultContent{
-			{Type: tool.ResultContentTypeText, Text: fmt.Sprintf("KB search failed: %v", err)},
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+
+		// 非 2xx 响应视为失败（触发熔断器计数）
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+		}
+
+		var result json.RawMessage
+		json.NewDecoder(resp.Body).Decode(&result)
+		return result, nil
+	})
+
+	// 熔断器打开：降级返回
+	if err == gobreaker.ErrOpenState {
+		emitToolResult(out, t.Name(), tctx.ToolUseID, "KB 熔断器打开，已降级", nil)
+		return tool.Result{Content: []tool.ResultContent{
+			{Type: tool.ResultContentTypeText, Text: "知识库服务熔断中，请稍后重试或继续对话。"},
 		}}, nil
 	}
-	defer resp.Body.Close()
 
-	var result json.RawMessage
-	json.NewDecoder(resp.Body).Decode(&result)
+	// HTTP 错误或其他失败：降级返回
+	if err != nil {
+		emitToolResult(out, t.Name(), tctx.ToolUseID, fmt.Sprintf("KB 服务不可用: %v", err), nil)
+		return tool.Result{Content: []tool.ResultContent{
+			{Type: tool.ResultContentTypeText, Text: "知识库暂时不可用，请稍后重试或继续对话。"},
+		}}, nil
+	}
 
-	// summary 给一行摘要，full 塞前 5 条命中的关键字段供展开查看
+	// 成功：解析结果
+	resultJSON := result.(json.RawMessage)
 	var parsed struct {
 		Hits []struct {
 			Title   string  `json:"title"`
@@ -457,7 +496,7 @@ func (t *KBSearchTool) Run(ctx context.Context, input json.RawMessage, tctx *too
 			Content string  `json:"content"`
 		} `json:"hits"`
 	}
-	json.Unmarshal(result, &parsed)
+	json.Unmarshal(resultJSON, &parsed)
 	summary := fmt.Sprintf("命中 %d 条 (query=%q, top_k=%d)", len(parsed.Hits), params.Query, params.TopK)
 	// full：前 5 条精简（title+doc_id+score+snippet 前 200 字），够用户判断命中的对不对
 	preview := make([]map[string]any, 0, len(parsed.Hits))
@@ -481,7 +520,7 @@ func (t *KBSearchTool) Run(ctx context.Context, input json.RawMessage, tctx *too
 	})
 
 	return tool.Result{Content: []tool.ResultContent{
-		{Type: tool.ResultContentTypeJSON, Data: result},
+		{Type: tool.ResultContentTypeJSON, Data: resultJSON},
 	}}, nil
 }
 
@@ -516,28 +555,53 @@ func (t *MemorySearchTool) Run(ctx context.Context, input json.RawMessage, tctx 
 		"tenant_id": t.tenantID,
 	}
 	body, _ := json.Marshal(payload)
-	req, _ := http.NewRequestWithContext(ctx, "POST",
-		ragServiceURL+"/memory/search", strings.NewReader(string(body)))
-	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return tool.Result{IsError: true, Content: []tool.ResultContent{
-			{Type: tool.ResultContentTypeText, Text: fmt.Sprintf("Memory search failed: %v", err)},
+	// 通过熔断器执行 HTTP 调用
+	result, err := memoryBreaker.Execute(func() (interface{}, error) {
+		req, _ := http.NewRequestWithContext(ctx, "POST",
+			ragServiceURL+"/memory/search", strings.NewReader(string(body)))
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+		}
+
+		var result json.RawMessage
+		json.NewDecoder(resp.Body).Decode(&result)
+		return result, nil
+	})
+
+	// 熔断器打开：降级返回
+	if err == gobreaker.ErrOpenState {
+		emitToolResult(out, t.Name(), tctx.ToolUseID, "记忆熔断器打开，已降级", nil)
+		return tool.Result{Content: []tool.ResultContent{
+			{Type: tool.ResultContentTypeText, Text: "记忆服务熔断中，请稍后重试或继续对话。"},
 		}}, nil
 	}
-	defer resp.Body.Close()
 
-	var result json.RawMessage
-	json.NewDecoder(resp.Body).Decode(&result)
+	// HTTP 错误或其他失败：降级返回
+	if err != nil {
+		emitToolResult(out, t.Name(), tctx.ToolUseID, fmt.Sprintf("记忆服务不可用: %v", err), nil)
+		return tool.Result{Content: []tool.ResultContent{
+			{Type: tool.ResultContentTypeText, Text: "记忆服务暂时不可用，请稍后重试或继续对话。"},
+		}}, nil
+	}
 
+	// 成功：解析结果
+	resultJSON := result.(json.RawMessage)
 	var parsed struct {
 		Memories []struct {
 			Content string  `json:"content"`
 			Score   float64 `json:"score"`
 		} `json:"memories"`
 	}
-	json.Unmarshal(result, &parsed)
+	json.Unmarshal(resultJSON, &parsed)
 	summary := fmt.Sprintf("命中 %d 条记忆 (query=%q)", len(parsed.Memories), params.Query)
 	preview := make([]map[string]any, 0, len(parsed.Memories))
 	for i, m := range parsed.Memories {
@@ -555,7 +619,7 @@ func (t *MemorySearchTool) Run(ctx context.Context, input json.RawMessage, tctx 
 	})
 
 	return tool.Result{Content: []tool.ResultContent{
-		{Type: tool.ResultContentTypeJSON, Data: result},
+		{Type: tool.ResultContentTypeJSON, Data: resultJSON},
 	}}, nil
 }
 
@@ -591,18 +655,43 @@ func (t *MemoryAddTool) Run(ctx context.Context, input json.RawMessage, tctx *to
 		"tenant_id": t.tenantID,
 	}
 	body, _ := json.Marshal(payload)
-	req, _ := http.NewRequestWithContext(ctx, "POST",
-		ragServiceURL+"/memory/add", strings.NewReader(string(body)))
-	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return tool.Result{IsError: true, Content: []tool.ResultContent{
-			{Type: tool.ResultContentTypeText, Text: fmt.Sprintf("Memory add failed: %v", err)},
+	// 通过熔断器执行 HTTP 调用
+	_, err := memoryBreaker.Execute(func() (interface{}, error) {
+		req, _ := http.NewRequestWithContext(ctx, "POST",
+			ragServiceURL+"/memory/add", strings.NewReader(string(body)))
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+		}
+
+		return nil, nil
+	})
+
+	// 熔断器打开：降级返回
+	if err == gobreaker.ErrOpenState {
+		emitToolResult(out, t.Name(), tctx.ToolUseID, "记忆熔断器打开，保存失败", nil)
+		return tool.Result{Content: []tool.ResultContent{
+			{Type: tool.ResultContentTypeText, Text: "记忆服务熔断中，保存失败，但对话可以继续。"},
 		}}, nil
 	}
-	defer resp.Body.Close()
 
+	// HTTP 错误或其他失败：降级返回
+	if err != nil {
+		emitToolResult(out, t.Name(), tctx.ToolUseID, fmt.Sprintf("记忆服务不可用: %v", err), nil)
+		return tool.Result{Content: []tool.ResultContent{
+			{Type: tool.ResultContentTypeText, Text: "记忆服务暂时不可用，保存失败，但对话可以继续。"},
+		}}, nil
+	}
+
+	// 成功
 	preview := params.Content
 	if len(preview) > 60 {
 		preview = preview[:57] + "..."

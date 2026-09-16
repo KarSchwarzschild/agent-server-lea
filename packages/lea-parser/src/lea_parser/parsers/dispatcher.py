@@ -48,10 +48,21 @@ SUPPORTED_FORMATS = set(_EXT_MAP.keys())
 
 
 def parse_document(file_path: str) -> dict:
-    """统一入口。返回 {md_content, text_blocks, image_items}。"""
+    """统一入口。返回 {md_content, text_blocks, image_items, page_count}。
+
+    page_count 只有分页格式（pdf / pptx）给得出，其余是 0 —— 0 的含义是"这个格式没有
+    页的概念"，不是"零页"。调用方据此决定注入文本里报不报页数。
+    """
     ext = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
     parser_fn = _EXT_MAP.get(ext)
     if not parser_fn:
         logger.warning("unsupported_format", ext=ext, file=file_path)
-        return parse_text(file_path)
-    return parser_fn(file_path)
+        result = parse_text(file_path)
+    else:
+        result = parser_fn(file_path)
+    # 统一补齐可选键，免得每个 parser 都要记得返回它们，也免得下游到处 .get()。
+    result.setdefault("page_count", 0)
+    result.setdefault("image_items", [])
+    result.setdefault("text_blocks", [])
+    result.setdefault("md_content", "")
+    return result

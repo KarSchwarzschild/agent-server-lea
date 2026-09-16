@@ -1,0 +1,20 @@
+# 本机开发：把 gateway 的两个宿主平台依赖指向 scripts/dev_gateway_stub.py。
+#
+# ⚠️ 指向替身的 gateway **等于没有鉴权** —— 替身对任何 token 都返回同一个用户和租户。
+# 只在本机用，别带到任何共享环境。
+#
+# 起：  uv run --no-sync python scripts/dev_gateway_stub.py     # 另开一个终端
+#       cd infra && docker compose -f docker-compose.yml -f docker-compose.dev-auth.yml up -d gateway
+# 撤：  cd infra && docker compose -f docker-compose.yml up -d --force-recreate gateway
+#
+# 为什么不干脆绕开 gateway 直连 lea-agent：gateway 唯一独有的是 main.go:routes 那张
+# 白名单路由表，而它正是历史上两次生产 404 的来源（项目、用户文件库漏注册，直连
+# agent 时完全正常）。绕开它等于把唯一需要覆盖的东西排除在外。
+services:
+  gateway:
+    environment:
+      OIDC_ISSUER: http://host.docker.internal:9310
+      OIDC_JWKS_URL: http://host.docker.internal:9310/jwks.json
+      TENANT_MEMBERSHIP_URL: http://host.docker.internal:9310/api/TenantUser/CurrUserTenants
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

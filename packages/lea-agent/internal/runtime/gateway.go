@@ -14,11 +14,22 @@ import (
 	"gitlab.ouc-online.com.cn/aibase/agentloop/tools/askuser"
 	"gitlab.ouc-online.com.cn/aibase/agentloop/tools/webfetch"
 	"gitlab.ouc-online.com.cn/aibase/agentloop/tools/websearch"
+	"github.com/sony/gobreaker"
+	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/breaker"
 )
 
 var toolsGatewayURL = getEnv("LEA_TOOLS_URL", "http://localhost:8400")
 
-// 工具执行不能共用 config_loader 那个 10s client：code_interpreter 首次调用
+var (
+	// 工具网关熔断器（全局单例）
+	toolGatewayBreaker *gobreaker.CircuitBreaker
+)
+
+func init() {
+	toolGatewayBreaker = breaker.NewToolGatewayBreaker()
+}
+
+// 工具执行不能共用 config_loader 那个 10s client：Bash 首次调用
 // 要等 Cube 冷启沙箱（拉 template + 起 VM + 挂 3 组 host-mount），实测远超
 // 10s，之前日志里的 "context deadline exceeded" 就是这个 —— 靠引擎重试才救回来，
 // 白等一轮。后续调用复用同一沙箱，都是几十毫秒。
@@ -160,9 +171,10 @@ func ExecuteRemoteTool(ctx context.Context, toolName string, params map[string]a
 
 	resp, err := gatewayClient.Do(req)
 	if err != nil {
+		// 降级：网关不可达时返回用户友好的错误信息，不阻断对话
 		fmt.Printf("[gateway] %s gatewayClient.Do err: %v\n", toolName, err)
-		return tool.Result{IsError: true, Content: []tool.ResultContent{
-			{Type: tool.ResultContentTypeText, Text: fmt.Sprintf("tools gateway: %v", err)},
+		return tool.Result{Content: []tool.ResultContent{
+			{Type: tool.ResultContentTypeText, Text: "工具服务暂时不可用，请稍后重试或继续对话。"},
 		}}, nil
 	}
 	defer resp.Body.Close()

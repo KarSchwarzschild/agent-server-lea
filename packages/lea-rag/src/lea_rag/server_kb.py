@@ -71,12 +71,28 @@ async def search_kb(body: KBSearchRequest):
     metadata_filter: 按 KB/Document 的 metadata JSON 字段过滤。
     """
     from lea_rag.retrieval.hybrid_v2 import HybridRetrieverV2
+    from lea_rag.services.cache import get_retrieval_cache, set_retrieval_cache
 
     effective_kb_ids = body.kb_ids
     effective_doc_ids = body.document_ids
 
     if not effective_kb_ids and not effective_doc_ids:
         effective_kb_ids = _get_visible_kb_ids(body.user_id, body.tenant_id)
+
+    # 尝试从缓存读取（仅缓存简单查询：无图片、无 metadata_filter、单 kb）
+    use_cache = (
+        not body.image
+        and not body.metadata_filter
+        and effective_kb_ids
+        and len(effective_kb_ids) == 1
+        and not effective_doc_ids
+    )
+
+    if use_cache:
+        kb_id = effective_kb_ids[0]
+        cached = await get_retrieval_cache(body.query, kb_id, body.top_k, body.strategy)
+        if cached is not None:
+            return cached
 
     if body.metadata_filter:
         effective_kb_ids, effective_doc_ids = _apply_metadata_filter(
@@ -121,7 +137,7 @@ async def search_kb(body: KBSearchRequest):
     all_hits.sort(key=lambda h: h.score, reverse=True)
     all_hits = all_hits[:body.top_k]
 
-    return [
+    results = [
         SearchHitOut(
             content=h.content,
             score=h.score,
@@ -131,10 +147,18 @@ async def search_kb(body: KBSearchRequest):
             page=h.page,
             chunk_type=h.chunk_type,
             source_filename=h.source_filename,
-            source_url=h.source_url,
+            source_url=h.source_url or "",
         )
         for h in all_hits
     ]
+
+    # 缓存结果
+    if use_cache:
+        kb_id = effective_kb_ids[0]
+        cacheable = [r.model_dump() for r in results]
+        await set_retrieval_cache(body.query, kb_id, body.top_k, body.strategy, cacheable)
+
+    return results
 
 
 def _get_visible_kb_ids(user_id: str, tenant_id: str) -> list[int] | None:

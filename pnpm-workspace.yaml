@@ -1,5 +1,8 @@
 packages:
-  - 'frontend'
+  - 'frontend-admin'
+  - 'frontend-user'
+  - 'frontend-lab'
 allowBuilds:
+  '@parcel/watcher': set this to true or false
   esbuild: set this to true or false
   vue-demi: set this to true or false

@@ -19,6 +19,11 @@ services:
     build:
       context: ..
       dockerfile: packages/lea-agent/Dockerfile
+      # agentloop 是本仓库之外的兄弟仓库，go.mod 里 replace 指向它（见 Dockerfile 头部）。
+      # 少了这行，buildkit 会把 `agentloop` 当成 Docker Hub 上的镜像去拉，报的是
+      # "failed to solve: agentloop: ... failed size validation" —— 完全看不出是缺上下文。
+      additional_contexts:
+        agentloop: ../../agentloop
     container_name: lea-agent
     env_file:
       - ../.env

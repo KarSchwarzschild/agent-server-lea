@@ -33,16 +33,30 @@ def parse_pdf(file_path: str) -> dict:
 
 
 def _parse_pymupdf(file_path: str) -> dict:
+    """兜底路径：只抽**文本层**，不做 OCR。
+
+    ⚠️ 这条路拿不到扫描件的内容。扫描版 PDF 由 MinerU 处理（它带 OCR / VLM，
+    parse_pdf 优先走那边），这里是 MinerU 没配或调用失败时的降级。
+
+    所以 `page_count > 0 而 md 为空` 在这条路上的含义是**"要么是扫描件、要么这几页
+    真的没字"，而我们分不出来** —— 因为没有 OCR 就没有判据。上游据此提示模型"文本层
+    为空，可在沙箱里 OCR"，而不是让它以为文件是空的。
+
+    真正该修的是让 MinerU 别静默降级到这里（见 parse_pdf 那两个 except 分支只 warning），
+    但那是部署可观测性的事，不在这一轮。
+    """
     import fitz
     doc = fitz.open(file_path)
     text_blocks: list[dict] = []
+    page_count = doc.page_count
     for page_num, page in enumerate(doc):
         text = page.get_text().strip()
         if text:
             text_blocks.append({"text": text, "page_idx": page_num})
     doc.close()
     md = "\n\n".join(b["text"] for b in text_blocks)
-    return {"md_content": md, "text_blocks": text_blocks, "image_items": []}
+    return {"md_content": md, "text_blocks": text_blocks, "image_items": [],
+            "page_count": page_count}
 
 
 def _html_table_to_text(html: str) -> str:
@@ -59,9 +73,11 @@ def _parse_content_list(content_list, images_dict: dict) -> dict:
     items = json.loads(content_list) if isinstance(content_list, str) else content_list
     text_blocks: list[dict] = []
     image_items: list[dict] = []
+    max_page = -1
     for item in items:
         item_type = item.get("type", "")
         page_idx = item.get("page_idx", 0)
+        max_page = max(max_page, int(page_idx))
         if item_type == "text":
             text = item.get("text", "").strip()
             if text:
@@ -83,7 +99,31 @@ def _parse_content_list(content_list, images_dict: dict) -> dict:
                     "caption": (item.get("image_caption") or [""])[0],
                     "img_path": img_path,
                 })
-    return {"text_blocks": text_blocks, "image_items": image_items}
+    # page_count 从 content_list 里最大的 page_idx 推。MinerU 不单独给总页数，而纯图片页
+    # 在 content_list 里仍有 image 条目（带 page_idx），所以这个推断通常是准的。
+    return {
+        "text_blocks": text_blocks,
+        "image_items": image_items,
+        "page_count": max_page + 1 if max_page >= 0 else 0,
+    }
+
+
+def _page_count_of(parsed: dict) -> int:
+    """content_list 推出来的页数。0 = 推不出来。
+
+    ## 为什么不用它去重拼 md_content
+
+    试过让 md 按页重排（加 `[第 N 页]` 标记），已经回退：MinerU 返回的 md_content 排版
+    显著更好（标题层级、列表、公式），而按 text_blocks 重拼会把这些全拍平成纯文本。
+
+    而重拼换来的东西其实没有必要：模型改文件是在沙箱里 `prs.slides[i]` / `doc.pages[i]`
+    直接定位的，那才是真相；就算用户说的是"改讲卷积的那一页"，模型也可以在沙箱里逐页
+    dump 文本自己找，比从注入文本里数段落可靠。所以页码标记只省一次往返，代价是丢掉
+    整篇排版 —— 不值。
+
+    page_count 本身留着：注入文本里要报"共 N 页"，那是纯元信息，不动正文。
+    """
+    return parsed.get("page_count") or 0
 
 
 def _parse_mineru_local(file_path: str, base_url: str) -> dict:
@@ -103,10 +143,12 @@ def _parse_mineru_local(file_path: str, base_url: str) -> dict:
     imgs = file_result.get("images", {})
     if cl:
         parsed = _parse_content_list(cl, imgs)
-        return {"md_content": md, "text_blocks": parsed["text_blocks"],
-                "image_items": parsed["image_items"]}
+        return {"md_content": md,
+                "text_blocks": parsed["text_blocks"],
+                "image_items": parsed["image_items"],
+                "page_count": _page_count_of(parsed)}
     return {"md_content": md, "text_blocks": [{"text": md, "page_idx": 0}],
-            "image_items": []}
+            "image_items": [], "page_count": 0}
 
 
 _MINERU_API_BASE = "https://mineru.net/api/v4"
@@ -166,8 +208,10 @@ def _download_zip(zip_url: str, token: str) -> dict:
                 images_dict[img_name] = base64.b64encode(zf.read(name)).decode()
     if content_list_raw:
         parsed = _parse_content_list(content_list_raw, images_dict)
-        return {"md_content": md_content, "text_blocks": parsed["text_blocks"],
-                "image_items": parsed["image_items"]}
+        return {"md_content": md_content,
+                "text_blocks": parsed["text_blocks"],
+                "image_items": parsed["image_items"],
+                "page_count": _page_count_of(parsed)}
     return {"md_content": md_content,
             "text_blocks": [{"text": md_content, "page_idx": 0}] if md_content else [],
-            "image_items": []}
+            "image_items": [], "page_count": 0}

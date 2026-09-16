@@ -19,6 +19,7 @@ import (
 //	挡住  Write / Edit / Bash            引擎原生
 //	挡住  code_interpreter               沙箱里能写文件、发请求、改产物
 //	挡住  memory_add                     写用户跨会话的长期记忆
+//	挡住  deliver_artifact               往用户的长期文件库里塞成品
 //	挡住  其余任何名字                    租户自定义工具 + MCP，读写意图无从判断
 //
 // 这跟 Claude Code 的选择一致 —— 它的 plan 模式也是"MCP 工具全挡，除非显式列进
@@ -48,9 +49,9 @@ import (
 //
 // ## 三条分支，最后一条是关键
 //
-//	1. 我们自己的工具   → 下面这几张表显式分类
-//	2. 引擎原生的工具   → 交给 DefaultResolver（Read/Write/Edit/Glob/Bash/Web*/AskUser…）
-//	3. 其余任何名字     → DefaultResolver 会给 unknown，我们把它**升级成 External**
+//  1. 我们自己的工具   → 下面这几张表显式分类
+//  2. 引擎原生的工具   → 交给 DefaultResolver（Read/Write/Edit/Glob/Bash/Web*/AskUser…）
+//  3. 其余任何名字     → DefaultResolver 会给 unknown，我们把它**升级成 External**
 //
 // 第 3 条覆盖的是租户在 lea-config 里自定义的网关工具（DynamicTool）和 MCP 工具 ——
 // 名字是运行时才知道的，数量不定，读写意图我们无从判断。保守当成"会改外面的东西"，
@@ -119,13 +120,19 @@ func (r PlatformResolver) Resolve(ctx context.Context, req permissions.ResolveRe
 			Risk:      permissions.RiskMedium,
 		}, nil
 
-	case req.ToolName == "code_interpreter":
-		// 沙箱里跑任意代码：能写文件、能发网络请求、能改 S3 产物。规划态必须挡。
+	case req.ToolName == "deliver_artifact":
+		// 不是 metadata，尽管它"只是写一行登记"。那一行会让一个对象进 OBS、占用户的
+		// 配额、出现在他所有对话的文件库里 —— 全都是会话结束后仍然在的效果。
+		//
+		// 跟 save_plan 的区别正在这里：计划是**规划态的产出本身**，挡了就交不出计划；
+		// 成品是**执行态的产出**，规划阶段根本还没有文件可交付。所以挡住它不会让
+		// plan 模式少任何东西，而放行它会让"规划态什么都不改"这句话变成假的。
 		return permissions.Action{
 			ToolName:  req.ToolName,
-			Operation: permissions.OperationExecute,
-			Risk:      permissions.RiskHigh,
+			Operation: permissions.OperationWrite,
+			Risk:      permissions.RiskMedium,
 		}, nil
+
 	}
 
 	action, err := r.fallback.Resolve(ctx, req)

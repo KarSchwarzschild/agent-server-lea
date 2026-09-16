@@ -1,0 +1,1042 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  color: #202123;
+  background: #ffffff;
+  font-family: "Aptos", "Segoe UI", sans-serif;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+.connection-error {
+  margin: 0;
+  color: #b42318;
+  font-size: 13px;
+}
+
+.app-shell {
+  display: grid;
+  grid-template-columns: 300px minmax(0, 1fr) 76px;
+  min-height: 100vh;
+}
+
+.app-shell.inspector-visible {
+  grid-template-columns: 300px minmax(0, 1fr) 400px;
+}
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 18px;
+  border-right: 1px solid #e5e5e5;
+  background: #f7f7f8;
+}
+
+.workspace-switcher,
+.topbar,
+.session-header,
+.inspector-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.session-toolbar,
+.session-config-panel {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.session-toolbar {
+  justify-content: space-between;
+  padding: 10px 12px;
+  border: 1px solid #e7e7e7;
+  border-radius: 8px;
+  background: #fafafa;
+}
+
+.session-toolbar-main,
+.attachment-chips {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.toolbar-label {
+  color: #6f7075;
+  font-size: 12px;
+}
+
+.session-config-panel {
+  padding: 10px 12px;
+  border: 1px solid #e7e7e7;
+  border-top: 0;
+  background: #ffffff;
+}
+
+.session-config-panel select {
+  min-width: 150px;
+  min-height: 34px;
+  padding: 0 10px;
+  border: 1px solid #d9d9d9;
+  border-radius: 6px;
+  background: #ffffff;
+  color: #343539;
+}
+
+.config-field {
+  display: grid;
+  gap: 6px;
+  color: #4b5563;
+  font-size: 12px;
+}
+
+.config-field select[multiple] {
+  min-height: 96px;
+  min-width: 220px;
+}
+
+.mount-panel {
+  align-items: stretch;
+}
+
+.mount-panel small {
+  align-self: center;
+}
+
+.composer-panel {
+  margin-bottom: 2px;
+  border-top: 1px solid #e7e7e7;
+  border-radius: 8px;
+}
+
+.composer-chips {
+  padding: 2px 4px;
+}
+
+.composer-actions {
+  align-items: center;
+}
+
+.composer-actions > :last-child {
+  margin-left: auto;
+}
+
+.workspace-switcher {
+  padding: 8px 4px 14px;
+}
+
+.logo {
+  display: grid;
+  place-items: center;
+  width: 46px;
+  height: 46px;
+  border-radius: 8px;
+  color: #ffffff;
+  background: #202123;
+  font-family: Georgia, serif;
+  font-size: 28px;
+  font-weight: 800;
+}
+
+.workspace-switcher strong,
+.workspace-switcher small,
+.sidebar-section span,
+.sidebar-section small,
+.topbar p,
+.topbar h1,
+.session-header p,
+.content-board p,
+.inspector-header small,
+.preview p,
+.citation p {
+  display: block;
+  margin: 0;
+  color: #6f7075;
+}
+
+.workspace-switcher strong,
+.topbar h1,
+.session-header h2,
+.asset-card h3,
+.market-list h3,
+.placeholder-board h2,
+.preview strong,
+.citation strong {
+  color: #202123;
+}
+
+.quick-actions {
+  display: flex;
+  gap: 10px;
+}
+
+.primary-nav,
+.sidebar-section,
+.conversation-stage,
+.content-board,
+.inspector-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.primary-nav button,
+.project-row,
+.conversation-row,
+.market-list article,
+.file-row,
+.dir-row,
+.inspector-tabs button,
+.segmented button {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 11px 12px;
+  color: #343539;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.primary-nav button.active,
+.conversation-row.active,
+.inspector-tabs button.active,
+.segmented button.active {
+  color: #202123;
+  background: #e8f5df;
+  border-color: #d7edca;
+}
+
+/* 会话行里的删除键。
+   默认透明而不是 display:none —— 后者在 hover 时会让行内其余元素重新排版（宽度
+   突然少一个按钮位），标题跟着跳一下。占位留着、只改透明度就不会动。 */
+.conversation-delete {
+  margin-left: auto;
+  flex: none;
+  width: 22px;
+  padding: 0;
+  color: #8b8c91;
+  font-size: 16px;
+  line-height: 1;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.conversation-row:hover .conversation-delete,
+.conversation-delete:focus-visible {
+  opacity: 1;
+}
+
+.conversation-delete:hover {
+  color: #b42318;
+  background: #fdecea;
+}
+
+.sidebar-section {
+  padding-top: 8px;
+}
+
+.sidebar-section header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: #5d5e63;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.grow {
+  flex: 1;
+}
+
+.main-stage {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 22px;
+  min-width: 0;
+}
+
+.topbar {
+  padding: 10px 4px 18px;
+  border-bottom: 1px solid #e8e8e8;
+}
+
+.eyebrow {
+  margin: 0 0 8px;
+  color: #2f7d32;
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.topbar h1 {
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: clamp(34px, 5vw, 64px);
+  line-height: 0.95;
+}
+
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.conversation-stage {
+  min-height: 0;
+}
+
+.message-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 46vh;
+  padding: 18px 0;
+}
+
+.message {
+  display: flex;
+  gap: 12px;
+}
+
+.message.assistant {
+  margin-left: 26px;
+}
+
+.message.system {
+  opacity: 0.85;
+}
+
+.plan-approval-card {
+  margin-top: 14px;
+  padding: 14px;
+  border: 1px solid #cfd8e3;
+  border-left: 3px solid #111827;
+  background: #f8fafc;
+  max-width: 520px;
+}
+
+.plan-approval-heading {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-bottom: 8px;
+  color: #111827;
+}
+
+.plan-approval-mark {
+  padding: 3px 6px;
+  background: #111827;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .08em;
+}
+
+.plan-approval-card p {
+  margin: 0 0 10px;
+  color: #4b5563;
+  white-space: pre-wrap;
+}
+
+.plan-options {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.plan-options span {
+  padding: 7px 9px;
+  border: 1px solid #e1e7ef;
+  background: #fff;
+  color: #374151;
+  font-size: 12px;
+}
+
+.plan-approval-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.avatar {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  flex: 0 0 auto;
+  border-radius: 8px;
+  background: #edf7e9;
+  color: #2f7d32;
+  font-weight: 800;
+}
+
+.bubble {
+  flex: 1;
+  padding: 14px 15px;
+  border: 1px solid #e7e7e7;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.bubble header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.bubble p {
+  margin: 0;
+  line-height: 1.65;
+}
+
+.composer {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-top: 10px;
+  border-top: 1px solid #e8e8e8;
+}
+
+.composer-actions {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.content-board {
+  padding: 18px 0 0;
+}
+
+.segmented {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.asset-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.asset-card {
+  padding: 16px;
+  border: 1px solid #e7e7e7;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.asset-card p,
+.market-list p {
+  line-height: 1.55;
+}
+
+.market-status {
+  margin: 4px 0 8px;
+  color: #6f7075;
+}
+
+.market-status.error {
+  color: #b42318;
+}
+
+.market-categories {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 2px 0 10px;
+  border-bottom: 1px solid #eeeeee;
+}
+
+.market-categories button {
+  padding: 6px 10px;
+  color: #6f7075;
+  border: 1px solid #e3e3e3;
+  border-radius: 999px;
+  background: #ffffff;
+  cursor: pointer;
+}
+
+.market-categories button.active {
+  color: #245d28;
+  border-color: #c9e5bf;
+  background: #e8f5df;
+}
+
+.tool-create-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 6px 0 14px;
+  padding: 14px;
+  border: 1px solid #e2e2e2;
+  border-radius: 8px;
+  background: #fafafa;
+}
+
+.skill-upload-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.skill-upload-form select {
+  min-height: 34px;
+  padding: 0 10px;
+  color: #343539;
+  border: 1px solid #e2e2e2;
+  border-radius: 4px;
+  background: #ffffff;
+}
+
+.upload-file-name {
+  color: #6f7075;
+  font-size: 13px;
+}
+
+.attachment-list,
+.document-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.attachment-list {
+  flex-direction: column;
+  align-items: stretch;
+  padding-bottom: 10px;
+  border-bottom: 1px solid #e7e7e7;
+}
+
+.workspace-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 10px 12px;
+  border: 1px solid #e7e7e7;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.workspace-summary small {
+  color: #6d6f76;
+  font-size: 11px;
+}
+
+.activity-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 12px 0;
+  padding-left: 10px;
+  border-left: 2px solid #e3e5e8;
+}
+
+.activity-item {
+  padding: 7px 9px;
+  border: 1px solid #e7e7e7;
+  border-radius: 6px;
+  background: #fafafa;
+}
+
+.activity-thinking {
+  background: #f8fafc;
+}
+
+.activity-sandbox {
+  border-color: #b9dec8;
+  background: #f5fbf7;
+}
+
+.activity-chain {
+  border-color: #cbd8ea;
+  background: #f6f9fd;
+}
+
+.activity-heading {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 20px;
+  color: #343539;
+  font-size: 12px;
+}
+
+.activity-heading strong {
+  flex: 1;
+}
+
+.activity-dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 7px;
+  border-radius: 50%;
+  background: #8a8d93;
+}
+
+.activity-sandbox .activity-dot {
+  background: #18a058;
+}
+
+.activity-chain .activity-dot {
+  background: #4f6f9f;
+}
+
+.activity-detail {
+  max-height: 180px;
+  overflow: auto;
+  margin: 6px 0 0 14px;
+  color: #6d6f76;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+/* 沙箱卡片的三种块。靠背景色区分"输入 / 正常输出 / 错误输出"——
+   以前三者都挤在同一坨 JSON 里，扫一眼分不出哪段是报错。 */
+.sandbox-code {
+  padding: 6px 8px;
+  color: #3a3d44;
+  border-radius: 6px;
+  background: #f4f5f7;
+  font-family: 'SFMono-Regular', Consolas, monospace;
+}
+
+.sandbox-stderr {
+  padding: 6px 8px;
+  color: #a8222a;
+  border-radius: 6px;
+  background: #fdf3f3;
+}
+
+.sandbox-message {
+  margin: 6px 0 0 14px;
+  color: #8a6100;
+  font-size: 11px;
+}
+
+.sandbox-artifacts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 8px 0 0 14px;
+}
+
+.sandbox-artifacts small {
+  color: #6d6f76;
+  font-size: 11px;
+}
+
+.sandbox-artifact {
+  padding: 2px 8px;
+  color: #2a5f9e;
+  border: 1px solid #cddcf0;
+  border-radius: 10px;
+  background: #f2f7fd;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.sandbox-artifact:hover {
+  background: #e5effb;
+}
+
+/* 工作区按目录分组。组名用等宽字体：它是路径，对齐了才看得出层级。 */
+.workspace-group-head {
+  display: flex;
+  justify-content: space-between;
+  margin: 10px 0 2px;
+  color: #6d6f76;
+  font-family: 'SFMono-Regular', Consolas, monospace;
+  font-size: 11px;
+}
+
+.document-row {
+  min-height: 32px;
+  color: #4e4f54;
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.form-grid select {
+  min-height: 34px;
+  padding: 0 10px;
+  color: #343539;
+  border: 1px solid #e2e2e2;
+  border-radius: 4px;
+  background: #ffffff;
+}
+
+.tag-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.market-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.market-list article {
+  justify-content: space-between;
+}
+
+.placeholder-board {
+  min-height: 60vh;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 32px 0;
+}
+
+.inspector {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  border-left: 1px solid #e5e5e5;
+  background: #fafafa;
+  overflow: hidden;
+}
+
+.inspector-toggle {
+  width: 100%;
+  height: 100%;
+  border: 0;
+  color: #4e4f54;
+  background: transparent;
+  cursor: pointer;
+}
+
+.inspector.open {
+  padding: 16px;
+}
+
+/* auto-fit 而不是写死列数：加一个页签就得回来改一次数字，忘了就挤成一坨。 */
+.inspector-tabs {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.inspector-tabs button {
+  padding: 6px 4px;
+  font-size: 12px;
+}
+
+/* ── 用户文件库 ────────────────────────────────── */
+
+.storage-meter {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid #e7e7e7;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.storage-line small {
+  color: #6d6f76;
+}
+
+.storage-bar {
+  height: 6px;
+  overflow: hidden;
+  border-radius: 3px;
+  background: #eceef1;
+}
+
+.storage-bar span {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+  background: #18a058;
+  transition: width 0.25s ease;
+}
+
+/* 90% 以上转红：用户还能靠自己删文件解决，得让他在撞上 507 之前就看见。 */
+.storage-bar span.danger {
+  background: #d03050;
+}
+
+.storage-detail {
+  color: #6d6f76;
+  font-size: 11px;
+}
+
+.library-filters {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.library-filters button {
+  padding: 4px 10px;
+  color: #6d6f76;
+  border: 1px solid #e7e7e7;
+  border-radius: 999px;
+  background: #ffffff;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.library-filters button.active {
+  color: #ffffff;
+  border-color: #18a058;
+  background: #18a058;
+}
+
+.library-error {
+  margin: 0;
+  padding: 8px 10px;
+  color: #d03050;
+  border: 1px solid #f5c6cf;
+  border-radius: 6px;
+  background: #fff5f6;
+  font-size: 12px;
+}
+
+/* 共享软提示。刻意跟 .library-error（红）区分开：warnings 不挡共享，只是"别人用
+   起来会跟你不一样"。做成红的会让用户以为被拦住了，然后去删掉那个知识库绑定。 */
+.share-warning {
+  margin: 0;
+  padding: 8px 10px;
+  color: #8a6100;
+  border: 1px solid #f0dca4;
+  border-radius: 6px;
+  background: #fffaf0;
+  font-size: 12px;
+}
+
+.library-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid #e7e7e7;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.library-main {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* 文件名可以很长，挤走标签比截断更糟 —— 标签正是"能不能导入"的那个信号。 */
+.library-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
+
+.library-title {
+  color: #343539;
+  font-size: 12px;
+}
+
+.library-desc {
+  display: -webkit-box;
+  overflow: hidden;
+  color: #6d6f76;
+  font-size: 11px;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.library-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: #6d6f76;
+  font-size: 11px;
+}
+
+.library-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.inspector-body {
+  gap: 10px;
+}
+
+.file-row {
+  justify-content: space-between;
+  align-items: center;
+}
+
+.file-row span {
+  flex: 1;
+}
+
+/* 选中态。预览区现在显示完整路径，但列表里也得看得出点的是哪一行 ——
+   分组之后同名文件会同时出现在屏幕上。 */
+.file-row.active {
+  border-color: #b5c9e4;
+  background: #f2f7fd;
+}
+
+/* 工作区树。缩进靠行内 padding-left（深度 × 16px）打，不靠嵌套 DOM ——
+   模板把树摊平成一维行列表渲染，省掉一个递归组件。行内样式优先级高于
+   下面 .workspace-tree .file-row 的 padding 简写，缩进不会被吃掉。 */
+.workspace-tree {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.workspace-tree .file-row,
+.workspace-tree .dir-row {
+  padding-top: 6px;
+  padding-bottom: 6px;
+  padding-right: 10px;
+}
+
+.workspace-tree .file-row:hover,
+.workspace-tree .dir-row:hover {
+  background: #f4f5f6;
+}
+
+.dir-row {
+  color: #56585e;
+  font-weight: 500;
+}
+
+.dir-row span {
+  flex: 1;
+  text-align: left;
+}
+
+/* 三角占固定宽度：展开 ▾ 和收起 ▸ 字宽不同，不定宽的话每次点击整行文字会横向抖一下。 */
+.tree-caret {
+  flex: none;
+  width: 12px;
+  color: #9aa0a6;
+  font-size: 10px;
+}
+
+.preview,
+.citation,
+.debug-panel pre {
+  padding: 14px;
+  border: 1px solid #e7e7e7;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.preview-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.image-preview {
+  display: block;
+  width: 100%;
+  max-height: 280px;
+  margin-top: 12px;
+  object-fit: contain;
+  border: 1px solid #e7e7e7;
+  border-radius: 4px;
+  background: #ffffff;
+}
+
+.text-preview {
+  max-height: 280px;
+  margin: 12px 0 0;
+  padding: 10px;
+  overflow: auto;
+  color: #343539;
+  border: 1px solid #e7e7e7;
+  border-radius: 4px;
+  background: #ffffff;
+  font: 12px/1.55 Consolas, "Cascadia Code", monospace;
+  white-space: pre-wrap;
+}
+
+.probe-row {
+  display: grid;
+  grid-template-columns: 110px minmax(0, 1fr);
+  gap: 10px;
+}
+
+@media (max-width: 1180px) {
+  .app-shell,
+  .app-shell.inspector-visible {
+    grid-template-columns: 280px minmax(0, 1fr);
+  }
+
+  .inspector {
+    display: none;
+  }
+}
+
+@media (max-width: 760px) {
+  .app-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar {
+    position: static;
+  }
+
+  .asset-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .composer-actions,
+  .topbar,
+  .session-header,
+  .workspace-switcher {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}

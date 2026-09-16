@@ -1,0 +1,55 @@
+# 直连两个副本的叠加层 —— 配合 docker-compose.verify.yml 用。
+#
+#   docker compose -f infra/docker-compose.verify.yml \
+#                  -f infra/docker-compose.verify.direct.yml \
+#                  up -d lea-config agent-a agent-b
+#
+# ## 为什么绕开 nginx
+#
+# verify.yml 里那个 nginx 是给"跨副本停止 / 断线续传"那几条用的：它们只需要请求被
+# **分散**到两个副本，谁先谁后无所谓，轮询正好。
+#
+# 但 expert_switch_e2e.py 的判据④（激活 agent 的多副本自愈）要的是**确定的顺序**：
+#
+#   1. 消息 → 副本B    让 B 的内存里装上按 active_agent_id=0 建的那份引擎
+#   2. PUT  → 副本A    只改库（A 内存里没这个会话）
+#   3. 消息 → 副本B    B 必须靠指纹自己发现列变了 → 重建 → 换人格
+#
+# 轮询给不了这个顺序。第 1 步要是落到 A，B 内存里就是空的，第 3 步走的是"全新构建"
+# 那条路 —— 全新构建当然会读到新的列，于是判据通过了，但**真正要验的自愈逻辑一行都
+# 没跑到**。这种假绿比失败更糟：它会让人以为跨副本没问题。
+#
+# 所以这里给两个副本各自开一个宿主端口，脚本用 LEA_AGENT_URL_A/_B 精确投递。
+#
+# ## 端口选择
+#
+# 8101/8102 而不是 8080 —— 宿主上 8080 归 lea-gateway（另一个栈，正在跑）。nginx
+# 这个 service 本身不启动（up 时不点它的名字），所以不会去抢 8080。
+services:
+  agent-a:
+    ports:
+      - "8101:8100"
+
+  agent-b:
+    ports:
+      - "8102:8100"
+
+  # ⚠️ verify.yml 里 prometheus 的 depends_on 指了一个这份文件里并不存在的 lea-rag，
+  # 于是**整个 project 校验不过**（compose 校验全图，哪怕 up 时只点了别的服务）：
+  #
+  #   service "prometheus" depends on undefined service "lea-rag": invalid compose project
+  #
+  # 这是 verify.yml 自己的既有问题，跟本次验收无关（prometheus/grafana 是后来加的，
+  # 加的时候 lea-rag 没一起进来）。
+  #
+  # 不能用 `prometheus: {depends_on: []}` 覆盖：list 形式的 depends_on 在多文件叠加时
+  # 是**合并**而不是替换，清空写法不生效（试过）。所以改成把这个名字补齐 —— 声明一个
+  # 不启动的占位 service，让引用解析得开。
+  #
+  # 不能加 profiles 把它排除：那样它就不在图里了，depends_on 照样悬空（也试过）。
+  # 所以就让它存在。它不会启动 —— `up` 时只点 lea-config / agent-a / agent-b 三个名字，
+  # 而只有 prometheus 依赖它，prometheus 本身也不启动。
+  # 真正修 verify.yml 是另一件事，不在这次验收范围里。
+  lea-rag:
+    image: alpine:3.20
+    command: ["true"]

@@ -1,0 +1,292 @@
+groups:
+  - name: lea-platform-critical
+    interval: 30s
+    rules:
+      # ========== 熔断器告警 ==========
+
+      - alert: CircuitBreakerOpen
+        expr: lea_agent_circuit_breaker_state > 1
+        for: 1m
+        labels:
+          severity: critical
+          service: lea-agent
+        annotations:
+          summary: "KB/Memory 熔断器打开"
+          description: |
+            熔断器已打开，外部服务可能故障。
+            Instance: {{ $labels.instance }}
+            State: {{ $value }}
+          dashboard: "http://grafana:3000/d/lea-platform-health"
+
+      # ========== 错误率告警 ==========
+
+      - alert: HighErrorRate5xx
+        expr: |
+          (
+            sum(rate(lea_agent_http_requests_total{status=~"5.."}[5m]))
+            /
+            sum(rate(lea_agent_http_requests_total[5m]))
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+          service: lea-agent
+        annotations:
+          summary: "lea-agent 5xx 错误率超过 5%"
+          description: |
+            5xx 错误率: {{ $value | humanizePercentage }}
+            Instance: {{ $labels.instance }}
+            需立即调查服务日志。
+
+      - alert: HighErrorRateConfig
+        expr: |
+          (
+            sum(rate(lea_config_http_requests_total{status=~"5.."}[5m]))
+            /
+            sum(rate(lea_config_http_requests_total[5m]))
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+          service: lea-config
+        annotations:
+          summary: "lea-config 5xx 错误率超过 5%"
+          description: |
+            5xx 错误率: {{ $value | humanizePercentage }}
+            Instance: {{ $labels.instance }}
+
+      - alert: HighErrorRateRag
+        expr: |
+          (
+            sum(rate(lea_rag_http_requests_total{status=~"5.."}[5m]))
+            /
+            sum(rate(lea_rag_http_requests_total[5m]))
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+          service: lea-rag
+        annotations:
+          summary: "lea-rag 5xx 错误率超过 5%"
+          description: |
+            5xx 错误率: {{ $value | humanizePercentage }}
+            Instance: {{ $labels.instance }}
+
+      - alert: HighErrorRateTools
+        expr: |
+          (
+            sum(rate(lea_tools_http_requests_total{status=~"5.."}[5m]))
+            /
+            sum(rate(lea_tools_http_requests_total[5m]))
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+          service: lea-tools
+        annotations:
+          summary: "lea-tools 5xx 错误率超过 5%"
+          description: |
+            5xx 错误率: {{ $value | humanizePercentage }}
+            Instance: {{ $labels.instance }}
+
+      # ========== 缓存告警 ==========
+
+      - alert: CacheInvalidationRateHigh
+        expr: |
+          (
+            sum(rate(lea_config_agent_config_loads_total{status="cache_miss"}[5m]))
+            /
+            sum(rate(lea_config_agent_config_loads_total[5m]))
+          ) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+          service: lea-config
+        annotations:
+          summary: "Agent 配置缓存失效率 > 10%"
+          description: |
+            缓存失效率: {{ $value | humanizePercentage }}
+            Instance: {{ $labels.instance }}
+            检查 Redis 连接和容量。
+
+      - alert: CacheMissRate
+        expr: |
+          (
+            sum(rate(lea_config_cache_misses_total[5m]))
+            /
+            sum(rate(lea_config_cache_requests_total[5m]))
+          ) > 0.5
+        for: 15m
+        labels:
+          severity: warning
+          service: lea-config
+        annotations:
+          summary: "缓存命中率过低 < 50%"
+          description: |
+            命中率: {{ $value | humanizePercentage }}
+            Instance: {{ $labels.instance }}
+            可能是 Redis 故障或容量不足。
+
+      # ========== 数据库告警 ==========
+
+      - alert: DBQueryLatencyP95High
+        expr: histogram_quantile(0.95, lea_config_db_query_duration_seconds) > 1
+        for: 5m
+        labels:
+          severity: warning
+          service: lea-config
+        annotations:
+          summary: "数据库查询 P95 延迟 > 1 秒"
+          description: |
+            P95 延迟: {{ $value | humanizeDuration }}
+            Instance: {{ $labels.instance }}
+            检查数据库是否有慢查询或索引缺失。
+
+      - alert: DBConnectionPoolExhausted
+        expr: lea_config_db_connection_pool_usage > 0.8
+        for: 5m
+        labels:
+          severity: warning
+          service: lea-config
+        annotations:
+          summary: "数据库连接池使用率 > 80%"
+          description: |
+            使用率: {{ $value | humanizePercentage }}
+            Instance: {{ $labels.instance }}
+            增加连接池大小或优化查询。
+
+      # ========== KB/RAG 告警 ==========
+
+      - alert: KBSearchHighLatency
+        expr: histogram_quantile(0.95, lea_rag_kb_search_duration_seconds) > 1
+        for: 5m
+        labels:
+          severity: warning
+          service: lea-rag
+        annotations:
+          summary: "知识库检索 P95 延迟 > 1 秒"
+          description: |
+            P95 延迟: {{ $value | humanizeDuration }}
+            Instance: {{ $labels.instance }}
+
+      - alert: EmbeddingHighLatency
+        expr: histogram_quantile(0.95, lea_rag_embedding_duration_seconds) > 2
+        for: 5m
+        labels:
+          severity: warning
+          service: lea-rag
+        annotations:
+          summary: "向量化处理 P95 延迟 > 2 秒"
+          description: |
+            P95 延迟: {{ $value | humanizeDuration }}
+            Instance: {{ $labels.instance }}
+
+      # ========== Tool 执行告警 ==========
+
+      - alert: ToolExecutionHighErrorRate
+        expr: |
+          (
+            sum(rate(lea_tools_tool_executions_total{status="error"}[5m]))
+            /
+            sum(rate(lea_tools_tool_executions_total[5m]))
+          ) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+          service: lea-tools
+        annotations:
+          summary: "工具执行错误率 > 10%"
+          description: |
+            错误率: {{ $value | humanizePercentage }}
+            Instance: {{ $labels.instance }}
+            检查沙箱和 MCP 连接状态。
+
+      - alert: SandboxExecutionTimeout
+        expr: rate(lea_tools_sandbox_timeouts_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          service: lea-tools
+        annotations:
+          summary: "沙箱执行超时"
+          description: |
+            超时率: {{ $value }}/s
+            Instance: {{ $labels.instance }}
+
+      # ========== 可观测性本身的告警 ==========
+
+      - alert: PrometheusScrapeFailed
+        expr: up{job=~"lea-.*"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Prometheus 无法采集 {{ $labels.job }}"
+          description: |
+            服务: {{ $labels.job }}
+            Instance: {{ $labels.instance }}
+            服务可能已宕机。
+
+      - alert: PrometheusHighMemoryUsage
+        expr: process_resident_memory_bytes{job="prometheus"} > 1e9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Prometheus 内存使用 > 1GB"
+          description: |
+            当前内存: {{ $value | humanize }}B
+            可能需要调整数据保留期。
+
+  - name: lea-platform-warnings
+    interval: 1m
+    rules:
+      # ========== 低优先级告警 ==========
+
+      - alert: SlowHTTPResponse
+        expr: histogram_quantile(0.99, lea_agent_http_request_duration_seconds) > 5
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: "HTTP 请求 P99 延迟 > 5 秒"
+          description: |
+            P99 延迟: {{ $value | humanizeDuration }}
+            Instance: {{ $labels.instance }}
+
+      - alert: CeleryTaskQueueLarge
+        expr: lea_rag_celery_queue_size > 1000
+        for: 15m
+        labels:
+          severity: warning
+          service: lea-rag
+        annotations:
+          summary: "Celery 任务队列堆积 > 1000"
+          description: |
+            当前队列: {{ $value }}
+            Instance: {{ $labels.instance }}
+            考虑增加 worker 数量。
+
+      - alert: SessionMemoryHigh
+        expr: lea_agent_session_count > 400
+        for: 10m
+        labels:
+          severity: warning
+          service: lea-agent
+        annotations:
+          summary: "会话数超过 400（容量限制 500）"
+          description: |
+            当前会话数: {{ $value }}
+            Instance: {{ $labels.instance }}
+
+      - alert: AttachmentLoadFailures
+        expr: increase(lea_agent_session_attachments_load_errors_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "会话级挂载加载失败"
+          description: |
+            5 分钟内失败数: {{ $value }}
+            Instance: {{ $labels.instance }}
+            这不会中断对话，但需要检查挂载来源。

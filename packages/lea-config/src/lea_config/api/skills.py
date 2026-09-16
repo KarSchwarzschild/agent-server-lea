@@ -37,6 +37,7 @@ import os
 import re
 import zipfile
 from datetime import datetime
+from functools import lru_cache
 from typing import Optional
 
 import yaml
@@ -81,7 +82,7 @@ class SkillCreate(BaseModel):
     display_name: str = ""
     description: str = ""
     version: str = "1.0.0"
-    category: str = "general"
+    category: str = Field(min_length=1, max_length=50)
     system_prompt: str = ""
     model_tier: str = "standard"
     required_tools: list = []
@@ -732,24 +733,43 @@ def request_publish(
 
 # ── Bundle 上传 / 下载 ─────────────────────────────────────
 
+@lru_cache(maxsize=1)
 def _get_obs_client():
-    import boto3
-    from botocore.config import Config
+    from obs import ObsClient
 
     endpoint = os.getenv("OBS_ENDPOINT", "http://localhost:9000")
     region = os.getenv("OBS_REGION", "cn-north-4")
+    server = endpoint.removeprefix("https://").removeprefix("http://").rstrip("/")
+    client = ObsClient(
+        access_key_id=os.getenv("OBS_ACCESS_KEY", ""),
+        secret_access_key=os.getenv("OBS_SECRET_KEY", ""),
+        server=server,
+        region=region,
+        is_secure=endpoint.startswith("https://"),
+        path_style=os.getenv("OBS_ADDRESSING_STYLE", "virtual") == "path",
+    )
+    bucket = os.getenv("OBS_BUCKET", "lea-uploads")
+    response = client.headBucket(bucket)
+    if response.status >= 300:
+        client.close()
+        raise RuntimeError(f"OBS bucket check failed: {response.status}")
+    return client, bucket
+
+
+def _get_minio_client():
+    import boto3
+    from botocore.config import Config
+
+    endpoint = os.getenv("MINIO_ENDPOINT", "http://localhost:9000")
     client = boto3.client(
         "s3",
         endpoint_url=endpoint,
-        aws_access_key_id=os.getenv("OBS_ACCESS_KEY", ""),
-        aws_secret_access_key=os.getenv("OBS_SECRET_KEY", ""),
-        config=Config(
-            signature_version="s3v4",
-            s3={"addressing_style": os.getenv("OBS_ADDRESSING_STYLE", "path")},
-        ),
-        region_name=region,
+        aws_access_key_id=os.getenv("MINIO_ACCESS_KEY", "minioadmin"),
+        aws_secret_access_key=os.getenv("MINIO_SECRET_KEY", "minioadmin"),
+        config=Config(signature_version="s3v4"),
+        region_name="us-east-1",
     )
-    bucket = os.getenv("OBS_BUCKET", "lea-uploads")
+    bucket = os.getenv("MINIO_BUCKET", "lea-uploads")
     try:
         client.head_bucket(Bucket=bucket)
     except client.exceptions.ClientError:
@@ -757,10 +777,18 @@ def _get_obs_client():
     return client, bucket
 
 
+def _storage_backend() -> str:
+    configured = os.getenv("OBJECT_STORAGE", "").strip().lower()
+    if configured in {"obs", "minio"}:
+        return configured
+    return "obs" if os.getenv("OBS_ACCESS_KEY") else "minio"
+
+
 @router.post("/upload", status_code=201)
 def upload_skill_bundle(
     file: UploadFile = File(...),
     version: str = Form(..., min_length=1, max_length=50),
+    category: str = Form(..., min_length=1, max_length=50),
     change_log: str = Form("", max_length=5000),
     db: Session = Depends(get_db),
     actor: Actor = Depends(require_actor),
@@ -800,6 +828,7 @@ def upload_skill_bundle(
         raise HTTPException(422, "SKILL.md 不是 UTF-8 编码")
 
     version = version.strip().removeprefix("v")
+    category = category.strip() or "general"
     if not re.match(r"^\d+(?:\.\d+){0,2}(?:[-+][0-9A-Za-z.-]+)?$", version):
         raise HTTPException(422, "version 必须是语义化版本号，例如 1.2.0")
     existing = (
@@ -819,14 +848,31 @@ def upload_skill_bundle(
     # 见 lea-tools 的 skill_provisioner.ensure_cached。
     sha256 = hashlib.sha256(raw).hexdigest()
     obj_key = f"skills/{actor.tenant_id}/{parsed['name']}/{sha256}.zip"
-    client, bucket = _get_obs_client()
-    client.put_object(
-        Bucket=bucket, Key=obj_key, Body=raw, ContentType="application/zip"
-    )
+    if _storage_backend() == "obs":
+        from obs import PutObjectHeader
+
+        client, bucket = _get_obs_client()
+        response = client.putContent(
+            bucket,
+            obj_key,
+            content=raw,
+            headers=PutObjectHeader(
+                contentType="application/zip",
+                contentLength=len(raw),
+            ),
+        )
+        if response.status >= 300:
+            raise HTTPException(502, f"OBS 上传失败: {response.status}")
+    else:
+        client, bucket = _get_minio_client()
+        client.put_object(
+            Bucket=bucket, Key=obj_key, Body=raw, ContentType="application/zip"
+        )
     bundle_uri = f"s3://{bucket}/{obj_key}"
 
     if existing:
         existing.description = parsed["description"]
+        existing.category = category
         existing.system_prompt = parsed["system_prompt"]
         existing.required_tools = parsed["required_tools"]
         existing.version = version
@@ -918,12 +964,22 @@ def download_skill_bundle(
     if not bucket or not key:
         raise HTTPException(500, f"bundle_uri 解析失败: {skill.bundle_uri}")
 
-    client, _ = _get_obs_client()
-    url = client.generate_presigned_url(
-        "get_object",
-        Params={"Bucket": bucket, "Key": key},
-        ExpiresIn=expires,
-    )
+    if _storage_backend() == "obs":
+        client, _ = _get_obs_client()
+        response = client.createSignedUrl(
+            "GET", bucketName=bucket, objectKey=key, expires=expires
+        )
+        status = getattr(response, "status", None)
+        url = getattr(response, "signedUrl", None)
+        if (isinstance(status, int) and status >= 300) or not url:
+            raise HTTPException(502, f"OBS 生成下载地址失败: {status or 'unknown'}")
+    else:
+        client, _ = _get_minio_client()
+        url = client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": bucket, "Key": key},
+            ExpiresIn=expires,
+        )
 
     public = os.getenv("OBS_PUBLIC_ENDPOINT", "").strip().rstrip("/")
     if public:

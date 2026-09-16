@@ -149,6 +149,10 @@ func UserAgentsProxy() gin.HandlerFunc {
 	return UserConfigProxy()
 }
 
+func UserTeamsProxy() gin.HandlerFunc {
+	return UserConfigProxy()
+}
+
 func UserSkillsProxy() gin.HandlerFunc {
 	return UserConfigProxy()
 }

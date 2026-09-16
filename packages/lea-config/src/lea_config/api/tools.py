@@ -23,7 +23,11 @@ IsConcurrencySafe() 硬编码 true（platform_tools.go），于是引擎会并�
 
 from __future__ import annotations
 
+import os
 from typing import Any, Literal, Optional
+
+import httpx
+import structlog
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -45,9 +49,63 @@ from lea_config.database import (
 )
 from lea_config.models.tool import Tool
 
+log = structlog.get_logger()
+
 router = APIRouter(prefix="/tools", tags=["tools"])
 
 UserExecutionType = Literal["api", "mcp"]
+
+
+async def _invalidate_tool_cache(tenant_id: str):
+    """让 lea-tools 的工具清单缓存尽快失效。**这只是加速器，不是保障。**
+
+    ## 真正的保障是 TTL
+
+    工具清单缓存的 TTL 是 300 秒（lea-tools 的 CACHE_TTL_CAPABILITIES）。这一跳成功
+    只是把"改了工具多久生效"从"最多 5 分钟"缩到"下一次请求"。它整个失败掉，系统仍然
+    正确 —— 只是慢一点。判据就是这个：把这个函数整个删掉，行为仍然正确。
+
+    所以这里不重试、不阻塞 CRUD、不把失败反馈给调用方。工具 CRUD 是管理员低频操作，
+    5 分钟的生效延迟业务上可接受，不值得为它上一整套投递保证（outbox + 持久队列 + 死信）。
+
+    ## 但失败必须看得见
+
+    这里原来是 `except Exception: pass` —— 连状态码都不看。后果不是"偶尔慢 5 分钟"，
+    而是**故障不可观测**：用户报"我改了工具没生效"，两边日志里什么都没有，唯一能做的是
+    等 5 分钟看它自己好没好。一个可以接受的降级，和一个查不出来的降级，是两件事。
+
+    现在失败会记 warning（带 tenant_id 和原因），并且**检查状态码** —— lea-tools 返 500
+    时旧代码认为"发出去了就算成功"，那种情况下缓存压根没删。
+
+    ## 为什么不改成"lea-config 自己写 Redis 版本号"
+
+    那个方案（写方 INCR、读方比版本）不依赖 lea-tools 活着，更稳。但它要求读方每次读缓存
+    多一次 Redis GET，是 lea-tools 侧的改动。当前 TTL 已经够用，先不引入。
+    真要做，见 docs/cache-optimization-summary.md 的 P4 一节。
+    """
+    lea_tools_url = os.getenv("LEA_TOOLS_URL", "http://lea-tools:8000")
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            resp = await client.post(
+                f"{lea_tools_url}/internal/invalidate-cache",
+                json={"tenant_id": tenant_id, "cache_type": "capabilities"},
+            )
+        # 状态码要看：非 2xx 意味着缓存**没删掉**，跟请求发不出去是同一类后果。
+        if resp.status_code >= 400:
+            log.warning(
+                "tool_cache_invalidate_rejected",
+                tenant_id=tenant_id,
+                status=resp.status_code,
+                body=resp.text[:200],
+                note="缓存未清除，将由 TTL(300s) 兜底",
+            )
+    except Exception as e:  # noqa: BLE001 —— 故意兜住所有异常：不能阻塞 CRUD
+        log.warning(
+            "tool_cache_invalidate_failed",
+            tenant_id=tenant_id,
+            error=str(e),
+            note="缓存未清除，将由 TTL(300s) 兜底",
+        )
 
 
 # ---------- Schemas ----------
@@ -108,7 +166,7 @@ def list_tools(
 
 
 @router.post("", status_code=201)
-def create_tool(
+async def create_tool(
     body: ToolCreate,
     db: Session = Depends(get_db),
     actor: Actor = Depends(require_actor),
@@ -139,11 +197,15 @@ def create_tool(
     db.add(tool)
     db.commit()
     db.refresh(tool)
+
+    # 清除 lea-tools 的工具清单缓存
+    await _invalidate_tool_cache(actor.tenant_id)
+
     return _row_to_dict(tool)
 
 
 @router.put("/{tool_id}")
-def update_tool(
+async def update_tool(
     tool_id: int,
     body: ToolUpdate,
     db: Session = Depends(get_db),
@@ -159,11 +221,15 @@ def update_tool(
         setattr(tool, k, v)
     db.commit()
     db.refresh(tool)
+
+    # 清除 lea-tools 的工具清单缓存
+    await _invalidate_tool_cache(actor.tenant_id)
+
     return _row_to_dict(tool)
 
 
 @router.delete("/{tool_id}", status_code=204)
-def delete_tool(
+async def delete_tool(
     tool_id: int,
     db: Session = Depends(get_db),
     actor: Actor = Depends(require_actor),
@@ -171,8 +237,13 @@ def delete_tool(
     tool = _load(db, tool_id)
     require(actor, DELETE, tool)
     _reject_if_builtin(tool, "删除")
+
+    tenant_id = tool.tenant_id  # 保存租户 ID，删除后 tool 对象失效
     db.delete(tool)
     db.commit()
+
+    # 清除 lea-tools 的工具清单缓存
+    await _invalidate_tool_cache(tenant_id)
 
 
 def _reject_name_conflict(

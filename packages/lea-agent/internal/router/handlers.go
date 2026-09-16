@@ -3,16 +3,30 @@ package router
 import (
 	"database/sql"
 	"errors"
+	"io"
 	"log"
+	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
+	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/cache"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/persistence"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/session"
 )
 
+// 全局消息缓存实例
+var globalMessageCache *persistence.MessageCache
+
+// InitMessageCache 初始化全局消息缓存
+func InitMessageCache(cacheLayer *cache.Cache, db *sql.DB, redisClient *redis.Client) {
+	globalMessageCache = persistence.NewMessageCache(cacheLayer, db, redisClient)
+}
+
 type SendRequest struct {
 	SessionID     string  `json:"session_id"`
 	AgentID       int     `json:"agent_id"`
+	ProjectID     *int    `json:"project_id,omitempty"`
 	Message       string  `json:"message"`
 	AttachmentIDs []int64 `json:"attachment_ids"`
 	// OnDisconnect 决定客户端在 turn 跑完之前消失（关标签页、断网、LB 空闲超时）
@@ -215,22 +229,60 @@ func handleTurnStatus(mgr *session.Manager) gin.HandlerFunc {
 	}
 }
 
+// handleCreateSession 建会话。
+//
+// ## agent_id 是可选的
+//
+// 不传 = 用租户的 super-agent（lea-config 的 _resolve_super_agent 在 agentID=0 时兜底）。
+// 这条路是"用户进来直接开聊"的前提：先有一个能对话的会话，再靠 @ 往里挂 skill/tool/
+// mcp_server/kb —— 而不是逼用户先选一个 agent 才看得到输入框。
+//
+// 指针而不是 int：0 和"没传"必须分得开。将来若要让 0 表示别的意思（比如显式拒绝兜底），
+// 有了这个区分才改得动；用零值的话那个语义位已经被占掉了。
+//
+// 空 body 也接受 —— POST 一个没有 body 的请求是这条路最自然的调用形状，而
+// ShouldBindJSON 对空 body 返回 EOF。不放过它的话"直接开聊"仍然要求前端记得发 `{}`。
 func handleCreateSession(mgr *session.Manager) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req struct {
-			AgentID int `json:"agent_id"`
+			AgentID   *int `json:"agent_id,omitempty"`
+			ProjectID *int `json:"project_id,omitempty"`
 		}
-		if err := c.ShouldBindJSON(&req); err != nil {
+		// EOF = 没有 body，等价于 {}。其余解析错误仍然是 400：那是**格式坏了**，
+		// 静默当成缺省会把一个拼错的字段名变成"悄悄用了 super-agent"。
+		if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
 			c.JSON(400, gin.H{"error": err.Error()})
 			return
 		}
 		tenantID := c.GetString("tenant_id")
 		userID := c.GetString("user_id")
 
+		agentID := 0
+		if req.AgentID != nil {
+			agentID = *req.AgentID
+		}
+		if req.ProjectID != nil {
+			db, dbErr := persistence.DB()
+			if dbErr != nil || db == nil {
+				c.JSON(503, gin.H{"error": "persistence unavailable"})
+				return
+			}
+			owned, err := persistence.ProjectOwnedBy(c.Request.Context(), db, *req.ProjectID, tenantID, userID)
+			if err != nil {
+				c.JSON(500, gin.H{"error": err.Error()})
+				return
+			}
+			if !owned {
+				c.JSON(404, gin.H{"error": "project not found"})
+				return
+			}
+		}
+
 		sess, err := mgr.GetOrCreate(c.Request.Context(), session.Params{
-			AgentID:  req.AgentID,
-			TenantID: tenantID,
-			UserID:   userID,
+			AgentID:   agentID,
+			TenantID:  tenantID,
+			UserID:    userID,
+			ProjectID: req.ProjectID,
 		})
 		if err != nil {
 			// 这条不传 SessionID，走不到复用分支，理论上碰不到 ErrForbidden；
@@ -274,6 +326,7 @@ func handleListSessions(_ *session.Manager) gin.HandlerFunc {
 				"id":             r.ID,
 				"title":          r.Title,
 				"agent_id":       r.AgentID,
+				"project_id":     r.ProjectID,
 				"message_count":  r.MessageCount,
 				"last_active_at": r.LastActiveAt,
 				"created_at":     r.CreatedAt,
@@ -281,6 +334,129 @@ func handleListSessions(_ *session.Manager) gin.HandlerFunc {
 			})
 		}
 		c.JSON(200, gin.H{"sessions": out})
+	}
+}
+
+func handleListProjects() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		db, err := persistence.DB()
+		if err != nil || db == nil {
+			c.JSON(503, gin.H{"error": "persistence unavailable"})
+			return
+		}
+		items, err := persistence.ListProjects(c.Request.Context(), db, c.GetString("tenant_id"), c.GetString("user_id"))
+		if err != nil {
+			c.JSON(500, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(200, gin.H{"projects": items})
+	}
+}
+
+func handleCreateProject() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req struct {
+			Name        string `json:"name" binding:"required"`
+			Description string `json:"description"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.Name) == "" {
+			c.JSON(400, gin.H{"error": "project name required"})
+			return
+		}
+		db, err := persistence.DB()
+		if err != nil || db == nil {
+			c.JSON(503, gin.H{"error": "persistence unavailable"})
+			return
+		}
+		project, err := persistence.CreateProject(c.Request.Context(), db, c.GetString("tenant_id"), c.GetString("user_id"), strings.TrimSpace(req.Name), strings.TrimSpace(req.Description))
+		if err != nil {
+			c.JSON(409, gin.H{"error": "project name already exists"})
+			return
+		}
+		c.JSON(201, project)
+	}
+}
+
+func handleUpdateProject() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		id, err := strconv.Atoi(c.Param("id"))
+		if err != nil {
+			c.JSON(400, gin.H{"error": "invalid project id"})
+			return
+		}
+		var req struct {
+			Name        string `json:"name" binding:"required"`
+			Description string `json:"description"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.Name) == "" {
+			c.JSON(400, gin.H{"error": "project name required"})
+			return
+		}
+		db, err := persistence.DB()
+		if err != nil || db == nil {
+			c.JSON(503, gin.H{"error": "persistence unavailable"})
+			return
+		}
+		project, err := persistence.UpdateProject(c.Request.Context(), db, id, c.GetString("tenant_id"), c.GetString("user_id"), strings.TrimSpace(req.Name), strings.TrimSpace(req.Description))
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(404, gin.H{"error": "project not found"})
+			return
+		}
+		if err != nil {
+			c.JSON(409, gin.H{"error": "project name already exists"})
+			return
+		}
+		c.JSON(200, project)
+	}
+}
+
+func handleArchiveProject() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		id, err := strconv.Atoi(c.Param("id"))
+		if err != nil {
+			c.JSON(400, gin.H{"error": "invalid project id"})
+			return
+		}
+		db, err := persistence.DB()
+		if err != nil || db == nil {
+			c.JSON(503, gin.H{"error": "persistence unavailable"})
+			return
+		}
+		err = persistence.ArchiveProject(c.Request.Context(), db, id, c.GetString("tenant_id"), c.GetString("user_id"))
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(404, gin.H{"error": "project not found"})
+			return
+		}
+		if err != nil {
+			c.JSON(500, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(200, gin.H{"id": id, "is_archived": true})
+	}
+}
+
+func handleDeleteProject() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		id, err := strconv.Atoi(c.Param("id"))
+		if err != nil {
+			c.JSON(400, gin.H{"error": "invalid project id"})
+			return
+		}
+		db, err := persistence.DB()
+		if err != nil || db == nil {
+			c.JSON(503, gin.H{"error": "persistence unavailable"})
+			return
+		}
+		err = persistence.DeleteProject(c.Request.Context(), db, id, c.GetString("tenant_id"), c.GetString("user_id"))
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(404, gin.H{"error": "project not found"})
+			return
+		}
+		if err != nil {
+			c.JSON(500, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(200, gin.H{"ok": true})
 	}
 }
 
@@ -311,7 +487,13 @@ func handleGetMessages(_ *session.Manager) gin.HandlerFunc {
 			return
 		}
 
-		msgs, err := persistence.GetMessages(c.Request.Context(), db, sessionID)
+		// 使用消息缓存（如果可用）
+		var msgs []persistence.MessageRow
+		if globalMessageCache != nil {
+			msgs, err = globalMessageCache.GetSessionMessages(c.Request.Context(), sessionID)
+		} else {
+			msgs, err = persistence.GetMessages(c.Request.Context(), db, sessionID)
+		}
 		if err != nil {
 			c.JSON(500, gin.H{"error": err.Error()})
 			return

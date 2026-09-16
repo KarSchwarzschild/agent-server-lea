@@ -23,10 +23,18 @@ func RegisterRoutes(api *gin.RouterGroup, mgr *session.Manager) {
 		// 断流之后前端靠它判断"还在生成"还是"已经结束"。跨副本有效。
 		chat.GET("/status/:session_id", handleTurnStatus(mgr))
 		chat.POST("/attachments/upload", handleUploadAttachment())
+		// 取回用户上传的原件。走 attachment_id 而不是路径：原件的权威位置是 OBS 上的
+		// blob，会话归档后 NFS 那份已经清理掉了、blob 还在。见 handleDownloadAttachment。
+		chat.GET("/attachments/:id/download", handleDownloadAttachment())
 	}
 
 	sess := api.Group("/sessions")
 	{
+		api.GET("/projects", handleListProjects())
+		api.POST("/projects", handleCreateProject())
+		api.PUT("/projects/:id", handleUpdateProject())
+		api.POST("/projects/:id/archive", handleArchiveProject())
+		api.DELETE("/projects/:id", handleDeleteProject())
 		sess.POST("", handleCreateSession(mgr))
 		sess.GET("", handleListSessions(mgr))
 		sess.GET("/:id/messages", handleGetMessages(mgr))
@@ -36,12 +44,30 @@ func RegisterRoutes(api *gin.RouterGroup, mgr *session.Manager) {
 		sess.GET("/:id/attachments", handleListSessionAttachments(mgr))
 		sess.POST("/:id/attachments", handleAttachToSession(mgr))
 		sess.DELETE("/:id/attachments/:kind/:ref_id", handleDetachFromSession(mgr))
+		// 切换这个会话的"激活 agent"（专家/专家团）；agent_id=0 = 取消回默认。
+		// 见 session_active_agent.go 顶部。
+		sess.PUT("/:id/active-agent", handleSetActiveAgent(mgr))
+		// 把用户文件库里的一个文件物化进这个会话，让模型能读能改。
+		// 挂在会话下面（而不是 /user 下）是因为它改的是**这一个会话**的状态。
+		// 见 user_files.go 的 handleImportToSession。
+		sess.POST("/:id/files/import", handleImportToSession())
+		sess.POST("/:id/files/publish", handlePublishWorkspaceFile())
 	}
 
 	files := api.Group("/files")
 	{
 		files.GET("/list", handleListArtifacts())
 		files.GET("/download", handleDownloadArtifact())
+	}
+
+	// 用户的长期文件库：跨会话的那一层。上传件 + 模型交付的成品合并展示。
+	// 见 user_files.go 顶部。
+	user := api.Group("/user")
+	{
+		user.GET("/storage", handleUserStorage())
+		user.GET("/files", handleListUserFiles())
+		// kind ∈ {upload, artifact} —— 两张表，删除要知道去哪张。
+		user.DELETE("/files/:kind/:id", handleDeleteUserFile())
 	}
 }
 

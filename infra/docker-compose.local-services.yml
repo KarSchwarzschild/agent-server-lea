@@ -1,0 +1,41 @@
+services:
+  gateway:
+    environment:
+      LEA_INTERNAL_TOKEN: local-dev-internal-token
+      LEA_AGENT_URL: http://agent:8100
+      LEA_CONFIG_URL: http://config:8500
+      LEA_RAG_URL: http://rag:8300
+      OIDC_ISSUER: https://passport-ai.ouchn.edu.cn
+      OIDC_JWKS_URL: https://passport-ai.ouchn.edu.cn/.well-known/openid-configuration/jwks
+      TENANT_MEMBERSHIP_URL: https://ai.ouchn.edu.cn/api/TenantUser/CurrUserTenants
+
+  agent:
+    environment:
+      LEA_INTERNAL_TOKEN: local-dev-internal-token
+      LEA_CONFIG_URL: http://config:8500
+      LEA_RAG_URL: http://rag:8300
+      REDIS_URL: redis://host.docker.internal:6379/0
+    extra_hosts:
+      - host.docker.internal:host-gateway
+
+  config:
+    environment:
+      LEA_INTERNAL_TOKEN: local-dev-internal-token
+      REDIS_URL: redis://host.docker.internal:6379/0
+    extra_hosts:
+      - host.docker.internal:host-gateway
+
+  rag:
+    environment:
+      LEA_INTERNAL_TOKEN: local-dev-internal-token
+      REDIS_URL: redis://host.docker.internal:6379/0
+      LEA_MILVUS_URI: http://host.docker.internal:19530
+      MINIO_ENDPOINT: http://host.docker.internal:9000
+    extra_hosts:
+      - host.docker.internal:host-gateway
+
+  tools:
+    environment:
+      REDIS_URL: redis://host.docker.internal:6379/0
+    extra_hosts:
+      - host.docker.internal:host-gateway

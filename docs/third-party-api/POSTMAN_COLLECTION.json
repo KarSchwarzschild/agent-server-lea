@@ -1,0 +1,540 @@
+{
+  "info": {
+    "_postman_id": "lea-platform-api",
+    "name": "LEA Platform API",
+    "description": "LEA Platform 完整 API 集合，包含所有端点和示例请求",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Session Management",
+      "item": [
+        {
+          "name": "Create Session",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"user_id\": \"user_123\",\n  \"project_id\": \"proj_456\",\n  \"agent_id\": 0,\n  \"title\": \"New Conversation\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/sessions",
+              "host": ["{{base_url}}"],
+              "path": ["sessions"]
+            }
+          }
+        },
+        {
+          "name": "List Sessions",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/sessions?page=1&page_size=20",
+              "host": ["{{base_url}}"],
+              "path": ["sessions"],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "1"
+                },
+                {
+                  "key": "page_size",
+                  "value": "20"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get Session",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/sessions/{{session_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["sessions", "{{session_id}}"]
+            }
+          }
+        },
+        {
+          "name": "Get Session Messages",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/sessions/{{session_id}}/messages?limit=50&offset=0",
+              "host": ["{{base_url}}"],
+              "path": ["sessions", "{{session_id}}", "messages"],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "50"
+                },
+                {
+                  "key": "offset",
+                  "value": "0"
+                }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Switch Active Agent",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"agent_id\": 42\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/sessions/{{session_id}}/active-agent",
+              "host": ["{{base_url}}"],
+              "path": ["sessions", "{{session_id}}", "active-agent"]
+            }
+          }
+        },
+        {
+          "name": "Delete Session",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/sessions/{{session_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["sessions", "{{session_id}}"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Chat",
+      "item": [
+        {
+          "name": "Send Message (Stream)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"session_id\": \"{{session_id}}\",\n  \"content\": \"Hello, please introduce yourself\",\n  \"agent_id\": 0\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/chat/stream",
+              "host": ["{{base_url}}"],
+              "path": ["chat", "stream"]
+            }
+          }
+        },
+        {
+          "name": "Get Chat Status",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/chat/status/{{session_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["chat", "status", "{{session_id}}"]
+            }
+          }
+        },
+        {
+          "name": "Stop Generation",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/chat/stop/{{session_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["chat", "stop", "{{session_id}}"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Session Attachments",
+      "item": [
+        {
+          "name": "Add Session Attachment",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"kind\": \"tool\",\n  \"ref_id\": \"tool_123\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/sessions/{{session_id}}/attachments",
+              "host": ["{{base_url}}"],
+              "path": ["sessions", "{{session_id}}", "attachments"]
+            }
+          }
+        },
+        {
+          "name": "List Session Attachments",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/sessions/{{session_id}}/attachments",
+              "host": ["{{base_url}}"],
+              "path": ["sessions", "{{session_id}}", "attachments"]
+            }
+          }
+        },
+        {
+          "name": "Remove Session Attachment",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/sessions/{{session_id}}/attachments/tool/tool_123",
+              "host": ["{{base_url}}"],
+              "path": ["sessions", "{{session_id}}", "attachments", "tool", "tool_123"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Files",
+      "item": [
+        {
+          "name": "List User Files",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/user/files",
+              "host": ["{{base_url}}"],
+              "path": ["user", "files"]
+            }
+          }
+        },
+        {
+          "name": "Get User Storage",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/user/storage",
+              "host": ["{{base_url}}"],
+              "path": ["user", "storage"]
+            }
+          }
+        },
+        {
+          "name": "Delete User File",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/user/files/upload/file_123",
+              "host": ["{{base_url}}"],
+              "path": ["user", "files", "upload", "file_123"]
+            }
+          }
+        },
+        {
+          "name": "Import File to Session",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"file_id\": \"file_123\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/sessions/{{session_id}}/files/import",
+              "host": ["{{base_url}}"],
+              "path": ["sessions", "{{session_id}}", "files", "import"]
+            }
+          }
+        },
+        {
+          "name": "Publish Session File",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"session_file_id\": \"sess_file_456\",\n  \"filename\": \"final_report.pdf\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/sessions/{{session_id}}/files/publish",
+              "host": ["{{base_url}}"],
+              "path": ["sessions", "{{session_id}}", "files", "publish"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Projects",
+      "item": [
+        {
+          "name": "Create Project",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"My Project\",\n  \"description\": \"Project description\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/projects",
+              "host": ["{{base_url}}"],
+              "path": ["projects"]
+            }
+          }
+        },
+        {
+          "name": "List Projects",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/projects",
+              "host": ["{{base_url}}"],
+              "path": ["projects"]
+            }
+          }
+        },
+        {
+          "name": "Update Project",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}",
+                "type": "text"
+              },
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Updated Project Name\",\n  \"description\": \"Updated description\"\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/projects/proj_123",
+              "host": ["{{base_url}}"],
+              "path": ["projects", "proj_123"]
+            }
+          }
+        },
+        {
+          "name": "Archive Project",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/projects/proj_123/archive",
+              "host": ["{{base_url}}"],
+              "path": ["projects", "proj_123", "archive"]
+            }
+          }
+        },
+        {
+          "name": "Delete Project",
+          "request": {
+            "method": "DELETE",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{token}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/projects/proj_123",
+              "host": ["{{base_url}}"],
+              "path": ["projects", "proj_123"]
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:8100/api",
+      "type": "string"
+    },
+    {
+      "key": "token",
+      "value": "your_token_here",
+      "type": "string"
+    },
+    {
+      "key": "session_id",
+      "value": "sess_abc123",
+      "type": "string"
+    }
+  ]
+}

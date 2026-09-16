@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from lea_config.database import Base, engine
 from lea_authkit import install_internal_auth
+from lea_config.metrics import MetricsMiddleware, metrics_endpoint
 import lea_config.models  # noqa: F401 — register all models with Base.metadata
 
 
@@ -29,9 +30,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.add_middleware(MetricsMiddleware)
+
 # Register routers — 统一资源路径，无 /admin 前缀
 from lea_config.api.agents import router as agents_router
 from lea_config.api.internal import router as internal_router
+from lea_config.api.llm_models import router as llm_models_router
 from lea_config.api.mcp_servers import router as mcp_servers_router
 from lea_config.api.models import router as models_router
 from lea_config.api.skills import router as skills_router
@@ -46,13 +50,21 @@ app.include_router(teams_router)           # /teams
 app.include_router(internal_router)        # /internal
 app.include_router(users_router)           # /users
 app.include_router(roles_router)           # /roles
-app.include_router(models_router)          # /retrieval/models
+app.include_router(models_router)          # /retrieval/models（embedding/reranker/vlm/asr，admin）
+app.include_router(llm_models_router)      # /llm-models（可选聊天模型，登录即可读）
 app.include_router(mcp_servers_router)     # /mcp-servers
 
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/metrics")
+def metrics():
+    """Prometheus 指标端点"""
+    return metrics_endpoint()
+
 
 
 # 服务间鉴权挂在最后 —— 见 lea_authkit/internal_auth.py 顶部关于"为什么内网也要挡"。

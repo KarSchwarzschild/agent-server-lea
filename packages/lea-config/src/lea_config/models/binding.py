@@ -49,3 +49,24 @@ class AgentToolBinding(Base):
     enabled = Column(Boolean, default=True)
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+
+class AgentMcpBinding(Base):
+    """Agent ↔ 整个 MCP server 的持久绑定（migrations/024）。
+
+    绑一个 server = 用它同步出的**全部**工具行，粒度跟会话级挂载
+    （session_attachments kind=mcp_server）一致。组装 agent-config 时展开成 tool 行，
+    与 AgentToolBinding（逐个 tool 绑）的结果按 tool id 去重合并。
+    """
+
+    __tablename__ = "agent_mcp_bindings"
+    __table_args__ = (
+        UniqueConstraint("agent_id", "mcp_server_id", name="uq_agent_mcp"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    agent_id = Column(Integer, ForeignKey("agents.id", ondelete="CASCADE"), nullable=False, index=True)
+    mcp_server_id = Column(Integer, ForeignKey("mcp_servers.id", ondelete="CASCADE"), nullable=False, index=True)
+    enabled = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())

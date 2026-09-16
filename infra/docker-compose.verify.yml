@@ -43,7 +43,15 @@ x-agent-common: &agent-common
     REDIS_URL: redis://202.205.160.9:26379/0
     # 容器网络里按服务名解析，不是 127.0.0.1
     LEA_CONFIG_URL: http://lea-config:8500
-    LEA_TOOLS_URL: http://lea-tools:8400
+    LEA_TOOLS_URL: http://10.192.241.137:8400
+    # lea-parser 没有 Dockerfile，只能跑在宿主机上（uvicorn --port 8600），
+    # 所以这里指 host.docker.internal 而不是服务名。
+    #
+    # ⚠️ 跟 REDIS_URL 同一类陷阱，而且更隐蔽：.env 里是 127.0.0.1:8600，在容器里
+    # 指的是容器自己。而附件上传的抽文本那步（router/attachment.go 第 2 步）
+    # **失败不阻断上传** —— 只记一行日志，然后 extracted_text 落空串。
+    # 于是上传看起来成功了，模型却拿不到任何内容，而根因在响应里完全看不出来。
+    LEA_PARSER_URL: http://host.docker.internal:8600
     # 排空超时调短，验证时不想等 3 分钟。生产保持默认。
     LEA_AGENT_DRAIN_TIMEOUT: 30s
     # 服务间鉴权的共享密钥，三个服务必须一致（见 lea-config 那段说明）。
@@ -121,17 +129,22 @@ services:
       LEA_TOOLS_URL: http://lea-tools:8400
     restart: unless-stopped
 
-  # ⚠️ 这个本地 lea-tools 只是让链路完整，**不能用来验证沙箱的文件行为。**
+  # ⚠️ 这个本地 lea-tools **不在 agent 的调用路径上**，别拿它当验收对象。
   #
-  # 真正在用的 lea-tools 部署在 10.192.241.137（跟 Cube 同一台），.env 里的
-  # LEA_TOOLS_URL 指的是那个。上面 agent 的 environment 把它覆盖成了这个容器，
-  # 所以验证台里跑的是本地这份。
+  # agent 那边（上面第 46 行）的 LEA_TOOLS_URL 明确指向 10.192.241.137:8400 ——
+  # 真正在用的那份，跟 Cube 同一台机器。这个容器只有 lea-config 的 sync 会调
+  # （见 lea-config 那段：它的 LEA_TOOLS_URL 被覆盖成 http://lea-tools:8400），
+  # 存在的理由是让 MCP sync 那一跳不出网。
   #
-  # 差别是实质性的：这台机器上没有共享存储，`ensure_session_dir` 建不出目录，
-  # 于是沙箱创建时**不挂 host-mount** —— 日志里只有一行
+  # 这两个方向别搞反 —— 搞反的代价是去错的机器上查日志：
+  #   agent → 工具执行 / 沙箱 / 文件      10.192.241.137:8400（远端，真 Cube + NFS）
+  #   lea-config → MCP discover / sync    lea-tools:8400（本容器）
+  #
+  # 而且**用这个容器验不出沙箱的文件行为**：本机没有共享存储，`ensure_session_dir`
+  # 建不出目录，于是沙箱创建时不挂 host-mount —— 日志里只有一行
   #   host-mount skipped: shared storage not writable from lea-tools
-  # 然后文件只存在于沙箱内部，沙箱一死就没了。所以"产物跨轮次还在"这类验证
-  # 必须在有共享存储的环境做，在这里做出来的结论是错的。
+  # 然后文件只存在于沙箱内部，沙箱一死就没了。"产物跨轮次还在"这类判据在这里做出来
+  # 的结论是错的，必须在有共享存储的那台（即 10.192.241.137）上做。
   #
   # 沙箱跨副本认领那部分不受影响 —— 它只依赖 Cube 的 metadata，而 Cube 是真的
   # （见 packages/lea-tools/tests/verify_adopt.py，那个脚本直接打真 Cube）。
@@ -154,4 +167,65 @@ services:
       # 白名单只放行这一个名字，别的内网地址照样拦（见 test_url_guard.py 那组）。
       # 生产设了它就是给自己开一个指定名字的 SSRF 通道。
       LEA_SSRF_HOST_ALLOWLIST: host.docker.internal
+      # 共享存储根目录（用本地目录模拟，仅供附件物化验收）
+      NFS_ROOT: /data/cubelet/lea
+    volumes:
+      # 挂载本地目录到容器，模拟共享存储（仅供附件物化验收）
+      - D:/lea-data:/data/cubelet/lea
     restart: unless-stopped
+
+  # Prometheus 监控采集 —— 验证可观测性
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: verify-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=15d'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    depends_on:
+      - agent-a
+      - agent-b
+      - lea-config
+      - lea-rag
+      - lea-tools
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Grafana 可视化仪表板 —— 监控展示
+  grafana:
+    image: grafana/grafana:latest
+    container_name: verify-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_INSTALL_PLUGINS: "grafana-piechart-panel"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  prometheus-data:
+  grafana-data:

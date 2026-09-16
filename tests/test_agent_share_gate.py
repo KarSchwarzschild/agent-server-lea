@@ -124,6 +124,24 @@ def bind_tool(client, agent_id: int, *, scope: str, owner: str | None = None,
         db.close()
 
 
+def bind_mcp(client, agent_id: int, *, scope: str, owner: str | None = None,
+             name: str = "mcp1") -> int:
+    from lea_config.models.binding import AgentMcpBinding
+    from lea_config.models.mcp_server import MCPServer
+
+    db = client.Session()
+    try:
+        s = MCPServer(tenant_id=T1, name=name, enabled=True,
+                      owner_scope=scope, owner_user_id=owner)
+        db.add(s)
+        db.flush()
+        db.add(AgentMcpBinding(agent_id=agent_id, mcp_server_id=s.id, enabled=True))
+        db.commit()
+        return s.id
+    finally:
+        db.close()
+
+
 def bind_skill(client, agent_id: int, *, scope: str, owner: str | None = None,
                name: str = "sk") -> int:
     from lea_config.models.binding import AgentSkillBinding
@@ -132,7 +150,7 @@ def bind_skill(client, agent_id: int, *, scope: str, owner: str | None = None,
     db = client.Session()
     try:
         s = Skill(tenant_id=T1, name=name, description="", enabled=True,
-                  owner_scope=scope, owner_user_id=owner)
+                  category="general", owner_scope=scope, owner_user_id=owner)
         db.add(s)
         db.flush()
         db.add(AgentSkillBinding(agent_id=agent_id, skill_id=s.id, enabled=True))
@@ -247,6 +265,26 @@ def test_private_tool_blocks_share(client):
     assert kinds == ["tool"]
     # 没共享成，归属不能被改坏
     assert scope_of(client, a) == OWNER_SCOPE_USER
+
+
+def test_private_mcp_server_blocks_share(client):
+    """私有 MCP server 硬拦 —— 整个 server 绑上去会把它同步出的全部工具下发，
+    server 私有而 agent 共享就是把私有工具的名字/描述/schema 泄给所有使用者。"""
+    a = mk_agent(client)
+    bind_mcp(client, a, scope=OWNER_SCOPE_USER, owner=OWNER)
+
+    r = client.post(f"/agents/{a}/share", headers=h())
+    assert r.status_code == 409, r.text
+    assert [b["kind"] for b in r.json()["detail"]["blockers"]] == ["mcp_server"]
+    assert scope_of(client, a) == OWNER_SCOPE_USER  # 没共享成，归属没被改坏
+
+
+def test_shared_mcp_server_does_not_block(client):
+    """server 已经共享到租户就不该拦 —— 否则装了 MCP 的专家永远共享不出去。"""
+    a = mk_agent(client)
+    bind_mcp(client, a, scope=OWNER_SCOPE_PLATFORM, owner=None)
+
+    assert client.post(f"/agents/{a}/share", headers=h()).status_code == 200
 
 
 def test_private_skill_blocks_share(client):

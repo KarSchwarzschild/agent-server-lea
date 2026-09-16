@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from lea_tools.db import Base, engine
+from lea_tools.metrics import MetricsMiddleware, metrics_endpoint
 
 
 @asynccontextmanager
@@ -30,11 +31,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="LEA Tool Gateway", version="0.1.0", lifespan=lifespan)
 
+app.add_middleware(MetricsMiddleware)
+
 
 from lea_tools.api.session import router as session_router
 from lea_tools.api.execute import router as execute_router
 
-# 只剩 MCP 的 /sync。原来这里还有 admin_tools / admin_perms / admin_creds 三组，
+# 只剩 MCP 的 /sync。原来这里还有 admin_tools / admin_perms / admin_creds 三组,
 # 全部**没有授权**且 tenant_id 由调用方在请求体里自选 —— 已删除，配置类操作统一走
 # lea-config（那边有 require_admin + 归属约束）。理由见 api/admin_mcp.py 的说明。
 from lea_tools.api.admin_mcp import router as admin_mcp_router
@@ -42,6 +45,8 @@ from lea_tools.api.admin_mcp import router as admin_mcp_router
 # 拆两跳的理由是**不让 lea-config 开始打用户填的任意 URL** —— 它今天一次外网都不打，
 # egress 可以锁死。见 api/internal_mcp.py 的说明。
 from lea_tools.api.internal_mcp import router as internal_mcp_router
+# 内部缓存失效端点：供 lea-config 在工具 CRUD 后调用，清除 capabilities 缓存。
+from lea_tools.api.internal_cache import router as internal_cache_router
 from lea_tools.api.sandbox import router as sandbox_router
 from lea_tools.api.files import router as files_router
 
@@ -49,6 +54,7 @@ app.include_router(session_router)
 app.include_router(execute_router)
 app.include_router(admin_mcp_router)
 app.include_router(internal_mcp_router)
+app.include_router(internal_cache_router)
 app.include_router(sandbox_router)
 app.include_router(files_router)
 
@@ -56,6 +62,13 @@ app.include_router(files_router)
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "lea-tools"}
+
+
+@app.get("/metrics")
+def metrics():
+    """Prometheus 指标端点"""
+    return metrics_endpoint()
+
 
 
 # 服务间鉴权。必须在 include_router 之后 —— middleware 是包在整个 app 外面的，

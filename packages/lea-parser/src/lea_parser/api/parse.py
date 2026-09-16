@@ -108,6 +108,10 @@ def parse_file(
             "md_content": result.get("md_content", ""),
             "chunks": result.get("chunks", []),
             "image_items": result.get("image_items", []),
+            # 分页格式（pdf / pptx）的总页数，其余为 0。调用方用它在注入文本里报
+            # "共 N 页"，以及区分"文件是空的"和"有 N 页但抽不出文本"（扫描件走
+            # pymupdf 兜底时就是后者）。
+            "page_count": result.get("page_count", 0),
             "duration_ms": duration_ms,
         }
     finally:

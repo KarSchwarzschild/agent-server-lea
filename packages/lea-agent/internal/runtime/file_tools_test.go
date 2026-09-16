@@ -146,8 +146,8 @@ func TestGatewayToolsetWithoutSandboxKeepsFileToolsButDropsBash(t *testing.T) {
 // 平台工具必须落在 Provision 通道里，否则子代理拿不到。
 //
 // 这条是"专家把 skill 执行派给子代理"能不能成立的前提：派下去的子代理必须能调
-// code_interpreter，否则派了活却没有干活的手段。这些工具此前全在 ExtraTools 里
-// （快照之后 append），子代理和专家一个都拿不到 —— 那时这套委派只是看起来可行。
+// Bash 执行脚本。这些工具此前全在 ExtraTools 里（快照之后 append），子代理和专家
+// 一个都拿不到 —— 那时这套委派只是看起来可行。
 //
 // memory_add 例外：写用户长期记忆只该主会话做，它留在 ExtraTools（BuildMainSessionTools）。
 func TestProvisionCarriesPlatformToolsExceptMemoryAdd(t *testing.T) {
@@ -173,7 +173,7 @@ func TestProvisionCarriesPlatformToolsExceptMemoryAdd(t *testing.T) {
 	// tools.Builtins() 那批全没进来。规划态下它们是放行的（network 不算 mutating），
 	// 所以对一个只配了业务 API 的 agent，这是规划阶段唯一的外部信息来源。
 	for _, want := range []string{
-		"code_interpreter", "kb_search", "memory_search", "get_plan",
+		"kb_search", "memory_search", "get_plan",
 		"WebSearch", "WebFetch",
 	} {
 		if !names[want] {
@@ -196,9 +196,9 @@ func TestProvisionCarriesPlatformToolsExceptMemoryAdd(t *testing.T) {
 	// 计划的两个**写**工具（save_plan / update_plan_step）也在这里，且**始终注册** ——
 	// 计划模式是所有 agent 都支持的能力，没有按 agent 的开关。只读的 get_plan 在
 	// Provision 那份里，专家要看得到整体计划才不会跑偏 —— 上面的 want 列表钉着它。
-	mainOnly := BuildMainSessionTools(cfg, "tenant-a", "user-a", "sess-a")
-	if len(mainOnly) != 3 {
-		t.Fatalf("主会话专属工具应有 3 个 (save_plan + update_plan_step + memory_add)，实际 %d: %v",
+	mainOnly := BuildMainSessionTools(cfg, "tenant-a", "user-a", "sess-a", nil)
+	if len(mainOnly) != 4 {
+		t.Fatalf("主会话专属工具应有 4 个 (save_plan + update_plan_step + deliver_artifact + memory_add)，实际 %d: %v",
 			len(mainOnly), toolNamesOf(mainOnly))
 	}
 	names = map[string]bool{}
@@ -214,12 +214,25 @@ func TestProvisionCarriesPlatformToolsExceptMemoryAdd(t *testing.T) {
 	if !names["memory_add"] {
 		t.Error("主会话专属工具应包含 memory_add")
 	}
+	if !names["deliver_artifact"] {
+		t.Error("主会话专属工具应包含 deliver_artifact")
+	}
 
-	// memory 关掉时只剩计划那两个 —— 它们的注册不跟着 memory 配置走，
-	// 计划持久化跟记忆是两回事。
-	got := toolNamesOf(BuildMainSessionTools(&AgentConfig{MemoryMode: "off"}, "t", "u", "s"))
-	if !reflect.DeepEqual(got, []string{"save_plan", "update_plan_step"}) {
-		t.Errorf("memory_mode=off 时应只剩 save_plan + update_plan_step，实际 %v", got)
+	// 而它**不**该在 Provision 里：子代理的产出是给主会话看的中间结果，
+	// 不是给用户的成品。见 BuildMainSessionTools 的注释。
+	subNames := map[string]bool{}
+	for _, tl := range ts.Tools() {
+		subNames[tl.Name()] = true
+	}
+	if subNames["deliver_artifact"] {
+		t.Error("deliver_artifact 不该在 Provision 里 —— 子代理的产出没经过主会话复核")
+	}
+
+	// memory 关掉时只剩计划那两个 + 交付 —— 它们的注册都不跟着 memory 配置走，
+	// 计划持久化、成品交付跟记忆是三回事。
+	got := toolNamesOf(BuildMainSessionTools(&AgentConfig{MemoryMode: "off"}, "t", "u", "s", nil))
+	if !reflect.DeepEqual(got, []string{"save_plan", "update_plan_step", "deliver_artifact"}) {
+		t.Errorf("memory_mode=off 时应只剩 save_plan + update_plan_step + deliver_artifact，实际 %v", got)
 	}
 }
 

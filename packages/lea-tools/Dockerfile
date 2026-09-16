@@ -36,6 +36,7 @@ ENV PYTHONUNBUFFERED=1 \
 
 COPY --from=ghcr.io/astral-sh/uv:0.6.12 /uv /usr/local/bin/uv
 COPY --from=deps /requirements.txt /tmp/requirements.txt
+ARG UV_INDEX_URL
 RUN uv pip install --system --no-cache -r /tmp/requirements.txt \
     && rm /tmp/requirements.txt
 

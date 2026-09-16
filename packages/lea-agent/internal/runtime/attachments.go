@@ -140,6 +140,70 @@ func MergeAttachments(
 	return cfg
 }
 
+// DescribedAttachment 是一条挂载的展示信息，给界面画 chip 用。
+//
+// Available=false 表示这行还在库里、但现在够不着（删了 / 停用 / 取消共享了）。
+// **保留在列表里**而不是丢掉：无声消失的 chip 会让用户以为自己记错了，标出来他才
+// 知道该摘掉它。这跟 MergeAttachments 那边对失效项静默丢弃是相反的取向，因为目的
+// 不同 —— 那边要保证会话建得起来，这边要让人看见问题。
+type DescribedAttachment struct {
+	Kind        string `json:"kind"`
+	RefID       int    `json:"ref_id"`
+	Name        string `json:"name"`
+	DisplayName string `json:"display_name"`
+	Description string `json:"description"`
+	Available   bool   `json:"available"`
+}
+
+// DescribeAttachments 把挂载记录换成带名字的展示信息。
+//
+// 跟 MergeAttachments 走的是**不同的端点**：那条给引擎装配用（mcp_server 展平成工具、
+// skill 带整段正文），这条给界面用（保留 ref_id 粒度、不传正文）。见 lea-config 侧
+// /internal/describe-attachments 的文件注释。
+//
+// 失败返回 error 而不是降级 —— 这是个纯展示接口，拿不到就该让前端知道去重试，
+// 而不是显示一排"未知"让用户以为挂载坏了。
+func DescribeAttachments(
+	ctx context.Context,
+	tenantID, userID string,
+	refs []AttachmentRef,
+) ([]DescribedAttachment, error) {
+	if len(refs) == 0 {
+		return []DescribedAttachment{}, nil
+	}
+
+	payload, _ := json.Marshal(map[string]any{
+		"tenant_id": tenantID,
+		"user_id":   userID,
+		"items":     refs,
+	})
+
+	req, err := http.NewRequestWithContext(ctx, "POST",
+		configServiceURL+"/internal/describe-attachments", bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("config service unreachable: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("describe-attachments: HTTP %d", resp.StatusCode)
+	}
+
+	var out struct {
+		Attachments []DescribedAttachment `json:"attachments"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode describe-attachments: %w", err)
+	}
+	return out.Attachments, nil
+}
+
 func resolveAttachments(
 	ctx context.Context,
 	tenantID, userID string,

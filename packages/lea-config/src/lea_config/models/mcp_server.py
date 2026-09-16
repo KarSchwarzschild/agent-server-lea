@@ -95,6 +95,7 @@ class MCPServer(OwnerMixin, TenantMixin, Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     name = Column(String(100), nullable=False, index=True)
     description = Column(Text, default="")
+    category = Column(String(50), nullable=False, default="general", index=True)
 
     # owner_scope / owner_user_id 来自 OwnerMixin，跟 tools / skills 是同一套三层
     # 可见性编码：

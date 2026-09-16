@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"crypto/subtle"
 	"fmt"
 	"log"
 	"net/http"
@@ -31,6 +32,10 @@ type Claims struct {
 func JWTAuth() gin.HandlerFunc {
 	secret := []byte(jwtSecret())
 	return func(c *gin.Context) {
+		if trustedGatewayIdentity(c) {
+			c.Next()
+			return
+		}
 		auth := c.GetHeader("Authorization")
 		if auth == "" {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing token"})
@@ -65,6 +70,33 @@ func JWTAuth() gin.HandlerFunc {
 		c.Set("role", role)
 		c.Next()
 	}
+}
+
+// trustedGatewayIdentity accepts identities only from a gateway that knows the
+// shared internal token. Browser requests cannot supply this token, so public
+// access remains protected by the gateway's OIDC validation.
+func trustedGatewayIdentity(c *gin.Context) bool {
+	internalToken := strings.TrimSpace(os.Getenv("LEA_INTERNAL_TOKEN"))
+	suppliedToken := c.GetHeader("X-Internal-Token")
+	if internalToken == "" || suppliedToken == "" ||
+		subtle.ConstantTimeCompare([]byte(internalToken), []byte(suppliedToken)) != 1 {
+		return false
+	}
+	userID := strings.TrimSpace(c.GetHeader("X-User-ID"))
+	tenantID := strings.TrimSpace(c.GetHeader("X-Tenant-ID"))
+	if userID == "" || tenantID == "" {
+		return false
+	}
+	role := strings.TrimSpace(c.GetHeader("X-User-Role"))
+	roles := []string{}
+	if role != "" {
+		roles = []string{role}
+	}
+	c.Set("user_id", userID)
+	c.Set("tenant_id", tenantID)
+	c.Set("roles", roles)
+	c.Set("role", role)
+	return true
 }
 
 func CORS() gin.HandlerFunc {

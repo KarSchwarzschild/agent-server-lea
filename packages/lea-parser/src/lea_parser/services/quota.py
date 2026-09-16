@@ -19,8 +19,30 @@ class QuotaError(Exception):
         super().__init__(message)
 
 
+# 递增并保证有 TTL，原子执行。
+#
+# 原来是 `count = INCR(key)` 然后 `if count == 1: EXPIRE(key, 3600)`。两步之间进程挂掉
+# 的话键**永不过期**：计数只增不减，那个用户/租户从此永久 429，只能靠人手动 DEL。
+# 限流器 fail-closed 成永久拒绝比不限流糟得多，而且窗口是一小时，坏了很难自愈。
+#
+# 用 `TTL == -1` 判而不是 `count == 1`：后者对**已经存在却没有 TTL** 的键（正是旧代码
+# 留下的坏键）永远不成立，于是永远补不上过期时间。按 TTL 判能顺手把历史坏键修好。
+_INCR_WITH_TTL = """
+local count = redis.call('INCR', KEYS[1])
+if redis.call('TTL', KEYS[1]) == -1 then
+  redis.call('EXPIRE', KEYS[1], ARGV[1])
+end
+return count
+"""
+
+
+def _incr_window(r, key: str, ttl_seconds: int) -> int:
+    """递增一个固定窗口计数器，返回当前值。"""
+    return int(r.eval(_INCR_WITH_TTL, 1, key, str(ttl_seconds)))
+
+
 def check_rate_limit(tenant_id: str, user_id: str, db: Session) -> None:
-    """Redis 滑动窗口限流（per hour）。超限抛 QuotaError。"""
+    """Redis 固定窗口限流（per hour）。超限抛 QuotaError。"""
     r = _get_redis()
     if not r:
         return
@@ -34,20 +56,14 @@ def check_rate_limit(tenant_id: str, user_id: str, db: Session) -> None:
     user_max = user_quota.max_calls_per_hour if user_quota else 100
 
     tenant_key = f"parser:rate:{tenant_id}"
-    tenant_count = r.incr(tenant_key)
-    if tenant_count == 1:
-        r.expire(tenant_key, 3600)
-    if tenant_count > tenant_max:
+    if _incr_window(r, tenant_key, 3600) > tenant_max:
         raise QuotaError(
             f"Tenant {tenant_id} exceeded {tenant_max} calls/hour",
             code="tenant_rate_limit",
         )
 
     user_key = f"parser:rate:{tenant_id}:{user_id}"
-    user_count = r.incr(user_key)
-    if user_count == 1:
-        r.expire(user_key, 3600)
-    if user_count > user_max:
+    if _incr_window(r, user_key, 3600) > user_max:
         raise QuotaError(
             f"User {user_id} exceeded {user_max} calls/hour",
             code="user_rate_limit",

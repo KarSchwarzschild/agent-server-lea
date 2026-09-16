@@ -1,0 +1,642 @@
+diff --git a/frontend-user/src/stores/agent-chat.ts b/frontend-user/src/stores/agent-chat.ts
+index c1ed4ef..d8ca8e2 100644
+--- a/frontend-user/src/stores/agent-chat.ts
++++ b/frontend-user/src/stores/agent-chat.ts
+@@ -352,7 +352,7 @@ function applyToolEvent(turn: TurnState, raw: unknown) {
+   const ev = raw as RawToolEvent
+   if (!ev || !ev.toolUseID || !ev.toolName) return
+ 
+-  const isSandbox = ev.toolName === 'code_interpreter'
++  const isSandbox = ev.toolName === 'Bash' || ev.toolName === 'code_interpreter'
+   const bucket = isSandbox ? turn.sandboxCalls : turn.toolCalls
+   const idKey = isSandbox ? 'callId' : 'toolCallId'
+   const existing = bucket.find(x => (x as { [k: string]: unknown })[idKey] === ev.toolUseID)
+@@ -360,11 +360,12 @@ function applyToolEvent(turn: TurnState, raw: unknown) {
+   if (ev.type === 'started') {
+     if (existing) return
+     if (isSandbox) {
+-      const input = (ev.input || {}) as { code?: string; language?: string }
++      const input = (ev.input || {}) as { code?: string; command?: string; language?: string }
++      const preview = input.code || input.command || ''
+       const sc: SandboxCallRow = {
+         callId: ev.toolUseID,
+-        language: input.language,
+-        codePreview: input.code ? (input.code.length > 200 ? input.code.slice(0, 200) + '...' : input.code) : '',
++        language: input.language || (input.command ? 'bash' : undefined),
++        codePreview: preview.length > 200 ? preview.slice(0, 200) + '...' : preview,
+         status: 'running',
+       }
+       turn.sandboxCalls.push(sc)
+diff --git a/packages/lea-agent/internal/runtime/code_interpreter.go b/packages/lea-agent/internal/runtime/code_interpreter.go
+index 06f97d7..2bfbac4 100644
+--- a/packages/lea-agent/internal/runtime/code_interpreter.go
++++ b/packages/lea-agent/internal/runtime/code_interpreter.go
+@@ -5,11 +5,15 @@ import (
+ 	"context"
+ 	"encoding/json"
+ 	"fmt"
++	"io"
+ 	"net/http"
++	"path/filepath"
++	"strings"
+ 	"sync"
+ 	"time"
+ 
+ 	"gitlab.ouc-online.com.cn/aibase/agentloop/tool"
++	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/persistence"
+ )
+ 
+ // sandboxCreateClient 专给建沙箱用 —— 它是这条链路上唯一会等 Cube 冷启动的调用。
+@@ -212,10 +216,77 @@ func (t *CodeInterpreterTool) ensureSandbox(ctx context.Context) error {
+ 	}
+ 	json.NewDecoder(resp.Body).Decode(&result)
+ 	t.sandboxSessID = result.SandboxSessionID
++	if err := t.stageSessionAttachments(ctx); err != nil {
++		return err
++	}
+ 	t.sandboxReady = true
+ 	return nil
+ }
+ 
++func (t *CodeInterpreterTool) stageSessionAttachments(ctx context.Context) error {
++	db, err := persistence.DB()
++	if err != nil || db == nil {
++		return nil
++	}
++	atts, err := persistence.LoadSessionAttachmentsForStage(ctx, db, t.tenantID, t.sessionID)
++	if err != nil {
++		return fmt.Errorf("load attachments for staging: %w", err)
++	}
++	for _, att := range atts {
++		if att.FileKey == "" || att.StagedPath != "" {
++			continue
++		}
++		destName := stageName(att.ID, att.Filename)
++		payload, _ := json.Marshal(map[string]string{
++			"tenant_id": t.tenantID, "session_id": t.sessionID,
++			"file_key": att.FileKey, "dest_name": destName,
++		})
++		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
++			toolsGatewayURL+"/api/files/uploads/stage", bytes.NewReader(payload))
++		if err != nil {
++			return err
++		}
++		req.Header.Set("Content-Type", "application/json")
++		if token := getEnv("LEA_INTERNAL_TOKEN", ""); token != "" {
++			req.Header.Set(InternalTokenHeader, token)
++		}
++		resp, err := gatewayClient.Do(req)
++		if err != nil {
++			return fmt.Errorf("stage %s: %w", att.Filename, err)
++		}
++		body, readErr := io.ReadAll(resp.Body)
++		resp.Body.Close()
++		if readErr != nil || resp.StatusCode >= 400 {
++			return fmt.Errorf("stage %s returned %d: %s", att.Filename, resp.StatusCode, strings.TrimSpace(string(body)))
++		}
++		var result struct {
++			StagedName string `json:"staged_name"`
++		}
++		if err := json.Unmarshal(body, &result); err != nil || result.StagedName == "" {
++			return fmt.Errorf("stage %s returned invalid response", att.Filename)
++		}
++		if err := persistence.MarkAttachmentStaged(ctx, db, t.tenantID, t.sessionID, att.ID, result.StagedName); err != nil {
++			return fmt.Errorf("record staged attachment %d: %w", att.ID, err)
++		}
++	}
++	return nil
++}
++
++func stageName(id int64, filename string) string {
++	name := filepath.Base(filename)
++	name = strings.Map(func(r rune) rune {
++		if r < 32 || r == '/' || r == '\\' {
++			return '-'
++		}
++		return r
++	}, name)
++	name = strings.TrimLeft(name, ".")
++	if name == "" {
++		name = "file"
++	}
++	return fmt.Sprintf("%d-%s", id, name)
++}
++
+ func (t *CodeInterpreterTool) execCode(ctx context.Context, code, language string) (json.RawMessage, error) {
+ 	params := map[string]any{
+ 		"code":       code,
+diff --git a/packages/lea-agent/internal/runtime/file_tools.go b/packages/lea-agent/internal/runtime/file_tools.go
+index a3f476e..9874fcd 100644
+--- a/packages/lea-agent/internal/runtime/file_tools.go
++++ b/packages/lea-agent/internal/runtime/file_tools.go
+@@ -41,14 +41,18 @@ import (
+ 	"context"
+ 	"encoding/json"
+ 	"fmt"
++	"io"
+ 	"net/http"
+ 	"net/url"
+ 	"path"
++	"strconv"
+ 	"strings"
+ 	"sync"
+ 	"time"
++	"unicode/utf8"
+ 
+ 	"gitlab.ouc-online.com.cn/aibase/agentloop/tool"
++	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/persistence"
+ )
+ 
+ // 文件工具的 HTTP 客户端。不共用 config_loader 那个 10s client：读写走 NFS 通常是
+@@ -203,8 +207,9 @@ type ReadFileTool struct{ fileToolBase }
+ 
+ func (t *ReadFileTool) Name() string { return "Read" }
+ func (t *ReadFileTool) Description() string {
+-	return "读取工作空间（/workspace）里的一个文本文件。修改文件前必须先读 —— " +
+-		"未读过的文件不允许覆盖，这可以防止抹掉你没看过的内容。"
++	return "读取一个文件的内容。既能读工作空间（/workspace）里的文本文件，也能读用户上传的原件" +
++		"（/mnt/uploads/... —— pdf、docx、pptx、xlsx 这类二进制文档会自动返回解析出来的文本）。" +
++		"修改工作空间里的文件前必须先读 —— 未读过的文件不允许覆盖，这可以防止抹掉你没看过的内容。"
+ }
+ 
+ // IsConcurrencySafe 为 true：只读，多个并行读互不影响。
+@@ -237,12 +242,24 @@ func (t *ReadFileTool) InputSchema() tool.Schema {
+ 	return tool.Schema{
+ 		Type: tool.SchemaTypeObject,
+ 		Properties: map[string]tool.Schema{
+-			"path": {Type: tool.SchemaTypeString, Description: "工作空间内的相对路径，如 output/report.md"},
++			"path": {
++				Type: tool.SchemaTypeString,
++				Description: "工作空间内的相对路径（如 output/report.md），" +
++					"或用户上传附件的逻辑路径（如 attachment:123），也可读已物化原件路径",
++			},
+ 		},
+-		Required: []string{"path"},
++		Required:             []string{"path"},
++		AdditionalProperties: false,
+ 	}
+ }
+ 
++// uploadsPrefix 是用户上传原件在沙箱里的挂载点，与 persistence.UploadsMount 一致。
++//
++// 用常量而不是引 persistence.UploadsMount：runtime 已经依赖 persistence（同一模块内
++// 不成环），但这里只需要一个前缀字符串，多一条依赖不划算。两边对不上的后果见
++// persistence/attachments.go 顶部那段。
++const uploadsPrefix = "/mnt/uploads/"
++
+ func (t *ReadFileTool) Run(ctx context.Context, input json.RawMessage, tctx *tool.Context, out chan<- tool.Event) (tool.Result, error) {
+ 	var p struct {
+ 		Path string `json:"path"`
+@@ -253,6 +270,23 @@ func (t *ReadFileTool) Run(ctx context.Context, input json.RawMessage, tctx *too
+ 	if p.Path == "" {
+ 		return errResult("path 不能为空"), nil
+ 	}
++	if strings.HasPrefix(p.Path, "attachment:") {
++		id, err := strconv.ParseInt(strings.TrimPrefix(p.Path, "attachment:"), 10, 64)
++		if err != nil || id <= 0 {
++			return errResult("附件路径格式错误，应为 attachment:<id>"), nil
++		}
++		return t.readAttachment(ctx, id, tctx, out), nil
++	}
++
++	// 上传件走单独一条路：查库拿上传时就抽好的文本，而不是把二进制字节读回来。
++	// 见 readUpload 的注释。
++	if strings.HasPrefix(p.Path, uploadsPrefix) {
++		if res, handled := t.readUpload(ctx, p.Path, tctx, out); handled {
++			return res, nil
++		}
++		// 没命中库（模型自己往 uploads 写过东西？不太可能，那目录只读）——
++		// 落到下面的普通读，让服务端给出真实的错误。
++	}
+ 
+ 	q := url.Values{
+ 		"session_id": {t.sessionID},
+@@ -292,6 +326,152 @@ func (t *ReadFileTool) Run(ctx context.Context, input json.RawMessage, tctx *too
+ 	return textResult(content + truncated), nil
+ }
+ 
++func (t *ReadFileTool) readAttachment(
++	ctx context.Context, id int64, tctx *tool.Context, out chan<- tool.Event,
++) tool.Result {
++	db, err := persistence.DB()
++	if err != nil || db == nil {
++		return errResult("暂时无法读取附件：存储服务不可用")
++	}
++	att, err := persistence.GetAttachmentForRead(ctx, db, t.tenantID, t.sessionID, id)
++	if err != nil {
++		return errResult(fmt.Sprintf("找不到附件 %d，或附件不属于当前会话", id))
++	}
++	if att.ExtractedText == "" {
++		if att.MediaType == "image" {
++			return textResult(fmt.Sprintf("附件 %s 是图片，没有文本层；如需理解画面，请先将其放入沙箱处理", att.Filename))
++		}
++		return errResult(fmt.Sprintf("附件 %s 尚未生成可读取的文本；如需处理原始文件，请先将其放入沙箱", att.Filename))
++	}
++	content := att.ExtractedText
++	if len(content) > maxReadBytes {
++		content = content[:maxReadBytes]
++		for len(content) > 0 && !utf8.ValidString(content) {
++			content = content[:len(content)-1]
++		}
++		content += fmt.Sprintf("\n\n[内容已截断：显示前 %d 字节，共 %d 字节]", len(content), len(att.ExtractedText))
++	}
++	emitToolResult(out, t.Name(), tctx.ToolUseID,
++		fmt.Sprintf("读取附件 %s（%d 字节文本）", att.Filename, len(att.ExtractedText)), nil)
++	return textResult(content)
++}
++
++// readUpload 读用户上传的原件，返回 (结果, 是否已处理)。
++//
++// ## 为什么不直接读字节
++//
++// /mnt/uploads 下躺的是**原始文件**：pptx 是 zip、pdf 是二进制、xlsx 是 zip。把它们
++// 当文本读的结果是服务端 415（files.py 的 UnicodeDecodeError 分支），而模型收到
++// "不是 UTF-8 文本文件"之后通常会去开沙箱重新解析一遍 —— 慢，而且它未必装得上库。
++//
++// 而这些文件的文本**上传时就抽好了**，躺在 chat_attachments.extracted_text 里
++// （router/attachment.go 的第 2 步打的 lea-parser）。所以这里查库，不碰字节。
++//
++// 这就是"read_file 按后缀路由到对应解析服务"那个设计的落点 —— 只不过路由发生在
++// **上传时**而不是读取时，因为那时字节还在手上。读取时只需要把结果取回来。
++//
++// ## 返回 handled=false 的两种情况
++//
++//	库不可用      降级到普通文件读，让服务端报真实错误
++//	查不到这一行   路径是模型编的、或者附件属于别的会话 —— 同样交给服务端报错
++//
++// 两种都不该在这里造一个自己的错误消息：服务端的 404 带着真实路径，比"附件不存在"
++// 有用（模型能据此发现自己拼错了文件名）。
++func (t *ReadFileTool) readUpload(
++	ctx context.Context, path string, tctx *tool.Context, out chan<- tool.Event,
++) (tool.Result, bool) {
++	db, err := persistence.DB()
++	if err != nil || db == nil {
++		return tool.Result{}, false
++	}
++
++	stagedName := strings.TrimPrefix(path, uploadsPrefix)
++	att, err := persistence.GetAttachmentByStagedPath(ctx, db, t.tenantID, t.sessionID, stagedName)
++	if err != nil {
++		return tool.Result{}, false
++	}
++
++	text, summary := renderUpload(att, path)
++	emitToolResult(out, t.Name(), tctx.ToolUseID, summary, nil)
++	return textResult(text), true
++}
++
++// renderUpload 把一行附件渲染成给模型的文本，外加一句给前端时间线的摘要。
++//
++// 从 readUpload 里分出来是为了能测：查库那一步依赖 persistence.DB() 单例（没有注入
++// 口），而真正值得钉住的是**四个分支各自说了什么** —— 说错的代价见每个分支的注释。
++func renderUpload(att persistence.Attachment, path string) (text, summary string) {
++	// 有文本 → 直接给。这是绝大多数情况（pdf/docx/pptx/txt/csv 都走这里）。
++	if att.ExtractedText != "" {
++		content := att.ExtractedText
++		note := ""
++		if len(content) > maxReadBytes {
++			// 截断的说明必须给出**怎么拿到剩下的**，否则模型会在残缺内容上给出完整
++			// 口吻的回答 —— 静默、且从输出看不出来的失败。
++			content = content[:maxReadBytes]
++			// 退到合法的 UTF-8 边界。
++			//
++			// ⚠️ 不能写成"最后一个字节不是起始字节就往回退" —— 切点正好落在字符边界上
++			// 时（maxReadBytes=61440 能被 3 整除，所以中文正文必然撞上），最后一个字节
++			// 是一个合法的续接字节，那种写法会把完整字符的尾巴剥掉，**反而**切出非法
++			// 序列。这个 bug 被 TestRenderUpload_TruncationNeverBreaksMultibyteChar 抓到过。
++			//
++			// 按"整个串合法吗"判就没有歧义，而且最多退 3 次。
++			for len(content) > 0 && !utf8.ValidString(content) {
++				content = content[:len(content)-1]
++			}
++			note = fmt.Sprintf(
++				"\n\n[内容已截断：显示前 %d 字节，全文共 %d 字节。"+
++					"需要其余部分请用 code_interpreter 在沙箱里读 %s。"+
++					"做整体总结/翻译这类需要通读的任务时，请先把文件读完。]",
++				len(content), len(att.ExtractedText), path)
++		}
++		return content + note,
++			fmt.Sprintf("读取上传件 %s（%d 字节文本）", att.Filename, len(att.ExtractedText))
++	}
++
++	// 没文本。**分清是哪一种**：三种情况模型该走的路完全不同，笼统一句"读不到"
++	// 会让它在错误的方向上重试。
++	//
++	// 三个分支都不点名 OCR / PIL / ffmpeg —— 装没装是可配置项，点名一个不在的东西
++	// 会让模型在同一个 import 上打转，而不是换条路。只给**性质**，手段由它在真实
++	// 环境里自己探明（它看得到报错，我们看不到）。
++	switch att.MediaType {
++	case "image":
++		// 图片没有文本层是这类文件的性质，不是提取失败。
++		return fmt.Sprintf(
++				"%s 是图片，没有文本层 —— 要了解画面内容需要对它做视觉处理。"+
++					"文件在 %s，可在沙箱里按可用的方式处理。", att.Filename, path),
++			fmt.Sprintf("读取上传件 %s（图片，无文本层）", att.Filename)
++
++	case "audio", "video":
++		return fmt.Sprintf(
++				"%s 是%s文件，本次没有可用的转写文本。文件在 %s，"+
++					"可在沙箱里按可用的方式处理。",
++				att.Filename, mediaWord(att.MediaType), path),
++			fmt.Sprintf("读取上传件 %s（%s，无转写文本）", att.Filename, mediaWord(att.MediaType))
++
++	default:
++		// 文档类但一个字都没抽出来：扫描件、纯图片 PDF、或者上传时 parser 挂了。
++		// 这三种在这里分不出来，所以都说 —— 模型据此可以判断要不要去沙箱试。
++		//
++		// 要跟"文件是空的"区分开：后者模型会回"你的文件好像是空的"，而实际上可能有
++		// 20 页内容，只是没有文本层。
++		return fmt.Sprintf(
++				"%s 没有提取到文本 —— 可能是扫描件/纯图片文档，也可能上传时解析失败。"+
++					"内容若存在于图像中，需要在沙箱里对 %s 做识别处理。",
++				att.Filename, path),
++			fmt.Sprintf("读取上传件 %s（未提取到文本）", att.Filename)
++	}
++}
++
++func mediaWord(mediaType string) string {
++	if mediaType == "audio" {
++		return "音频"
++	}
++	return "视频"
++}
++
+ // ── Write ──────────────────────────────────────────────
+ 
+ type WriteFileTool struct{ fileToolBase }
+@@ -683,7 +863,8 @@ type BashTool struct {
+ func (t *BashTool) Name() string { return "Bash" }
+ func (t *BashTool) Description() string {
+ 	return "在沙箱里执行 shell 命令，工作目录是 /workspace。适合文件整理、格式转换、" +
+-		"查看环境等一行能说清的操作。要写多行程序、装依赖或做数据分析请用 code_interpreter。"
++		"运行 Python/Node 脚本、安装依赖、查看环境和数据处理。复杂代码请先写入脚本，" +
++		"再用 python 或 node 命令执行。"
+ }
+ 
+ // IsConcurrencySafe 为 false：命令内容任意，可能改动文件系统。
+@@ -750,10 +931,65 @@ func (t *BashTool) ensureSandbox(ctx context.Context) error {
+ 	if resp.StatusCode >= 400 {
+ 		return fmt.Errorf("创建沙箱返回 %d", resp.StatusCode)
+ 	}
++
++	// 物化所有 file_key != "" && staged_path == "" 的附件
++	if err := t.stageSessionAttachments(ctx); err != nil {
++		return err
++	}
++
+ 	t.sandboxReady = true
+ 	return nil
+ }
+ 
++func (t *BashTool) stageSessionAttachments(ctx context.Context) error {
++	db, err := persistence.DB()
++	if err != nil || db == nil {
++		return nil
++	}
++	atts, err := persistence.LoadSessionAttachmentsForStage(ctx, db, t.tenantID, t.sessionID)
++	if err != nil {
++		return fmt.Errorf("load attachments for staging: %w", err)
++	}
++	for _, att := range atts {
++		if att.FileKey == "" || att.StagedPath != "" {
++			continue
++		}
++		destName := stageName(att.ID, att.Filename)
++		payload, _ := json.Marshal(map[string]string{
++			"tenant_id": t.tenantID, "session_id": t.sessionID,
++			"file_key": att.FileKey, "dest_name": destName,
++		})
++		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
++			toolsGatewayURL+"/api/files/uploads/stage", bytes.NewReader(payload))
++		if err != nil {
++			return err
++		}
++		req.Header.Set("Content-Type", "application/json")
++		if token := getEnv("LEA_INTERNAL_TOKEN", ""); token != "" {
++			req.Header.Set(InternalTokenHeader, token)
++		}
++		resp, err := gatewayClient.Do(req)
++		if err != nil {
++			return fmt.Errorf("stage %s: %w", att.Filename, err)
++		}
++		body, readErr := io.ReadAll(resp.Body)
++		resp.Body.Close()
++		if readErr != nil || resp.StatusCode >= 400 {
++			return fmt.Errorf("stage %s returned %d: %s", att.Filename, resp.StatusCode, strings.TrimSpace(string(body)))
++		}
++		var result struct {
++			StagedName string `json:"staged_name"`
++		}
++		if err := json.Unmarshal(body, &result); err != nil || result.StagedName == "" {
++			return fmt.Errorf("stage %s returned invalid response", att.Filename)
++		}
++		if err := persistence.MarkAttachmentStaged(ctx, db, t.tenantID, t.sessionID, att.ID, result.StagedName); err != nil {
++			return fmt.Errorf("record staged attachment %d: %w", att.ID, err)
++		}
++	}
++	return nil
++}
++
+ func (t *BashTool) Run(ctx context.Context, input json.RawMessage, tctx *tool.Context, out chan<- tool.Event) (tool.Result, error) {
+ 	var p struct {
+ 		Command string `json:"command"`
+@@ -798,6 +1034,7 @@ func (t *BashTool) Run(ctx context.Context, input json.RawMessage, tctx *tool.Co
+ 		Stdout     string `json:"stdout"`
+ 		Stderr     string `json:"stderr"`
+ 		ExitCode   int    `json:"exit_code"`
++		Artifacts  []any  `json:"artifacts"`
+ 		DurationMs int    `json:"duration_ms"`
+ 	}
+ 	if err := json.Unmarshal(raw, &res); err != nil {
+@@ -833,9 +1070,23 @@ func (t *BashTool) Run(ctx context.Context, input json.RawMessage, tctx *tool.Co
+ 		text = "命令执行完毕，没有输出。"
+ 	}
+ 
+-	emitToolResult(out, t.Name(), tctx.ToolUseID,
+-		fmt.Sprintf("执行 %s（退出码 %d，%dms）", firstLine(p.Command), res.ExitCode, res.DurationMs),
+-		map[string]any{"exit_code": res.ExitCode, "duration_ms": res.DurationMs})
++	if out != nil && tctx != nil {
++		select {
++		case out <- tool.Event{
++			Type:      tool.EventTypeProgress,
++			ToolName:  t.Name(),
++			ToolUseID: tctx.ToolUseID,
++			Data: map[string]any{
++				"stdout":      res.Stdout,
++				"stderr":      res.Stderr,
++				"artifacts":   res.Artifacts,
++				"exit_code":   res.ExitCode,
++				"duration_ms": res.DurationMs,
++			},
++		}:
++		default:
++		}
++	}
+ 
+ 	// 退出码非 0 标成工具错误，模型才知道要处理而不是当成成功继续。
+ 	if res.ExitCode != 0 {
+diff --git a/packages/lea-agent/internal/runtime/file_tools_test.go b/packages/lea-agent/internal/runtime/file_tools_test.go
+index 2f7e774..a5d2153 100644
+--- a/packages/lea-agent/internal/runtime/file_tools_test.go
++++ b/packages/lea-agent/internal/runtime/file_tools_test.go
+@@ -146,8 +146,8 @@ func TestGatewayToolsetWithoutSandboxKeepsFileToolsButDropsBash(t *testing.T) {
+ // 平台工具必须落在 Provision 通道里，否则子代理拿不到。
+ //
+ // 这条是"专家把 skill 执行派给子代理"能不能成立的前提：派下去的子代理必须能调
+-// code_interpreter，否则派了活却没有干活的手段。这些工具此前全在 ExtraTools 里
+-// （快照之后 append），子代理和专家一个都拿不到 —— 那时这套委派只是看起来可行。
++// Bash 执行脚本。这些工具此前全在 ExtraTools 里（快照之后 append），子代理和专家
++// 一个都拿不到 —— 那时这套委派只是看起来可行。
+ //
+ // memory_add 例外：写用户长期记忆只该主会话做，它留在 ExtraTools（BuildMainSessionTools）。
+ func TestProvisionCarriesPlatformToolsExceptMemoryAdd(t *testing.T) {
+@@ -173,7 +173,7 @@ func TestProvisionCarriesPlatformToolsExceptMemoryAdd(t *testing.T) {
+ 	// tools.Builtins() 那批全没进来。规划态下它们是放行的（network 不算 mutating），
+ 	// 所以对一个只配了业务 API 的 agent，这是规划阶段唯一的外部信息来源。
+ 	for _, want := range []string{
+-		"code_interpreter", "kb_search", "memory_search", "get_plan",
++		"kb_search", "memory_search", "get_plan",
+ 		"WebSearch", "WebFetch",
+ 	} {
+ 		if !names[want] {
+@@ -183,6 +183,9 @@ func TestProvisionCarriesPlatformToolsExceptMemoryAdd(t *testing.T) {
+ 	if names["memory_add"] {
+ 		t.Error("memory_add 不该在 Provision 里 —— 子代理是临时的，不该写用户长期记忆")
+ 	}
++	if names["code_interpreter"] {
++		t.Error("code_interpreter 暂不应暴露给模型，沙箱执行统一使用 Bash")
++	}
+ 	// 计划的两个写工具反过来：子代理拿到就能改用户批准过的计划、或者替一个没人
+ 	// 验收的产出标"完成"。
+ 	for _, forbidden := range []string{"save_plan", "update_plan_step"} {
+diff --git a/packages/lea-agent/internal/runtime/platform_tools.go b/packages/lea-agent/internal/runtime/platform_tools.go
+index 198f471..4bf6e6e 100644
+--- a/packages/lea-agent/internal/runtime/platform_tools.go
++++ b/packages/lea-agent/internal/runtime/platform_tools.go
+@@ -47,13 +47,8 @@ func emitToolResult(out chan<- tool.Event, name, toolUseID string, summary strin
+ // build.go 里的顺序是：Provision → 并入 sessionTools → 快照 eligibleSubagentTools →
+ // append ExtraTools。落在快照之前的才被子代理继承。
+ //
+-// 这条分界是"专家把 skill 执行派给子代理"能不能成立的前提：一个跑 pptx skill 的子代理
+-// 必须能调 code_interpreter，否则派了活却没有干活的手段。code_interpreter 此前在
+-// ExtraTools 里，子代理和专家一个都拿不到 —— 那时"派活给子代理"只是看起来可行。
+-//
+-// 附带一层：npm 工作区、NODE_PATH、os.environ 追加而非替换那些踩出来的规则写在
+-// CodeInterpreterTool.Description() 里。工具描述随工具走，所以工具进了子代理，坑的
+-// 说明也自动跟进去，不需要在别处复述一遍。
++// 这条分界是"专家把 skill 执行派给子代理"能不能成立的前提：子代理必须能拿到
++// Bash，才能在沙箱中执行 Python、Node 和 skill 脚本。
+ //
+ // 只有主会话该有的工具见 BuildMainSessionTools。
+ func BuildPlatformTools(cfg *AgentConfig, tenantID, userID, sessionID string) []tool.Tool {
+@@ -73,16 +68,6 @@ func BuildPlatformTools(cfg *AgentConfig, tenantID, userID, sessionID string) []
+ 		tools = append(tools, &MemorySearchTool{tenantID: tenantID, userID: userID})
+ 	}
+ 
+-	if cfg.SandboxEnabled {
+-		tools = append(tools, &CodeInterpreterTool{
+-			tenantID:  tenantID,
+-			userID:    userID,
+-			sessionID: sessionID,
+-			skillID:   cfg.ActiveSkillID,
+-			skills:    cfg.Skills,
+-		})
+-	}
+-
+ 	// get_plan 是只读的，**专家和子代理都该有**：转交链里执行第 3 步的那个专家，
+ 	// 得看得到整体计划才不会跑偏。写那两个（save_plan / update_plan_step）在
+ 	// BuildMainSessionTools —— 子代理改不了用户批准过的契约，标"完成"也轮不到一个
+diff --git a/packages/lea-agent/internal/session/collector.go b/packages/lea-agent/internal/session/collector.go
+index fd9906c..2054e98 100644
+--- a/packages/lea-agent/internal/session/collector.go
++++ b/packages/lea-agent/internal/session/collector.go
+@@ -215,7 +215,7 @@ func (c *messageCollector) appendTextSegmentLocked(kind, delta string) {
+ }
+ 
+ // onToolEvent 把 agentloop tool.Event 映射到 tool_calls / sandbox_calls。
+-// code_interpreter 走 sandbox 组，其他走通用 tool 组。
++// Bash 走 sandbox 组，其他走通用 tool 组。
+ func (c *messageCollector) onToolEvent(ev tool.Event) {
+ 	// 用量事件先接住 —— 它不是工具生命周期的一环，走下面的 started/progress/completed
+ 	// 分支会被整个丢掉（这是 token_count 列一直为 0 的原因之一）。
+@@ -236,7 +236,7 @@ func (c *messageCollector) onToolEvent(ev tool.Event) {
+ 	c.mu.Lock()
+ 	defer c.mu.Unlock()
+ 
+-	if ev.ToolName == "code_interpreter" {
++	if ev.ToolName == "Bash" || ev.ToolName == "code_interpreter" {
+ 		c.onSandboxLocked(ev)
+ 		return
+ 	}
+@@ -565,7 +565,7 @@ func decodeInput(raw json.RawMessage) map[string]any {
+ 	return out
+ }
+ 
+-// extractCodeMeta 从 code_interpreter 的 input 里挑出 code preview / language。
++// extractCodeMeta 从沙箱工具的 input 里挑出代码预览 / language。
+ // 前端 sandbox_calls 卡片需要这俩字段。
+ func extractCodeMeta(input map[string]any) (preview string, language string) {
+ 	if input == nil {
+@@ -574,7 +574,14 @@ func extractCodeMeta(input map[string]any) (preview string, language string) {
+ 	if lang, ok := input["language"].(string); ok {
+ 		language = lang
+ 	}
+-	if code, ok := input["code"].(string); ok {
++	code, ok := input["code"].(string)
++	if !ok {
++		code, ok = input["command"].(string)
++		if ok && language == "" {
++			language = "bash"
++		}
++	}
++	if ok {
+ 		if len(code) > 200 {
+ 			preview = code[:200] + "..."
+ 		} else {
+diff --git a/packages/lea-agent/internal/session/collector_test.go b/packages/lea-agent/internal/session/collector_test.go
+index 9f3a2ce..7ca00f3 100644
+--- a/packages/lea-agent/internal/session/collector_test.go
++++ b/packages/lea-agent/internal/session/collector_test.go
+@@ -60,6 +60,42 @@ func TestCollector_SandboxCalls(t *testing.T) {
+ 	}
+ }
+ 
++func TestCollector_BashCallsUseSandboxBucket(t *testing.T) {
++	c := newCollector()
++	c.onToolEvent(tool.Event{
++		Type: tool.EventTypeStarted, ToolName: "Bash", ToolUseID: "bash-1",
++		Input: json.RawMessage(`{"command":"python /workspace/process.py"}`),
++	})
++	c.onToolEvent(tool.Event{
++		Type: tool.EventTypeProgress, ToolName: "Bash", ToolUseID: "bash-1",
++		Data: map[string]any{
++			"artifacts":   []any{"result.xlsx"},
++			"stdout":      "done\n",
++			"duration_ms": float64(25),
++		},
++	})
++	c.onToolEvent(tool.Event{
++		Type: tool.EventTypeCompleted, ToolName: "Bash", ToolUseID: "bash-1",
++		DurationMs: 25,
++	})
++
++	extra := c.toExtra()
++	scs := extra["sandbox_calls"].([]map[string]any)
++	if len(scs) != 1 || scs[0]["status"] != "success" {
++		t.Fatalf("Bash should be a successful sandbox call: %v", scs)
++	}
++	if _, ok := extra["tool_calls"]; ok {
++		t.Fatal("Bash should not appear in tool_calls")
++	}
++	arts, ok := scs[0]["artifacts"].([]string)
++	if !ok || len(arts) != 1 || arts[0] != "result.xlsx" {
++		t.Fatalf("Bash artifacts missing: %v", scs[0])
++	}
++	if scs[0]["language"] != "bash" || scs[0]["codePreview"] != "python /workspace/process.py" {
++		t.Fatalf("Bash metadata missing: %v", scs[0])
++	}
++}
++
+ func TestCollector_SandboxArtifactsFromProgress(t *testing.T) {
+ 	c := newCollector()
+ 	c.onToolEvent(tool.Event{

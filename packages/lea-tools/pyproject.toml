@@ -7,6 +7,7 @@ dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.34",
     "httpx>=0.26",
+    "cubesandbox>=0.7,<0.8",
     "sqlalchemy>=2.0",
     "pymysql>=1.1",
     "pydantic-settings>=2.0",
@@ -18,6 +19,23 @@ dependencies = [
     "jsonpath-ng>=1.6",
     "boto3>=1.34",
     "esdk-obs-python>=3.26",
+    # /api/files/uploads/blob 收 multipart（用户上传的原件字节）。
+    #
+    # ⚠️ FastAPI 不把它作为依赖带进来，而缺了它的失败是**进程起不来**：
+    # File/Form 参数在 import 期就要求它在场，于是 uvicorn 在装配路由时抛
+    # RuntimeError 直接退出 —— 表现是容器无限重启，而报错栈全在 fastapi 内部，
+    # 看不出是哪个端点引起的。加 uploads 那两个端点时漏了这条，真链路验收才发现。
+    "python-multipart>=0.0.9",
+    # 官方 MCP SDK —— streamable-HTTP 客户端 + ClientSession，负责 initialize 握手、
+    # SSE 解析、Mcp-Session-Id 管理。自己手写协议只会引入 bug（见 mcp_proxy.py）。
+    #
+    # 钉在 1.9.x（<2）：2.x 换成了 httpx2（第二套 http 栈，跟本项目的 httpx 并存、
+    # 镜像翻倍），且 streamable_http_client 不再收 headers、改收整个 client、返回值也变了。
+    # 1.9.x 是文档化、稳定的那套：streamablehttp_client(url, headers=...) 返回
+    # (read, write, get_session_id)，headers= 正好塞凭证，CallToolResult.isError/content
+    # 结构稳定，跟现有 mcp_call 的逻辑一一对得上。
+    "mcp>=1.9,<2",
+    "prometheus-client>=0.20",
     # 服务间鉴权（被调方中间件 + 打 lea-rag 时的请求头）。见 packages/lea-authkit。
     "lea-authkit",
 ]

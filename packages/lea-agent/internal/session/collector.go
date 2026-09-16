@@ -24,10 +24,12 @@ type messageCollector struct {
 	responseParts []string
 	thinking      strings.Builder
 
-	toolCalls    []map[string]any
-	toolIndex    map[string]int
-	sandboxCalls []map[string]any
-	sandboxIndex map[string]int
+	toolCalls      []map[string]any
+	toolIndex      map[string]int
+	sandboxCalls   []map[string]any
+	sandboxIndex   map[string]int
+	references     []map[string]any
+	referenceIndex map[string]int
 
 	// segments 保留 delta/thinking/tool/sandbox 到达的真实交错顺序。
 	// 每项形如 {kind: "text"|"thinking"|"tool"|"sandbox", content?: string, index?: int}
@@ -171,8 +173,9 @@ func (c *messageCollector) usageTotals() (in, out int) {
 
 func newCollector() *messageCollector {
 	return &messageCollector{
-		toolIndex:    make(map[string]int),
-		sandboxIndex: make(map[string]int),
+		toolIndex:      make(map[string]int),
+		sandboxIndex:   make(map[string]int),
+		referenceIndex: make(map[string]int),
 	}
 }
 
@@ -215,8 +218,11 @@ func (c *messageCollector) appendTextSegmentLocked(kind, delta string) {
 }
 
 // onToolEvent 把 agentloop tool.Event 映射到 tool_calls / sandbox_calls。
-// code_interpreter 走 sandbox 组，其他走通用 tool 组。
+// Bash 走 sandbox 组，其他走通用 tool 组。
 func (c *messageCollector) onToolEvent(ev tool.Event) {
+	if refs := referencesFromToolEvent(ev); len(refs) > 0 {
+		c.onReferences(refs)
+	}
 	// 用量事件先接住 —— 它不是工具生命周期的一环，走下面的 started/progress/completed
 	// 分支会被整个丢掉（这是 token_count 列一直为 0 的原因之一）。
 	//
@@ -236,11 +242,58 @@ func (c *messageCollector) onToolEvent(ev tool.Event) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if ev.ToolName == "code_interpreter" {
+	if ev.ToolName == "Bash" || ev.ToolName == "code_interpreter" {
 		c.onSandboxLocked(ev)
 		return
 	}
 	c.onToolLocked(ev)
+}
+
+func (c *messageCollector) onReferences(refs []map[string]any) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, ref := range refs {
+		id, _ := ref["id"].(string)
+		if id == "" {
+			continue
+		}
+		if index, ok := c.referenceIndex[id]; ok {
+			c.references[index] = ref
+			continue
+		}
+		c.referenceIndex[id] = len(c.references)
+		c.references = append(c.references, ref)
+	}
+}
+
+func referencesFromToolEvent(ev tool.Event) []map[string]any {
+	refs := make([]map[string]any, 0, len(ev.Files))
+	for _, file := range ev.Files {
+		if file.Path == "" {
+			continue
+		}
+		refs = append(refs, map[string]any{
+			"id":     "file:" + file.Path,
+			"title":  file.Path,
+			"path":   file.Path,
+			"source": string(file.Kind),
+		})
+	}
+	if payload, ok := ev.Data.(map[string]any); ok {
+		if raw, ok := payload["references"].([]any); ok {
+			for _, item := range raw {
+				if ref, ok := item.(map[string]any); ok {
+					if _, exists := ref["id"]; !exists {
+						ref["id"] = ref["url"]
+					}
+					if id, _ := ref["id"].(string); id != "" {
+						refs = append(refs, ref)
+					}
+				}
+			}
+		}
+	}
+	return refs
 }
 
 func (c *messageCollector) onToolLocked(ev tool.Event) {
@@ -490,6 +543,9 @@ func (c *messageCollector) toExtra() map[string]any {
 	if len(c.sandboxCalls) > 0 {
 		extra["sandbox_calls"] = c.sandboxCalls
 	}
+	if len(c.references) > 0 {
+		extra["references"] = c.references
+	}
 	if t := c.thinking.String(); t != "" {
 		extra["reasoning_blocks"] = []map[string]any{
 			{
@@ -565,7 +621,7 @@ func decodeInput(raw json.RawMessage) map[string]any {
 	return out
 }
 
-// extractCodeMeta 从 code_interpreter 的 input 里挑出 code preview / language。
+// extractCodeMeta 从沙箱工具的 input 里挑出代码预览 / language。
 // 前端 sandbox_calls 卡片需要这俩字段。
 func extractCodeMeta(input map[string]any) (preview string, language string) {
 	if input == nil {
@@ -574,7 +630,14 @@ func extractCodeMeta(input map[string]any) (preview string, language string) {
 	if lang, ok := input["language"].(string); ok {
 		language = lang
 	}
-	if code, ok := input["code"].(string); ok {
+	code, ok := input["code"].(string)
+	if !ok {
+		code, ok = input["command"].(string)
+		if ok && language == "" {
+			language = "bash"
+		}
+	}
+	if ok {
 		if len(code) > 200 {
 			preview = code[:200] + "..."
 		} else {

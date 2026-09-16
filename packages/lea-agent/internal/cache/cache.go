@@ -3,8 +3,8 @@ package cache
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"log"
 	"math/rand"
 	"time"
 
@@ -13,222 +13,183 @@ import (
 
 // Config 缓存配置
 type Config struct {
-	BaseTTL      time.Duration // 基础 TTL
-	Jitter       time.Duration // TTL 抖动范围 ±
-	NullTTL      time.Duration // NULL 值缓存 TTL（更短）
-	LockTimeout  time.Duration // 分布式锁超时
-	LockRetries  int           // 等锁重试次数
-	LockRetryDel time.Duration // 等锁重试延迟
+	// DefaultTTL 默认缓存时长
+	DefaultTTL time.Duration
+	// NullTTL 空值标记的缓存时长（防穿透）
+	NullTTL time.Duration
+	// LockTimeout 分布式锁超时时间（防击穿）
+	LockTimeout time.Duration
+	// JitterPercent TTL 随机抖动百分比（防雪崩），范围 0-100
+	JitterPercent int
 }
 
 // DefaultConfig 默认配置
 var DefaultConfig = Config{
-	BaseTTL:      5 * time.Minute,
-	Jitter:       60 * time.Second,
-	NullTTL:      1 * time.Minute,
-	LockTimeout:  5 * time.Second,
-	LockRetries:  3,
-	LockRetryDel: 100 * time.Millisecond,
+	DefaultTTL:    5 * time.Minute,
+	NullTTL:       1 * time.Minute,
+	LockTimeout:   10 * time.Second,
+	JitterPercent: 10, // 10% 抖动
 }
 
-const nullValue = "__NULL__"
-
-// Cache 缓存层（防护所有雪崩/击穿/穿透）
+// Cache 缓存层，提供三大防护：雪崩/击穿/穿透
 type Cache struct {
 	client *redis.Client
-	cfg    Config
+	config Config
 }
 
 // New 创建缓存实例
-func New(client *redis.Client, cfg Config) *Cache {
-	if cfg.BaseTTL == 0 {
-		cfg = DefaultConfig
+func New(client *redis.Client, config Config) *Cache {
+	if config.DefaultTTL == 0 {
+		config = DefaultConfig
 	}
-	return &Cache{client: client, cfg: cfg}
-}
-
-// Get 读缓存，返回 (值, 缓存命中, 错误)
-func (c *Cache) Get(ctx context.Context, key string) (string, bool, error) {
-	val, err := c.client.Get(ctx, key).Result()
-	if err == redis.Nil {
-		return "", false, nil // 缓存不存在
+	return &Cache{
+		client: client,
+		config: config,
 	}
-	if err != nil {
-		log.Printf("cache get error: %v", err)
-		return "", false, err
-	}
-
-	// 检查是否是 NULL 标记（穿透防护）
-	if val == nullValue {
-		return "", true, nil // 命中，但值是 NULL
-	}
-
-	return val, true, nil
 }
 
-// Set 写缓存，自动加抖动避免雪崩
-func (c *Cache) Set(ctx context.Context, key, value string) error {
-	ttl := c.randomTTL()
-	return c.client.Set(ctx, key, value, ttl).Err()
-}
-
-// SetWithTTL 写缓存，指定 TTL
-func (c *Cache) SetWithTTL(ctx context.Context, key, value string, ttl time.Duration) error {
-	return c.client.Set(ctx, key, value, ttl).Err()
-}
-
-// SetNull 写 NULL 标记（穿透防护）
-func (c *Cache) SetNull(ctx context.Context, key string) error {
-	return c.client.Set(ctx, key, nullValue, c.cfg.NullTTL).Err()
-}
-
-// Delete 删除缓存
-func (c *Cache) Delete(ctx context.Context, keys ...string) error {
-	if len(keys) == 0 {
-		return nil
-	}
-	return c.client.Del(ctx, keys...).Err()
-}
-
-// GetOrLoadJSON 读 JSON 缓存，miss 时调 loader 加载并缓存（击穿防护）
+// GetOrLoad 缓存未命中时调用 loader 加载数据
 //
-// 用法：
-//   config, err := cache.GetOrLoadJSON(ctx, "agent:1", func(ctx context.Context) (any, error) {
-//       return db.GetAgentConfig(1)
-//   })
-func (c *Cache) GetOrLoadJSON(ctx context.Context, key string, loader func(context.Context) (any, error)) (any, error) {
-	// 第一步：尝试从缓存读
-	val, hit, err := c.Get(ctx, key)
-	if err != nil {
-		// 缓存连接出错，直接降级到 loader
-		log.Printf("cache unavailable, falling back to loader: %v", err)
-		return c.loadAndCacheJSON(ctx, key, loader)
+// 防护措施：
+//  - 雪崩：TTL 加随机抖动
+//  - 击穿：分布式锁（同一个 key 只有一个 loader 在跑）
+//  - 穿透：NULL 值标记（loader 返回 nil 也缓存）
+func (c *Cache) GetOrLoad(ctx context.Context, key string, loader func(context.Context) ([]byte, error)) ([]byte, error) {
+	// 降级保护：Redis 不可用时直接回源
+	if c.client == nil {
+		return loader(ctx)
 	}
 
-	if hit {
-		if val == "" { // NULL 值命中
+	// 1. 尝试从缓存读取
+	data, err := c.client.Get(ctx, key).Bytes()
+	if err == nil {
+		// 命中：检查是否是 NULL 标记
+		if string(data) == "NULL" {
 			return nil, nil
 		}
-		// 缓存命中，反序列化
-		var result any
-		if err := json.Unmarshal([]byte(val), &result); err != nil {
-			log.Printf("cache unmarshal error: %v", err)
-			// 坏数据，清掉重新加载
-			_ = c.Delete(ctx, key)
-			return c.loadAndCacheJSON(ctx, key, loader)
-		}
-		return result, nil
+		return data, nil
+	}
+	if !errors.Is(err, redis.Nil) {
+		// Redis 异常（网络/超时等）：降级回源
+		return loader(ctx)
 	}
 
-	// 第二步：缓存 miss，用分布式锁防击穿
-	return c.getWithLock(ctx, key, loader)
-}
+	// 2. 缓存未命中：尝试获取分布式锁
+	lockKey := key + ":lock"
+	acquired, err := c.acquireLock(ctx, lockKey)
+	if err != nil || !acquired {
+		// 获取锁失败：说明有其他进程在加载，等一会儿再读缓存
+		time.Sleep(100 * time.Millisecond)
+		data, err := c.client.Get(ctx, key).Bytes()
+		if err == nil && string(data) != "NULL" {
+			return data, nil
+		}
+		if err == nil && string(data) == "NULL" {
+			return nil, nil
+		}
+		// 仍未命中：降级回源
+		return loader(ctx)
+	}
+	defer c.releaseLock(ctx, lockKey)
 
-// getWithLock 用分布式锁防止击穿
-func (c *Cache) getWithLock(ctx context.Context, key string, loader func(context.Context) (any, error)) (any, error) {
-	lockKey := fmt.Sprintf("lock:%s", key)
-
-	// 尝试拿锁
-	ok, err := c.client.SetNX(ctx, lockKey, "1", c.cfg.LockTimeout).Result()
+	// 3. 持有锁：调用 loader
+	data, err = loader(ctx)
 	if err != nil {
-		// 锁服务出错，直接加载（降级）
-		log.Printf("lock unavailable: %v", err)
-		return c.loadAndCacheJSON(ctx, key, loader)
-	}
-
-	if ok {
-		// 拿到锁，加载数据并缓存
-		defer c.client.Del(ctx, lockKey)
-		return c.loadAndCacheJSON(ctx, key, loader)
-	}
-
-	// 没拿到锁，等待其他 goroutine 加载完成
-	for i := 0; i < c.cfg.LockRetries; i++ {
-		time.Sleep(c.cfg.LockRetryDel)
-
-		val, hit, err := c.Get(ctx, key)
-		if err != nil {
-			continue // 重试
-		}
-
-		if hit {
-			if val == "" {
-				return nil, nil
-			}
-			var result any
-			if err := json.Unmarshal([]byte(val), &result); err != nil {
-				continue
-			}
-			return result, nil
-		}
-	}
-
-	// 等了多次还是没有，直接加载（可能加锁的 goroutine 失败了）
-	log.Printf("lock wait timeout for %s, fallback to direct load", key)
-	return c.loadAndCacheJSON(ctx, key, loader)
-}
-
-// loadAndCacheJSON 调 loader 加载数据并缓存
-func (c *Cache) loadAndCacheJSON(ctx context.Context, key string, loader func(context.Context) (any, error)) (any, error) {
-	result, err := loader(ctx)
-
-	if err != nil {
-		// 加载失败，不缓存
-		log.Printf("loader error for %s: %v", key, err)
+		// loader 失败不缓存，直接返回错误
 		return nil, err
 	}
 
-	if result == nil {
-		// NULL 值，缓存一个标记（穿透防护）
-		_ = c.SetNull(ctx, key)
+	// 4. 写入缓存（包括 NULL 值）
+	ttl := c.ttlWithJitter(c.config.DefaultTTL)
+	if data == nil {
+		// 穿透防护：空值用较短 TTL
+		c.client.Set(ctx, key, "NULL", c.config.NullTTL)
 		return nil, nil
 	}
 
-	// 成功，缓存 JSON
-	data, err := json.Marshal(result)
+	c.client.Set(ctx, key, data, ttl)
+	return data, nil
+}
+
+// GetOrLoadJSON 是 GetOrLoad 的 JSON 版本
+func (c *Cache) GetOrLoadJSON(ctx context.Context, key string, loader func(context.Context) (any, error)) (any, error) {
+	data, err := c.GetOrLoad(ctx, key, func(ctx context.Context) ([]byte, error) {
+		result, err := loader(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if result == nil {
+			return nil, nil
+		}
+		return json.Marshal(result)
+	})
+
 	if err != nil {
-		log.Printf("marshal error for %s: %v", key, err)
-		return result, nil // 返回结果但不缓存
+		return nil, err
+	}
+	if data == nil {
+		return nil, nil
 	}
 
-	_ = c.Set(ctx, key, string(data))
+	var result any
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, err
+	}
 	return result, nil
 }
 
-// randomTTL 生成随机 TTL（防雪崩）
-func (c *Cache) randomTTL() time.Duration {
-	jitterMs := rand.Intn(int(c.cfg.Jitter.Milliseconds()))
-	return c.cfg.BaseTTL + time.Duration(jitterMs-int(c.cfg.Jitter.Milliseconds())/2)*time.Millisecond
+// Invalidate 使缓存失效
+func (c *Cache) Invalidate(ctx context.Context, key string) error {
+	if c.client == nil {
+		return nil
+	}
+	return c.client.Del(ctx, key).Err()
 }
 
-// InvalidatePattern 清除匹配的缓存键（发布失效事件）
-//
-// 用法：
-//   cache.InvalidatePattern(ctx, "agent:*")  // 清除所有 agent 缓存
+// acquireLock 尝试获取分布式锁（SET NX + TTL）
+func (c *Cache) acquireLock(ctx context.Context, lockKey string) (bool, error) {
+	return c.client.SetNX(ctx, lockKey, "1", c.config.LockTimeout).Result()
+}
+
+// releaseLock 释放分布式锁
+func (c *Cache) releaseLock(ctx context.Context, lockKey string) error {
+	return c.client.Del(ctx, lockKey).Err()
+}
+
+// ttlWithJitter 给 TTL 加随机抖动（防雪崩）
+func (c *Cache) ttlWithJitter(base time.Duration) time.Duration {
+	if c.config.JitterPercent <= 0 {
+		return base
+	}
+	jitter := int64(base) * int64(c.config.JitterPercent) / 100
+	delta := rand.Int63n(jitter*2) - jitter
+	return time.Duration(int64(base) + delta)
+}
+
+// InvalidatePattern 批量删除匹配 pattern 的 key（运维用）
 func (c *Cache) InvalidatePattern(ctx context.Context, pattern string) error {
-	// 用 SCAN 扫出所有匹配的 key，然后删除
+	if c.client == nil {
+		return nil
+	}
+
 	var cursor uint64
 	var keys []string
+
 	for {
-		newKeys, newCursor, err := c.client.Scan(ctx, cursor, pattern, 100).Result()
+		var batch []string
+		var err error
+		batch, cursor, err = c.client.Scan(ctx, cursor, pattern, 100).Result()
 		if err != nil {
-			return err
+			return fmt.Errorf("scan failed: %w", err)
 		}
-		keys = append(keys, newKeys...)
-		cursor = newCursor
+		keys = append(keys, batch...)
 		if cursor == 0 {
 			break
 		}
 	}
 
 	if len(keys) > 0 {
-		return c.Delete(ctx, keys...)
+		return c.client.Del(ctx, keys...).Err()
 	}
 	return nil
-}
-
-// PublishInvalidation 发布缓存失效事件给其他 pod（可选）
-func (c *Cache) PublishInvalidation(ctx context.Context, eventType string, id string) error {
-	msg := fmt.Sprintf("%s:%s", eventType, id)
-	return c.client.Publish(ctx, "cache:invalidate", msg).Err()
 }

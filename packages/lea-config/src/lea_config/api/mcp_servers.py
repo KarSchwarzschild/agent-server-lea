@@ -51,6 +51,7 @@ router = APIRouter(prefix="/mcp-servers", tags=["mcp-servers"])
 class MCPServerCreate(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     description: str = ""
+    category: str = Field(default="general", min_length=1, max_length=50)
     # transport 有唯一合法值，所以给默认值 —— 调用方不该被迫填一个只有一个选项的字段。
     # 仍然保留这个字段是为了让「以后会有别的传输方式」这件事在契约上可见。
     transport: str = Field(default=MCP_TRANSPORT_STREAMABLE_HTTP)
@@ -65,6 +66,7 @@ class MCPServerCreate(BaseModel):
 class MCPServerUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
+    category: Optional[str] = Field(None, min_length=1, max_length=50)
     transport: Optional[str] = None
     endpoint: Optional[str] = Field(None, min_length=1, max_length=500)
     auth_config: Optional[dict] = None
@@ -88,6 +90,7 @@ def _to_dict(s: MCPServer) -> dict:
         "tenant_id": s.tenant_id,
         "name": s.name,
         "description": s.description or "",
+        "category": s.category or "general",
         "owner_scope": s.owner_scope,
         # owner_user_id 以前不在响应里。放开用户私有 server 之后必须给 —— 否则前端
         # 分不出"这是我建的"和"平台建的"，而这两者能不能改是不一样的（_can_edit）。

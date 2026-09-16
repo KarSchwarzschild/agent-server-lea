@@ -1,9 +1,11 @@
 """统一 Agent 路由 — 合并 admin + user 端点。
 
-路径 = 资源（/agents），Auth = 权限（scoped_filter + require）。
-- 普通用户：scoped_filter 限制只能看到 platform + 自己的 agent
-- 管理员：scoped_filter 返回 true()，看到全部
-- admin-only 操作靠 _is_admin() 区分
+路径 = 资源（/agents），Auth = 权限（读用 agent 的 visible_to，写用 _require_mine）。
+- 普通用户：只看到 全局平台层(default) + 本租户共享 + 自己私有 的 agent
+  （见 models/agent.py::visible_to；跟 tool/skill/mcp 的三段式可见性一致，
+   有 default 全局层，不用 authkit 的 scoped_filter —— 那个没有全局逃逸）
+- 平台管理员：看到全部
+- 写操作（改/绑定/分享）靠 _require_mine：只能改自己建的；admin-only 操作靠 _is_admin()
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
-from lea_authkit import Actor, require_actor, scoped_filter
+from lea_authkit import Actor, require_actor
 from lea_config.api._auth_helpers import require_admin
 from lea_config.database import (
     DEFAULT_TENANT_ID,
@@ -24,8 +26,16 @@ from lea_config.database import (
     get_db,
 )
 from lea_config.models.agent import Agent
-from lea_config.models.binding import AgentKbBinding, AgentSkillBinding, AgentToolBinding
+from lea_config.models.agent import visible_to as agent_visible_to
+from lea_config.models.binding import (
+    AgentKbBinding,
+    AgentMcpBinding,
+    AgentSkillBinding,
+    AgentToolBinding,
+)
 from lea_config.models.knowledge import KnowledgeBase
+from lea_config.models.mcp_server import MCPServer
+from lea_config.models.mcp_server import visible_to as mcp_visible_to
 from lea_config.models.skill import Skill
 from lea_config.models.team import AgentTeam, AgentTeamMember
 from lea_config.models.tool import Tool, visible_to
@@ -96,6 +106,11 @@ class BindToolBody(BaseModel):
     enabled: bool = True
 
 
+class BindMcpBody(BaseModel):
+    mcp_server_id: int
+    enabled: bool = True
+
+
 # ── Helpers ────────────────────────────────────────────────
 
 def _is_admin(actor: Actor) -> bool:
@@ -149,8 +164,16 @@ def _get_agent_or_404(db: Session, agent_id: int, actor: Actor) -> Agent:
     agent = db.query(Agent).filter(Agent.id == agent_id).first()
     if agent is None:
         raise HTTPException(404, "Agent not found")
-    # 跨租户 404，同租户放行
-    if not actor.is_platform_admin and agent.tenant_id != actor.tenant_id:
+    # 可见性跟 list_agents 用同一条规则（agent_visible_to）：本租户 + 全局平台层(default)。
+    # 用 in-Python 判定而不是再查一次库——agent 已在手上。跨租户但非全局的一律 404，不泄露存在性。
+    #
+    # 注意这只放开**读**：写路径的 handler 拿到 agent 后还会走 _require_mine（只能改自己建的），
+    # 所以别的租户能看到/召唤一个全局专家，但改不动它。
+    if actor.is_platform_admin:
+        return agent
+    is_global = agent.tenant_id == DEFAULT_TENANT_ID and agent.owner_scope == OWNER_SCOPE_PLATFORM
+    is_own_tenant = agent.tenant_id == actor.tenant_id
+    if not (is_global or is_own_tenant):
         raise HTTPException(404, "Agent not found")
     return agent
 
@@ -168,7 +191,7 @@ def _require_mine(agent: Agent, actor: Actor) -> None:
 # ── Agent CRUD ─────────────────────────────────────────────
 
 @router.get("")
-def list_agents(
+async def list_agents(
     scope: str = "all",
     category: str | None = None,
     search: str | None = None,
@@ -178,9 +201,26 @@ def list_agents(
     db: Session = Depends(get_db),
     actor: Actor = Depends(require_actor),
 ):
+    from lea_config.services.cache import get_agent_list_cache, set_agent_list_cache
+
     is_adm = _is_admin(actor)
 
-    q = db.query(Agent).filter(scoped_filter(actor, Agent))
+    # 只缓存普通用户的简单查询（scope=all, 无过滤条件）
+    cache_key_params = f"{scope}:{category}:{search}:{enabled}:{page}:{page_size}"
+    use_cache = not is_adm and scope == "all" and not category and not search and enabled is None and page == 1
+
+    if use_cache:
+        cached = await get_agent_list_cache(actor.tenant_id, f"{actor.user_id}:{cache_key_params}")
+        if cached is not None:
+            return cached
+
+    # 可见性用 agent 自己的 visible_to（本租户 + 全局平台层 default），不用 authkit 的
+    # scoped_filter —— 后者没有 default 全局逃逸，会把官方公共专家挡在别的租户外面。
+    # 见 models/agent.py::visible_to 的说明。平台管理员看全部。
+    if actor.is_platform_admin:
+        q = db.query(Agent)
+    else:
+        q = db.query(Agent).filter(and_(*agent_visible_to(actor.tenant_id, actor.user_id)))
 
     # 普通用户只看 enabled 的；admin 可通过 enabled 参数过滤
     if not is_adm:
@@ -212,6 +252,10 @@ def list_agents(
         elif scope == "system":
             rows = [a for a in rows if a.is_system]
         result = {"items": [_agent_to_dict(a, actor.user_id) for a in rows]}
+
+    # 缓存普通用户的简单查询结果
+    if use_cache:
+        await set_agent_list_cache(actor.tenant_id, f"{actor.user_id}:{cache_key_params}", result)
 
     return result
 
@@ -265,11 +309,13 @@ def get_agent(
 
 
 @router.post("", status_code=201)
-def create_agent(
+async def create_agent(
     body: AgentCreate,
     db: Session = Depends(get_db),
     actor: Actor = Depends(require_actor),
 ):
+    from lea_config.services.cache import invalidate_agent_cache
+
     # \u67e5\u91cd\u540d
     dup = (
         db.query(Agent)
@@ -297,16 +343,22 @@ def create_agent(
     db.add(agent)
     db.commit()
     db.refresh(agent)
+
+    # \u5931\u6548\u7f13\u5b58
+    await invalidate_agent_cache(actor.tenant_id)
+
     return _agent_to_dict(agent, actor.user_id)
 
 
 @router.put("/{agent_id}")
-def update_agent(
+async def update_agent(
     agent_id: int,
     body: AgentUpdate,
     db: Session = Depends(get_db),
     actor: Actor = Depends(require_actor),
 ):
+    from lea_config.services.cache import invalidate_agent_cache
+
     agent = _get_agent_or_404(db, agent_id, actor)
     _require_mine(agent, actor)
 
@@ -314,20 +366,30 @@ def update_agent(
         setattr(agent, k, v)
     db.commit()
     db.refresh(agent)
+
+    # \u5931\u6548\u7f13\u5b58
+    await invalidate_agent_cache(actor.tenant_id)
+
     return _agent_to_dict(agent, actor.user_id)
 
 
 @router.delete("/{agent_id}")
-def delete_agent(
+async def delete_agent(
     agent_id: int,
     db: Session = Depends(get_db),
     actor: Actor = Depends(require_actor),
 ):
+    from lea_config.services.cache import invalidate_agent_cache
+
     agent = _get_agent_or_404(db, agent_id, actor)
     _require_mine(agent, actor)
 
     db.delete(agent)
     db.commit()
+
+    # \u5931\u6548\u7f13\u5b58
+    await invalidate_agent_cache(actor.tenant_id)
+
     return {"message": "\u5df2\u5220\u9664"}
 
 
@@ -413,6 +475,22 @@ def _share_blockers(
             blockers.append(ShareBlocker(
                 kind="skill", id=s.id, name=s.name,
                 reason=f"私有技能（属于 {s.owner_user_id}），走 /skills/{s.id}/publish 上架",
+            ))
+
+    # MCP server —— 硬拦，跟 tool/skill 同理。整个 server 绑上去，会把它同步出的全部
+    # 工具下发；server 私有而 agent 共享，就是把私有工具的名字/描述/schema 泄给所有
+    # 使用者（internal.py 展开时不再按 user 过滤）。所以私有 server 要先共享到租户。
+    mcp_rows = (
+        db.query(MCPServer)
+        .join(AgentMcpBinding, AgentMcpBinding.mcp_server_id == MCPServer.id)
+        .filter(AgentMcpBinding.agent_id == agent.id)
+        .all()
+    )
+    for m in mcp_rows:
+        if m.owner_scope == OWNER_SCOPE_USER:
+            blockers.append(ShareBlocker(
+                kind="mcp_server", id=m.id, name=m.name,
+                reason=f"私有 MCP server（属于 {m.owner_user_id}），要先共享到租户",
             ))
 
     # 知识库：**只提示不拦**。见上面"安全 vs 可用性"那段。
@@ -842,6 +920,79 @@ def unbind_tool(
     return {"message": "\u5df2\u89e3\u7ed1"}
 
 
+# -- MCP Server Bindings --
+#
+# \u7ed1\u4e00\u4e2a MCP server = \u7528\u5b83\u540c\u6b65\u51fa\u7684**\u5168\u90e8**\u5de5\u5177\u884c\uff0c\u7c92\u5ea6\u8ddf\u4f1a\u8bdd\u7ea7\u6302\u8f7d
+# \uff08session_attachments kind=mcp_server\uff09\u4e00\u81f4\u3002\u5c55\u5f00\u5728 internal.py \u7ec4\u88c5 agent-config \u65f6\u505a\uff0c
+# \u4e0e\u9010\u4e2a tool \u7ed1\uff08agent_tool_bindings\uff09\u7684\u7ed3\u679c\u6309 tool id \u53bb\u91cd\u5408\u5e76\u3002
+
+@router.post("/{agent_id}/mcp")
+def bind_mcp(
+    agent_id: int,
+    body: BindMcpBody,
+    db: Session = Depends(get_db),
+    actor: Actor = Depends(require_actor),
+):
+    agent = _get_agent_or_404(db, agent_id, actor)
+    _require_mine(agent, actor)
+
+    # \u53ef\u89c1\u6027\u8fc7\u6ee4\u8ddf bind_tool \u540c\u6e90\u540c\u7406 \u2014\u2014 \u7f3a\u4e86\u5b83\u5c31\u662f"\u731c\u4e2a id \u628a\u522b\u4eba\u7684 server \u7ed1\u5230\u81ea\u5df1
+    # agent \u4e0a"\uff0c\u800c server \u4e00\u7ed1\u5c31\u628a\u5b83\u540c\u6b65\u51fa\u7684\u5168\u90e8\u5de5\u5177\u540d/\u63cf\u8ff0/schema \u4e0b\u53d1\u3002\u4e09\u5c42\u53ef\u89c1\u6027
+    # \u53ea\u6709\u4e00\u4efd\u5b9e\u73b0\uff08models/mcp_server.py::visible_to\uff09\uff0c\u8ddf /internal/resolve-attachments
+    # \u6302 server \u90a3\u6761\u7528\u7684\u662f\u540c\u4e00\u6761\u89c4\u5219\u3002\u505c\u7528\u7684 server \u4e5f\u4e0d\u80fd\u7ed1\uff08\u7ed1\u4e0a\u4e5f\u4e0d\u4e0b\u53d1\uff09\u3002
+    server = (
+        db.query(MCPServer)
+        .filter(
+            MCPServer.id == body.mcp_server_id,
+            MCPServer.enabled.is_(True),
+            *mcp_visible_to(actor.tenant_id, actor.user_id),
+        )
+        .first()
+    )
+    if server is None:
+        # 404 \u800c\u975e 403\uff1a\u4e0d\u786e\u8ba4"\u8fd9\u4e2a id \u5b58\u5728"\uff0c\u8ddf\u672c\u6587\u4ef6\u5176\u4ed6\u8de8\u5f52\u5c5e\u5206\u652f\u4e00\u81f4\u3002
+        raise HTTPException(404, "mcp server not found")
+
+    existing = (
+        db.query(AgentMcpBinding)
+        .filter_by(agent_id=agent_id, mcp_server_id=body.mcp_server_id)
+        .first()
+    )
+    if existing:
+        existing.enabled = body.enabled
+        db.commit()
+        db.refresh(existing)
+        return {c.name: getattr(existing, c.name) for c in existing.__table__.columns}
+
+    binding = AgentMcpBinding(agent_id=agent_id, **body.model_dump())
+    db.add(binding)
+    db.commit()
+    db.refresh(binding)
+    return {c.name: getattr(binding, c.name) for c in binding.__table__.columns}
+
+
+@router.delete("/{agent_id}/mcp/{mcp_server_id}")
+def unbind_mcp(
+    agent_id: int,
+    mcp_server_id: int,
+    db: Session = Depends(get_db),
+    actor: Actor = Depends(require_actor),
+):
+    agent = _get_agent_or_404(db, agent_id, actor)
+    _require_mine(agent, actor)
+
+    b = (
+        db.query(AgentMcpBinding)
+        .filter_by(agent_id=agent_id, mcp_server_id=mcp_server_id)
+        .first()
+    )
+    if not b:
+        raise HTTPException(404, "Binding not found")
+    db.delete(b)
+    db.commit()
+    return {"message": "\u5df2\u89e3\u7ed1"}
+
+
 # ── All Bindings List (从旧 bindings.py 迁入) ────────────
 
 @router.get("/{agent_id}/bindings")
@@ -854,6 +1005,7 @@ def list_bindings(
     skills = db.query(AgentSkillBinding).filter_by(agent_id=agent_id).all()
     kbs = db.query(AgentKbBinding).filter_by(agent_id=agent_id).all()
     tools = db.query(AgentToolBinding).filter_by(agent_id=agent_id).all()
+    mcp = db.query(AgentMcpBinding).filter_by(agent_id=agent_id).all()
 
     def _row_to_dict(obj):
         return {c.name: getattr(obj, c.name) for c in obj.__table__.columns}
@@ -862,4 +1014,5 @@ def list_bindings(
         "skills": [_row_to_dict(s) for s in skills],
         "knowledge_bases": [_row_to_dict(k) for k in kbs],
         "tools": [_row_to_dict(t) for t in tools],
+        "mcp_servers": [_row_to_dict(m) for m in mcp],
     }

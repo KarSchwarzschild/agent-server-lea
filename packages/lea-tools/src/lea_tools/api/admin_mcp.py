@@ -41,7 +41,12 @@ from sqlalchemy.orm import Session
 
 from lea_tools.db import get_db
 from lea_tools.db.models import MCPServer, Tool
-from lea_tools.executor.mcp_proxy import MCPSession, check_transport
+from lea_tools.executor.mcp_proxy import (
+    MCP_RESOURCE_LIST,
+    MCP_RESOURCE_READ,
+    MCPSession,
+    check_transport,
+)
 from lea_tools.executor.url_guard import check_outbound_url
 
 log = structlog.get_logger(__name__)
@@ -190,11 +195,13 @@ async def sync_mcp_tools(
     session = MCPSession(server.id, server.endpoint, server.auth_config)
 
     try:
-        remote_tools = await session.list_tools()
+        described = await session.describe()
     except Exception as e:
         _record(server, f"{type(e).__name__}: {e}")
         db.commit()
         raise HTTPException(502, f"Failed to connect to MCP server: {e}")
+
+    remote_tools = described["tools"]
 
     tool_filter = server.tool_filter or []
     synced: list[str] = []
@@ -273,6 +280,62 @@ async def sync_mcp_tools(
             ))
         synced.append(full_name)
 
+    # resources → 两个合成工具行。模型只会调 tool，而 MCP 的 resources 是另一套原语
+    # （list/read by URI），所以把"能读资源"这件事投影成两个工具让模型能用它：
+    #
+    #   mcp_{id}_list_resources   无参 → 列出这个 server 有哪些资源（uri + 说明）
+    #   mcp_{id}_read_resource    收 uri → 读回某个资源的内容
+    #
+    # 判据写在 endpoint 列（真 MCP 工具行 endpoint 恒为 NULL）：mcp_call 读到 marker
+    # 就走 resources/* 而不是 call_tool。这两行跟真工具行一样进 synced —— 于是 server
+    # 关掉 resources 能力后，下次 sync 它们不再被 append，自然进 stale 被删掉。
+    #
+    # tool_filter 不管这两个：它过滤的是远端工具名，而这俩是我们合成的、不在远端清单里。
+    if described["supports_resources"]:
+        synth = [
+            (
+                f"mcp_{server.id}_list_resources",
+                MCP_RESOURCE_LIST,
+                "[MCP] 列出该 MCP server 可读的资源（返回 uri 列表，配合 read_resource 使用）",
+                {"type": "object", "properties": {}},
+            ),
+            (
+                f"mcp_{server.id}_read_resource",
+                MCP_RESOURCE_READ,
+                "[MCP] 按 uri 读取一个 MCP 资源的内容（uri 来自 list_resources）",
+                {
+                    "type": "object",
+                    "properties": {
+                        "uri": {"type": "string", "description": "资源 uri，来自 list_resources"}
+                    },
+                    "required": ["uri"],
+                },
+            ),
+        ]
+        for full_name, marker, description, schema in synth:
+            if row := existing.get(full_name):
+                row.schema_json = schema
+                row.description = description
+                row.endpoint = marker
+                row.enabled = True
+                row.owner_scope = server.owner_scope
+                row.owner_user_id = server.owner_user_id
+            else:
+                db.add(Tool(
+                    tenant_id=server.tenant_id,
+                    name=full_name,
+                    display_name=full_name.split("_", 2)[-1],
+                    description=description,
+                    execution_type="mcp",
+                    schema_json=schema,
+                    endpoint=marker,
+                    mcp_server_id=server.id,
+                    owner_scope=server.owner_scope,
+                    owner_user_id=server.owner_user_id,
+                    enabled=True,
+                ))
+            synced.append(full_name)
+
     # 远端已经没有的：删掉。不删的话留下一批调用必然失败的工具，而它们仍然出现在
     # 清单里、仍然能被绑定 —— 模型会去调一个上游已经下线的东西。
     #
@@ -284,6 +347,11 @@ async def sync_mcp_tools(
     server.last_sync_at = datetime.utcnow()
     _record(server, None)
     db.commit()
+
+    # 清除该租户的工具清单缓存（工具行已变化）
+    from lea_tools.services.cache import invalidate_capabilities
+    await invalidate_capabilities(server.tenant_id)
+
     if skipped:
         # 日志 + 响应两处都报。响应给点了同步按钮的人看；日志给"用户说少了个工具"
         # 时的排查用 —— 那种问题用户描述不清，只能靠日志复原。
@@ -301,4 +369,9 @@ async def sync_mcp_tools(
         # 名字加上 mcp_{id}_ 前缀之后超过 tools.name 的宽度，只能跳过（截断会让两个
         # 不同的工具变成同一个名字）。空列表是常态，不是特例。
         "skipped_too_long": skipped,
+        # server 广告了 resources 能力吗、远端列出了几个资源。给前端"这个 server 还能
+        # 读 N 个资源"的展示用，也让真链路验收能直接断言 resources 这条支路跑了。
+        # 合成的两个工具行本身已经在 tools/synced 里，这里报的是**远端资源数**。
+        "supports_resources": described["supports_resources"],
+        "resource_count": len(described["resources"]),
     }

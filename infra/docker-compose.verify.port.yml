@@ -1,0 +1,4 @@
+services:
+  agent-a:
+    ports:
+      - "8082:8100"

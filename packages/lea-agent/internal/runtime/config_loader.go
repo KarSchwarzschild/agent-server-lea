@@ -8,12 +8,48 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"gitlab.ouc-online.com.cn/aibase/agentloop/team"
+	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/cache"
 )
 
 var configServiceURL = getEnv("LEA_CONFIG_URL", "http://localhost:8500")
+
+var (
+	globalCache     *cache.Cache
+	globalCacheOnce sync.Once
+)
+
+// InitCache 初始化全局缓存（从 main.go 调用）
+func InitCache(redisClient *redis.Client) {
+	globalCacheOnce.Do(func() {
+		if redisClient == nil {
+			log.Printf("[cache] Redis client is nil, cache disabled")
+			return
+		}
+		globalCache = cache.New(redisClient, cache.DefaultConfig)
+		log.Printf("[cache] Cache initialized with TTL=%s", cache.DefaultConfig.DefaultTTL)
+	})
+}
+
+// GetCache 返回全局缓存实例（可能为 nil 如果 Redis 不可用）
+func GetCache() *cache.Cache {
+	return globalCache
+}
+
+// SetConfigServiceURLForTest 把 lea-config 的地址指向一个假上游，返回恢复函数。
+//
+// 只给测试用。runtime 包内的测试直接改 configServiceURL 就行（同包），但 router
+// 包的测试够不着那个私有变量 —— 而建会话必打 /internal/agent-config，没有这个钩子
+// 那边就只能起真服务或者跳过不验。
+func SetConfigServiceURLForTest(u string) func() {
+	old := configServiceURL
+	configServiceURL = u
+	return func() { configServiceURL = old }
+}
 
 type ToolDef struct {
 	Name        string `json:"name"`
@@ -162,6 +198,40 @@ var httpClient = &http.Client{Timeout: 10 * time.Second}
 // H2：agentID=0（前端硬编码 super-agent）时，lea-config 会兜底到 tenant super-agent，
 // 返回的 cfg.ID 是解析后的真实 agent 主键。
 func LoadAgentConfig(ctx context.Context, agentID int, tenantID string) (*AgentConfig, error) {
+	// 降级保护：缓存未初始化时直接回源
+	if globalCache == nil {
+		return loadAgentConfigFromSource(ctx, agentID, tenantID)
+	}
+
+	// 缓存键：agent:{id}:{tenant}
+	cacheKey := fmt.Sprintf("agent:%d:%s", agentID, tenantID)
+
+	// 通过缓存加载
+	data, err := globalCache.GetOrLoad(ctx, cacheKey, func(ctx context.Context) ([]byte, error) {
+		cfg, err := loadAgentConfigFromSource(ctx, agentID, tenantID)
+		if err != nil {
+			return nil, err
+		}
+		return json.Marshal(cfg)
+	})
+
+	if err != nil {
+		return nil, err
+	}
+	if data == nil {
+		return nil, fmt.Errorf("agent %d not found for tenant %s", agentID, tenantID)
+	}
+
+	var cfg AgentConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("cache data unmarshal failed: %w", err)
+	}
+
+	return &cfg, nil
+}
+
+// loadAgentConfigFromSource 从 lea-config 加载配置（原 LoadAgentConfig 逻辑）
+func loadAgentConfigFromSource(ctx context.Context, agentID int, tenantID string) (*AgentConfig, error) {
 	url := fmt.Sprintf("%s/internal/agent-config/%d?tenant_id=%s", configServiceURL, agentID, tenantID)
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {

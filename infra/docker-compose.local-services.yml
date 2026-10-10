@@ -18,6 +18,13 @@ services:
     extra_hosts:
       - host.docker.internal:host-gateway
 
+  agent-worker:
+    environment:
+      LEA_INTERNAL_TOKEN: local-dev-internal-token
+      LEA_CONFIG_URL: http://config:8500
+      LEA_RAG_URL: http://rag:8300
+      REDIS_URL: redis://redis:6379/0
+
   config:
     environment:
       LEA_INTERNAL_TOKEN: local-dev-internal-token

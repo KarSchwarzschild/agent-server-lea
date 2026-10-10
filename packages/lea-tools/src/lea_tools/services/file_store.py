@@ -64,6 +64,42 @@ SKILL_MOUNT = "/opt/skills"
 # 路径约定不一致，排查会绕远。所以别在任何地方硬写这个字符串。
 UPLOADS_MOUNT = "/mnt/uploads"
 
+# workspace 本身在沙箱里的挂载点（nfs_provisioner.py 的 mountPath，同一个
+# 字符串，这里没法直接 import 常量共用——两个服务是分开部署的，只能各自
+# 硬写、靠注释互相指路）。
+#
+# 为什么需要这个：Bash 工具跑在沙箱容器里，模型在那边天然会用 "/workspace/x"
+# 这种绝对路径（因为那是真实存在的挂载点）；但 Write/Edit/Read 这几个文件
+# 工具的 rel_path 参数要的是**相对于这个会话 workspace 根目录**的相对路径——
+# 两套约定字面上都叫 "workspace"，模型很容易搞混，把 bash 那套绝对路径习惯
+# 带过来。
+#
+# 不处理这个案例的后果：Python 的 pathlib 里 `/` 拼接一旦右边是绝对路径就会
+# 直接丢掉左边只保留右边（语言本身的既定行为），于是 `self._ws / "/workspace/x"`
+# 算出来的是 "/workspace/x" 本身，完全绕开了真正的 workspace 根，然后被下面
+# 的越界检查正确拒绝——但那句报错听起来像安全拦截，模型很难只凭"路径越界"
+# 四个字猜到"我应该去掉前面这段 /workspace/"，往往会换几种写法反复重试，
+# 白白烧掉本来就紧张的 ReAct 轮次预算（多文件任务比如生成 PPT，本来就要
+# 写好几个文件，max_turns 撞得更快）。
+WORKSPACE_MOUNT = "/workspace"
+
+
+def _normalize_rel_path(rel_path: str) -> str:
+    """把模型可能传来的"沙箱视角的绝对路径"标准化成 workspace 根下的相对路径。
+
+    两种写法都认，模型不需要自己纠正：
+
+        /workspace              ->  .
+        /workspace/slides/a.js  ->  slides/a.js
+        slides/a.js             ->  slides/a.js（本来就是相对路径，原样返回）
+    """
+    stripped = rel_path.strip()
+    if stripped == WORKSPACE_MOUNT:
+        return "."
+    if stripped.startswith(WORKSPACE_MOUNT + "/"):
+        return stripped[len(WORKSPACE_MOUNT) + 1 :]
+    return rel_path
+
 
 @dataclass
 class FileEntry:
@@ -294,6 +330,7 @@ class NFSFileStore:
         同级目录名以 workspace 开头，而 session 目录由 provisioner 建），但写侧复用
         同一个检查就是可写逃逸了。
         """
+        rel_path = _normalize_rel_path(rel_path)
         root = self._ws.resolve()
         target = (self._ws / rel_path).resolve()
         if target != root and not target.is_relative_to(root):
@@ -520,6 +557,11 @@ class SandboxFileStore:
 
     @staticmethod
     def _check(rel_path: str) -> str:
+        # 同样的"模型把 bash 那套 /workspace 绝对路径习惯带进来"的问题，见
+        # _normalize_rel_path 顶部的说明——这里的沙箱路径本来就长
+        # "/workspace/x"，所以不是拼接出错，而是干脆先把这个前缀剥掉再走后面
+        # 的越界检查，两种写法都认。
+        rel_path = _normalize_rel_path(rel_path)
         if rel_path.startswith("/") or ".." in rel_path.split("/"):
             raise PermissionError("path escapes workspace")
         return f"/workspace/{rel_path}"

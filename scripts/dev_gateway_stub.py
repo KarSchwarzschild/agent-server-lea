@@ -49,6 +49,7 @@ ISSUER = f"http://host.docker.internal:{PORT}"
 KID = "lea-dev-key-1"
 USER_ID = "lab-dev-user"
 TENANT_ID = "default"
+ROLE = "user"
 
 KEY_PATH = pathlib.Path(__file__).resolve().parent.parent / "infra" / ".dev-oidc-key.pem"
 
@@ -99,10 +100,21 @@ def mint(key: rsa.RSAPrivateKey, days: int = 7) -> str:
     )
 
 
-MEMBERSHIP = {"data": [{
-    "tenantId": TENANT_ID, "tenantType": "normal",
-    "role": "Member", "userTenantRoleName": "成员", "disabled": False,
-}]}
+def membership() -> dict:
+    if ROLE == "platform_admin":
+        return {"data": [{
+            "tenantId": TENANT_ID, "tenantType": "super",
+            "role": "Master", "userTenantRoleName": "管理者", "disabled": False,
+        }]}
+    if ROLE == "admin":
+        return {"data": [{
+            "tenantId": TENANT_ID, "tenantType": "normal",
+            "role": "Master", "userTenantRoleName": "管理者", "disabled": False,
+        }]}
+    return {"data": [{
+        "tenantId": TENANT_ID, "tenantType": "normal",
+        "role": "Member", "userTenantRoleName": "成员", "disabled": False,
+    }]}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -113,7 +125,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/jwks.json":
             body = jwks(self.key)
         elif path == "/api/TenantUser/CurrUserTenants":
-            body = MEMBERSHIP
+            body = membership()
         else:
             self.send_error(404)
             return
@@ -129,9 +141,17 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    global ROLE, USER_ID, TENANT_ID
     parser = argparse.ArgumentParser()
     parser.add_argument("--mint", action="store_true", help="只打印一个 token 就退出")
+    parser.add_argument("--role", choices=("user", "admin", "platform_admin"), default="user")
+    parser.add_argument("--user-id", default=USER_ID)
+    parser.add_argument("--tenant-id", default=TENANT_ID)
     args = parser.parse_args()
+
+    ROLE = args.role
+    USER_ID = args.user_id
+    TENANT_ID = args.tenant_id
 
     key = _load_key()
     if args.mint:

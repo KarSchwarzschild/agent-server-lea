@@ -162,7 +162,7 @@ def list_tools(
     )
     total = q.count()
     items = q.order_by(Tool.id).offset((page - 1) * page_size).limit(page_size).all()
-    return {"total": total, "items": [_row_to_dict(t) for t in items]}
+    return {"total": total, "items": [_row_to_dict(t, actor) for t in items]}
 
 
 @router.post("", status_code=201)
@@ -201,7 +201,7 @@ async def create_tool(
     # 清除 lea-tools 的工具清单缓存
     await _invalidate_tool_cache(actor.tenant_id)
 
-    return _row_to_dict(tool)
+    return _row_to_dict(tool, actor)
 
 
 @router.put("/{tool_id}")
@@ -225,7 +225,7 @@ async def update_tool(
     # 清除 lea-tools 的工具清单缓存
     await _invalidate_tool_cache(actor.tenant_id)
 
-    return _row_to_dict(tool)
+    return _row_to_dict(tool, actor)
 
 
 @router.delete("/{tool_id}", status_code=204)
@@ -337,5 +337,23 @@ def _load(db: Session, tool_id: int) -> Tool:
     return tool
 
 
-def _row_to_dict(obj) -> dict:
-    return {c.name: getattr(obj, c.name) for c in obj.__table__.columns}
+def _row_to_dict(obj, actor: Actor) -> dict:
+    data = {c.name: getattr(obj, c.name) for c in obj.__table__.columns}
+    can_edit = actor.is_platform_admin or (
+        obj.tenant_id == actor.tenant_id
+        and (
+            actor.is_tenant_admin
+            or (obj.owner_scope == OWNER_SCOPE_USER and obj.owner_user_id == actor.user_id)
+        )
+    )
+    data["publication_status"] = (
+        "draft"
+        if obj.owner_scope == OWNER_SCOPE_USER
+        else ("active" if obj.enabled else "suspended")
+    )
+    data["allowed_actions"] = ["read"]
+    if can_edit:
+        data["allowed_actions"].extend(["update", "delete", "run_check"])
+    if obj.owner_scope == OWNER_SCOPE_USER and can_edit:
+        data["allowed_actions"].append("submit_publication")
+    return data

@@ -118,6 +118,9 @@ export type AgentInfo = {
   avatar?: string
   model?: string
   is_mine?: boolean
+  // 乐观并发控制用——保存时原样带回去当 expected_updated_at，见
+  // updateAgent 的说明。没有这个字段（老缓存数据）就不校验。
+  updated_at?: string
 }
 
 export type TeamInfo = {
@@ -129,6 +132,7 @@ export type TeamInfo = {
   decomposer_prompt?: string
   synthesizer_prompt?: string
   max_subtasks?: number
+  updated_at?: string
 }
 
 export type TeamMember = {
@@ -194,6 +198,14 @@ export type KnowledgeBaseItem = {
   retrieval_mode?: string
   retrieval_top_k?: number
   score_threshold?: number
+  embedding_model?: string
+  embedding_dim?: number
+  reranker_model?: string
+  reranker_enabled?: boolean
+  vlm_model?: string
+  vlm_enabled?: boolean
+  multimodal?: boolean
+  updated_at?: string
 }
 
 export type KnowledgeDocument = {
@@ -288,7 +300,11 @@ export const listAgents = () => request<{ items?: AgentInfo[] } | AgentInfo[]>('
 export const createAgent = (payload: { name: string; description: string; category: string; soul_prompt: string; model?: string }) => request<AgentInfo>('/api/user/agents', {
   method: 'POST', body: JSON.stringify(payload), headers: { 'Content-Type': 'application/json' }
 })
-export const updateAgent = (agentId: number, payload: { name?: string; description?: string; category?: string; soul_prompt?: string; model?: string }) => request<AgentInfo>(`/api/user/agents/${agentId}`, {
+// expected_updated_at：乐观并发控制，传上一次读到的 updated_at 原样带回去。
+// 省略=不检查（旧调用点兼容）。带了但跟数据库当前值不一致时后端返 409——
+// 后端只用了 HTTPException(409, "纯字符串")，没有专门的 code，调用方按
+// error.status === 409 分支，不要指望 error.code。
+export const updateAgent = (agentId: number, payload: { name?: string; description?: string; category?: string; soul_prompt?: string; model?: string; expected_updated_at?: string }) => request<AgentInfo>(`/api/user/agents/${agentId}`, {
   method: 'PUT', body: JSON.stringify(payload), headers: { 'Content-Type': 'application/json' }
 })
 export const deleteAgent = (agentId: number) => request<{ message: string }>(`/api/user/agents/${agentId}`, { method: 'DELETE' })
@@ -355,7 +371,7 @@ export const listTeams = () => request<{ items: TeamInfo[] }>('/api/user/teams?p
 export const createTeam = (payload: { agent_id: number; strategy: string; decomposer_prompt: string; synthesizer_prompt: string; max_subtasks: number }) => request<TeamInfo>('/api/user/teams', {
   method: 'POST', body: JSON.stringify(payload), headers: { 'Content-Type': 'application/json' }
 })
-export const updateTeam = (teamId: number, payload: { strategy?: string; decomposer_prompt?: string; synthesizer_prompt?: string; max_subtasks?: number }) => request<TeamInfo>(`/api/user/teams/${teamId}`, {
+export const updateTeam = (teamId: number, payload: { strategy?: string; decomposer_prompt?: string; synthesizer_prompt?: string; max_subtasks?: number; expected_updated_at?: string }) => request<TeamInfo>(`/api/user/teams/${teamId}`, {
   method: 'PUT', body: JSON.stringify(payload), headers: { 'Content-Type': 'application/json' }
 })
 export const deleteTeam = (teamId: number) => request<void>(`/api/user/teams/${teamId}`, { method: 'DELETE' })
@@ -365,10 +381,38 @@ export const addTeamMember = (teamId: number, payload: { member_agent_id: number
 })
 export const removeTeamMember = (teamId: number, memberId: number) => request<void>(`/api/user/teams/${teamId}/members/${memberId}`, { method: 'DELETE' })
 export const listKnowledgeBases = () => request<{ knowledge_bases: KnowledgeBaseItem[] }>('/api/user/knowledge-bases?page=1&size=50')
-export const createKnowledgeBase = (payload: { name: string; description: string; visibility: string }) => request<KnowledgeBaseItem>('/api/user/knowledge-bases', {
+export const createKnowledgeBase = (payload: {
+  name: string
+  description: string
+  visibility: string
+  embedding_model?: string
+  reranker_model?: string
+  reranker_enabled?: boolean
+  vlm_model?: string
+  vlm_enabled?: boolean
+  multimodal?: boolean
+}) => request<KnowledgeBaseItem>('/api/user/knowledge-bases', {
   method: 'POST', body: JSON.stringify(payload), headers: { 'Content-Type': 'application/json' }
 })
-export const updateKnowledgeBase = (kbId: number, payload: { name?: string; description?: string; visibility?: string; retrieval_mode?: string; retrieval_top_k?: number; score_threshold?: number; enabled?: boolean }) => request<KnowledgeBaseItem>(`/api/user/knowledge-bases/${kbId}`, {
+// embedding_model/embedding_dim 类型层面允许传，但后端只在 document_count===0
+// 时真的接受，否则 400——前端按 document_count 禁用输入框，不在类型层面禁止。
+export const updateKnowledgeBase = (kbId: number, payload: {
+  name?: string
+  description?: string
+  visibility?: string
+  retrieval_mode?: string
+  retrieval_top_k?: number
+  score_threshold?: number
+  enabled?: boolean
+  embedding_model?: string
+  embedding_dim?: number
+  reranker_model?: string
+  reranker_enabled?: boolean
+  vlm_model?: string
+  vlm_enabled?: boolean
+  multimodal?: boolean
+  expected_updated_at?: string
+}) => request<KnowledgeBaseItem>(`/api/user/knowledge-bases/${kbId}`, {
   method: 'PUT', body: JSON.stringify(payload), headers: { 'Content-Type': 'application/json' }
 })
 export const deleteKnowledgeBase = (kbId: number) => request<{ message: string }>(`/api/user/knowledge-bases/${kbId}`, { method: 'DELETE' })
@@ -401,6 +445,13 @@ export type ChatModel = { name: string; provider: string; is_default: boolean; c
 // 列表可能是空的（租户没配 llm_providers）。那时候选择器必须仍然允许手输，
 // 否则连模型都设不了，比没有列表更糟。
 export const listChatModels = () => request<{ items: ChatModel[] }>('/api/user/llm-models')
+
+export type RetrievalModel = { name: string; model_type: string; model_name: string; dimension?: number; is_default: boolean }
+
+// listRetrievalModels 给知识库建库/改库表单的 embedding/reranker/vlm 下拉供数，
+// 跟 listChatModels 是同一个问题的同一个修法：自由文本打错字会静默落到默认模型。
+export const listRetrievalModels = (modelType?: 'embedding' | 'reranker' | 'vlm') =>
+  request<{ items: RetrievalModel[] }>(`/api/user/retrieval-models${modelType ? `?model_type=${modelType}` : ''}`)
 
 export type PublishRequest = {
   id: number
@@ -561,7 +612,15 @@ export async function downloadAttachment(id: number) {
 }
 
 export async function sendMessageStream(
-  payload: { session_id?: string; agent_id: number; project_id?: number; message: string; attachment_ids?: number[]; plan_mode?: boolean; plan_action?: string },
+  payload: {
+    session_id?: string; agent_id: number; project_id?: number; message: string
+    attachment_ids?: number[]; plan_mode?: boolean; plan_action?: string
+    // 完整替换语义——每次都发这条会话现在该有的完整清单（已挂载 + 这一轮新选的），
+    // 不是"这次要新增的增量"。省略这个字段=不动现有挂载（后端按 nil 处理，
+    // 兼容不知道这个字段的旧客户端），带了就整体替换，见 lea-agent 里
+    // SendRequest.Attachments 的说明。
+    attachments?: { kind: SessionAttachment['kind']; ref_id: number }[]
+  },
   onEvent: (event: ChatEvent) => void
 ) {
   const controller = new AbortController()
@@ -573,8 +632,16 @@ export async function sendMessageStream(
   })
   if (!response.ok || !response.body) {
     let detail = ''
-    try { detail = (await response.json()).error || '' } catch { /* plain text response */ }
-    throw new Error(detail || `stream failed: ${response.status}`)
+    let code = ''
+    try {
+      const body = await response.json()
+      detail = body.error || ''
+      code = body.code || ''
+    } catch { /* plain text response */ }
+    // 用 ApiError（带 code）而不是裸 Error——跟 resumeMessageStream 保持一致，
+    // 否则 session_archived（会话已被删除）这类需要专门分支处理的错误，
+    // 调用方只能拿字符串去匹配中文文案，文案一改就失效。
+    throw new ApiError(detail || `stream failed: ${response.status}`, response.status, code)
   }
 
   void consumeSse(response.body, onEvent, controller.signal)

@@ -36,6 +36,19 @@ data:
   LEA_AGENT_DRAIN_TIMEOUT: "3m"
   LEA_AGENT_PRESTOP_DELAY: "5s"
 
+  # 单轮 Run 的总执行上限。它跟 HTTP/SSE 连接超时无关：客户端断线后任务仍可继续，
+  # 但模型/工具链不能无限循环。超时会落为 timed_out 并执行正常收尾。
+  LEA_AGENT_RUN_TIMEOUT: "30m"
+
+  # 长任务调度。先部署 Temporal 和 lea-agent-worker，再把 inline 改为 temporal。
+  # Temporal 保存工作流和调度状态；MySQL 保存产品可见的 run 状态；Redis 保存 SSE 事件。
+  LEA_AGENT_EXECUTION_MODE: "inline"
+  TEMPORAL_ADDRESS: "temporal-frontend.temporal.svc.cluster.local:7233"
+  TEMPORAL_NAMESPACE: "default"
+  LEA_AGENT_TEMPORAL_TASK_QUEUE: "lea-agent-runs"
+  LEA_AGENT_DISPATCH_INTERVAL: "2s"
+  LEA_AGENT_RETRY_LOCK_WAIT: "75s"
+
   # 事件日志（断线续传用，见 docs/FRONTEND_API.md）。
   # 逐 token 写，所以 MAXLEN 直接等于"最多能回放多少个事件"。10000 大约 1MB/会话。
   # 调小的后果是长回答的开头被挤掉，客户端 from=0 补到的正文缺开头 —— 不报错。

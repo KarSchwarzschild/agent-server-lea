@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/sony/gobreaker"
 	"gitlab.ouc-online.com.cn/aibase/agentloop/tool"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/breaker"
+	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/metrics"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/persistence"
 )
 
@@ -448,6 +450,7 @@ func (t *KBSearchTool) Run(ctx context.Context, input json.RawMessage, tctx *too
 	body, _ := json.Marshal(payload)
 
 	// 通过熔断器执行 HTTP 调用
+	kbStart := time.Now()
 	result, err := kbBreaker.Execute(func() (interface{}, error) {
 		req, _ := http.NewRequestWithContext(ctx, "POST",
 			ragServiceURL+"/kb/search", strings.NewReader(string(body)))
@@ -471,6 +474,7 @@ func (t *KBSearchTool) Run(ctx context.Context, input json.RawMessage, tctx *too
 
 	// 熔断器打开：降级返回
 	if err == gobreaker.ErrOpenState {
+		metrics.RecordDownstreamCall("kb", "degraded", time.Since(kbStart))
 		emitToolResult(out, t.Name(), tctx.ToolUseID, "KB 熔断器打开，已降级", nil)
 		return tool.Result{Content: []tool.ResultContent{
 			{Type: tool.ResultContentTypeText, Text: "知识库服务熔断中，请稍后重试或继续对话。"},
@@ -479,11 +483,13 @@ func (t *KBSearchTool) Run(ctx context.Context, input json.RawMessage, tctx *too
 
 	// HTTP 错误或其他失败：降级返回
 	if err != nil {
+		metrics.RecordDownstreamCall("kb", "error", time.Since(kbStart))
 		emitToolResult(out, t.Name(), tctx.ToolUseID, fmt.Sprintf("KB 服务不可用: %v", err), nil)
 		return tool.Result{Content: []tool.ResultContent{
 			{Type: tool.ResultContentTypeText, Text: "知识库暂时不可用，请稍后重试或继续对话。"},
 		}}, nil
 	}
+	metrics.RecordDownstreamCall("kb", "ok", time.Since(kbStart))
 
 	// 成功：解析结果
 	resultJSON := result.(json.RawMessage)
@@ -557,6 +563,7 @@ func (t *MemorySearchTool) Run(ctx context.Context, input json.RawMessage, tctx 
 	body, _ := json.Marshal(payload)
 
 	// 通过熔断器执行 HTTP 调用
+	memSearchStart := time.Now()
 	result, err := memoryBreaker.Execute(func() (interface{}, error) {
 		req, _ := http.NewRequestWithContext(ctx, "POST",
 			ragServiceURL+"/memory/search", strings.NewReader(string(body)))
@@ -579,6 +586,7 @@ func (t *MemorySearchTool) Run(ctx context.Context, input json.RawMessage, tctx 
 
 	// 熔断器打开：降级返回
 	if err == gobreaker.ErrOpenState {
+		metrics.RecordDownstreamCall("memory", "degraded", time.Since(memSearchStart))
 		emitToolResult(out, t.Name(), tctx.ToolUseID, "记忆熔断器打开，已降级", nil)
 		return tool.Result{Content: []tool.ResultContent{
 			{Type: tool.ResultContentTypeText, Text: "记忆服务熔断中，请稍后重试或继续对话。"},
@@ -587,11 +595,13 @@ func (t *MemorySearchTool) Run(ctx context.Context, input json.RawMessage, tctx 
 
 	// HTTP 错误或其他失败：降级返回
 	if err != nil {
+		metrics.RecordDownstreamCall("memory", "error", time.Since(memSearchStart))
 		emitToolResult(out, t.Name(), tctx.ToolUseID, fmt.Sprintf("记忆服务不可用: %v", err), nil)
 		return tool.Result{Content: []tool.ResultContent{
 			{Type: tool.ResultContentTypeText, Text: "记忆服务暂时不可用，请稍后重试或继续对话。"},
 		}}, nil
 	}
+	metrics.RecordDownstreamCall("memory", "ok", time.Since(memSearchStart))
 
 	// 成功：解析结果
 	resultJSON := result.(json.RawMessage)
@@ -657,6 +667,7 @@ func (t *MemoryAddTool) Run(ctx context.Context, input json.RawMessage, tctx *to
 	body, _ := json.Marshal(payload)
 
 	// 通过熔断器执行 HTTP 调用
+	memAddStart := time.Now()
 	_, err := memoryBreaker.Execute(func() (interface{}, error) {
 		req, _ := http.NewRequestWithContext(ctx, "POST",
 			ragServiceURL+"/memory/add", strings.NewReader(string(body)))
@@ -677,6 +688,7 @@ func (t *MemoryAddTool) Run(ctx context.Context, input json.RawMessage, tctx *to
 
 	// 熔断器打开：降级返回
 	if err == gobreaker.ErrOpenState {
+		metrics.RecordDownstreamCall("memory", "degraded", time.Since(memAddStart))
 		emitToolResult(out, t.Name(), tctx.ToolUseID, "记忆熔断器打开，保存失败", nil)
 		return tool.Result{Content: []tool.ResultContent{
 			{Type: tool.ResultContentTypeText, Text: "记忆服务熔断中，保存失败，但对话可以继续。"},
@@ -685,11 +697,13 @@ func (t *MemoryAddTool) Run(ctx context.Context, input json.RawMessage, tctx *to
 
 	// HTTP 错误或其他失败：降级返回
 	if err != nil {
+		metrics.RecordDownstreamCall("memory", "error", time.Since(memAddStart))
 		emitToolResult(out, t.Name(), tctx.ToolUseID, fmt.Sprintf("记忆服务不可用: %v", err), nil)
 		return tool.Result{Content: []tool.ResultContent{
 			{Type: tool.ResultContentTypeText, Text: "记忆服务暂时不可用，保存失败，但对话可以继续。"},
 		}}, nil
 	}
+	metrics.RecordDownstreamCall("memory", "ok", time.Since(memAddStart))
 
 	// 成功
 	preview := params.Content

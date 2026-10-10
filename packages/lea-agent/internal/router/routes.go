@@ -1,27 +1,51 @@
 package router
 
 import (
+	"context"
 	"log"
 	"os"
 
 	"github.com/gin-gonic/gin"
+	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/middleware"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/session"
+	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/temporalrun"
 )
 
+type RunCoordinator interface {
+	Dispatch(context.Context, temporalrun.Input) error
+	Cancel(context.Context, string) error
+}
+
 func RegisterRoutes(api *gin.RouterGroup, mgr *session.Manager) {
+	RegisterRoutesWithCoordinator(api, mgr, nil)
+}
+
+func RegisterRoutesWithCoordinator(api *gin.RouterGroup, mgr *session.Manager, coordinator RunCoordinator) {
+	// HTTP 指标：记录每条请求的耗时和状态码，暴露到 /metrics。
+	api.Use(middleware.Metrics())
+
+	operations := api.Group("/operations")
+	{
+		operations.GET("/runs", handleListOperationRuns())
+		operations.GET("/runs/:run_id", handleGetOperationRun())
+		operations.POST("/runs/:run_id/cancel", handleCancelOperationRun(coordinator))
+		operations.POST("/runs/:run_id/retry", handleRetryOperationRun(coordinator))
+	}
+
 	chat := api.Group("/chat")
 	{
 		// 主链路：发消息 + 同连接回 SSE。多副本下唯一不需要会话亲和的形状。
-		chat.POST("/stream", handleSendStream(mgr))
+		chat.POST("/stream", handleSendStream(mgr, coordinator))
 		// 断线重连入口。POST /stream 是单连接，断了没法重接（重发 POST 会真的再问
 		// 一遍），所以重连必须走这条：带 ?from=<最后收到的 id> 从事件日志补齐再接直播。
 		// 配了 REDIS_URL 时它不需要会话亲和；没配时退回内存订阅（单实例的正确行为）。
 		chat.GET("/stream/:session_id", handleStreamResume(mgr))
 		// 两段式链路的发送端，保留给尚未迁移的客户端。
-		chat.POST("/send", handleSend(mgr))
-		chat.POST("/stop/:session_id", handleStop(mgr))
+		chat.POST("/send", handleSend(mgr, coordinator))
+		chat.POST("/stop/:session_id", handleStop(mgr, coordinator))
 		// 断流之后前端靠它判断"还在生成"还是"已经结束"。跨副本有效。
-		chat.GET("/status/:session_id", handleTurnStatus(mgr))
+		chat.GET("/status/:session_id", handleTurnStatus(mgr, coordinator))
+		chat.GET("/runs/:run_id", handleGetRun())
 		chat.POST("/attachments/upload", handleUploadAttachment())
 		// 取回用户上传的原件。走 attachment_id 而不是路径：原件的权威位置是 OBS 上的
 		// blob，会话归档后 NFS 那份已经清理掉了、blob 还在。见 handleDownloadAttachment。

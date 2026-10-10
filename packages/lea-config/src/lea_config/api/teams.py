@@ -5,6 +5,7 @@ AgentTeam 无 TenantMixin，通过 agent.tenant_id 间接约束。
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -36,6 +37,9 @@ class TeamUpdate(BaseModel):
     decomposer_prompt: Optional[str] = None
     synthesizer_prompt: Optional[str] = None
     max_subtasks: Optional[int] = None
+    # 乐观并发控制：跟 lea-config 的 agents.py、lea-rag 的 server_user_kb.py
+    # 同一个模式，那边有完整说明。省略=不检查（旧客户端兼容）。
+    expected_updated_at: Optional[datetime] = None
 
 
 class MemberCreate(BaseModel):
@@ -51,11 +55,36 @@ def _row_to_dict(obj) -> dict:
 
 
 def _ensure_team_tenant(db: Session, team: AgentTeam, actor: Actor) -> None:
-    """通过 team.agent_id → Agent.tenant_id 链路校验租户归属。"""
+    """写操作用的严格租户校验：只有团长 agent 明确属于当前租户才放行。
+
+    故意比 `_ensure_team_visible` 严——全局(default)/共享团只读，改不动，跟
+    `agent.py::visible_to` 文档里"这条规则只管读，改的归属另有 _require_mine 把关"
+    是同一个道理，只是 Team 没有自己的 created_by，退化成按团长 agent 的租户卡。
+    """
     if actor.is_platform_admin:
         return
     agent = db.query(Agent).filter(Agent.id == team.agent_id).first()
     if not agent or agent.tenant_id != actor.tenant_id:
+        raise HTTPException(404, "Team not found")
+
+
+def _ensure_team_visible(db: Session, team: AgentTeam, actor: Actor) -> None:
+    """读操作用的可见性校验，必须跟 `list_teams` 那条规则完全一致。
+
+    之前 `list_members` 复用的是上面写操作的 `_ensure_team_tenant`（严格
+    tenant_id 相等），比 `list_teams` 用的 `agent_visible_to`（本租户 + 共享 +
+    全局平台层）更严——于是团长 agent 是全局/共享的团，能在列表里看到、点进
+    "成员配置"却 404，前端吞掉这个错误后就表现成"看不到任何成员"。这里的可见性
+    必须跟能不能列出这个团保持一致，否则永远是一个能看见入口、进去就报错的死角。
+    """
+    if actor.is_platform_admin:
+        return
+    agent = (
+        db.query(Agent)
+        .filter(Agent.id == team.agent_id, and_(*agent_visible_to(actor.tenant_id, actor.user_id)))
+        .first()
+    )
+    if not agent:
         raise HTTPException(404, "Team not found")
 
 
@@ -128,7 +157,13 @@ def update_team(
     if not team:
         raise HTTPException(404, "Team not found")
     _ensure_team_tenant(db, team, actor)
-    for k, v in body.model_dump(exclude_unset=True).items():
+    fields = body.model_dump(exclude_unset=True)
+    expected = fields.pop("expected_updated_at", None)
+    if expected is not None:
+        current = team.updated_at.replace(microsecond=0) if team.updated_at else None
+        if current != expected.replace(microsecond=0):
+            raise HTTPException(409, "该专家团已被修改，请刷新后重试")
+    for k, v in fields.items():
         setattr(team, k, v)
     db.commit()
     db.refresh(team)
@@ -160,7 +195,7 @@ def list_members(
     team = db.query(AgentTeam).filter(AgentTeam.id == team_id).first()
     if not team:
         raise HTTPException(404, "Team not found")
-    _ensure_team_tenant(db, team, actor)
+    _ensure_team_visible(db, team, actor)
     members = db.query(AgentTeamMember).filter(AgentTeamMember.team_id == team_id).all()
     return {"items": [_row_to_dict(member) for member in members]}
 

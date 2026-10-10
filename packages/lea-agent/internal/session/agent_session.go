@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"reflect"
 	"strings"
 	"sync"
@@ -16,12 +17,14 @@ import (
 	"github.com/google/uuid"
 	engine "gitlab.ouc-online.com.cn/aibase/agentloop"
 	"gitlab.ouc-online.com.cn/aibase/agentloop/llm"
+	enginesessions "gitlab.ouc-online.com.cn/aibase/agentloop/sessions"
 	"gitlab.ouc-online.com.cn/aibase/agentloop/team"
 	"gitlab.ouc-online.com.cn/aibase/agentloop/tool"
 	"gitlab.ouc-online.com.cn/aibase/agentloop/turn"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/control"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/eventlog"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/lock"
+	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/metrics"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/persistence"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/runtime"
 )
@@ -81,6 +84,7 @@ type AgentSession struct {
 	turnCancel  context.CancelFunc
 	turnEpoch   uint64
 	turnStopped bool
+	turnRunID   string
 
 	// locker 是跨 pod 的执行权。存成字段而不是每次调 lock.Shared()，是为了让测试
 	// 能在同一个二进制里同时覆盖"有 Redis"和"没 Redis"两条路 —— Shared() 是
@@ -151,6 +155,14 @@ func (s *AgentSession) Touch() {
 	s.activeMu.Lock()
 	s.lastActive = time.Now()
 	s.activeMu.Unlock()
+}
+
+func (s *AgentSession) ExecutionParams() (int, *int) {
+	if s.projectID == nil {
+		return s.activeAgentID, nil
+	}
+	projectID := *s.projectID
+	return s.activeAgentID, &projectID
 }
 
 // IdleFor 返回距上次活跃的时长。
@@ -598,7 +610,82 @@ const (
 	PlanActionReject  = "reject"
 )
 
+const (
+	defaultRunTimeout      = 30 * time.Minute
+	defaultRetryLockWait   = 75 * time.Second
+	runCancellationPollGap = 2 * time.Second
+)
+
 func (s *AgentSession) Send(message string, attachmentIDs []int64, plan PlanControl) error {
+	_, err := s.SendWithRun(message, attachmentIDs, plan)
+	return err
+}
+
+func (s *AgentSession) SendWithRun(message string, attachmentIDs []int64, plan PlanControl) (string, error) {
+	runID, _, err := s.startRun(context.Background(), "", true, message, attachmentIDs, plan, 1)
+	return runID, err
+}
+
+// SubmitRun 只创建持久化 Run，不在当前进程执行。独立调度器成功接单后由 worker 调
+// ExecutePreparedRun。它先确保 chat_sessions 行存在，让落到任意 worker 的 GetOrCreate
+// 都能完成归属校验。
+func (s *AgentSession) SubmitRun(ctx context.Context, message string, attachmentIDs []int64, plan PlanControl) (string, error) {
+	s.Touch()
+	if err := s.planSupported(plan); err != nil {
+		return "", err
+	}
+	db, err := persistence.DB()
+	if err != nil || db == nil {
+		if err == nil {
+			err = errors.New("run store is disabled")
+		}
+		return "", fmt.Errorf("open run store: %w", err)
+	}
+	if err := persistence.EnsureSession(ctx, db, s.id, s.userID, s.tenantID, s.projectID, s.activeAgentID, message); err != nil {
+		return "", err
+	}
+	runID := uuid.NewString()
+	err = persistence.CreateExclusiveAgentRun(ctx, db, persistence.CreateRunParams{
+		ID:        runID,
+		SessionID: s.id,
+		TenantID:  s.tenantID,
+		UserID:    s.userID,
+		AgentID:   s.activeAgentID,
+		ProjectID: s.projectID,
+		Request: map[string]any{
+			"message":        message,
+			"attachment_ids": attachmentIDs,
+			"plan_mode":      plan.Mode,
+			"plan_action":    plan.Action,
+		},
+	})
+	if err != nil {
+		return "", err
+	}
+	return runID, nil
+}
+
+// ExecutePreparedRun 在 worker 中执行 API 已经创建的 queued Run，并等待整轮收尾。
+func (s *AgentSession) ExecutePreparedRun(ctx context.Context, runID, message string, attachmentIDs []int64, plan PlanControl, attempt int) error {
+	_, done, err := s.startRun(ctx, runID, false, message, attachmentIDs, plan, attempt)
+	if err != nil {
+		return err
+	}
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		s.interruptCurrentRun()
+		select {
+		case <-done:
+			return ctx.Err()
+		case <-time.After(15 * time.Second):
+			return ctx.Err()
+		}
+	}
+}
+
+func (s *AgentSession) startRun(parent context.Context, runID string, create bool, message string, attachmentIDs []int64, plan PlanControl, attempt int) (string, <-chan error, error) {
 	// turn 级可取消 ctx —— Stop() 靠它掐断。不能用 context.Background()：
 	// 引擎的 collectAssistantMessage / 工具层 httpClient 全是 ctx-aware，
 	// 但没人持有 cancel 时那些 select <-ctx.Done() 永远不会触发，一旦
@@ -622,24 +709,95 @@ func (s *AgentSession) Send(message string, attachmentIDs []int64, plan PlanCont
 	// 每轮的计划等于两份计划各说各的。要支持得先给引擎加 Config.PlanMode 并接到
 	// 每条 leg 上，那是另一个量级的事。
 	if err := s.planSupported(plan); err != nil {
-		return err
+		return "", nil, err
 	}
 
 	// 抢执行权必须同步做 —— 起了 goroutine 就没法把 409 回给调用方了。
-	handle, err := s.acquireTurnLock()
+	var handle *lock.Handle
+	var err error
+	if attempt > 1 {
+		handle, err = s.acquireRetryTurnLock(parent)
+	} else {
+		handle, err = s.acquireTurnLock()
+	}
 	if err != nil {
-		return err
+		return "", nil, err
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	if create {
+		runID = uuid.NewString()
+	} else if runID == "" {
+		handle.Release()
+		return "", nil, errors.New("prepared run id is required")
+	}
+	db, dbErr := persistence.DB()
+	if dbErr != nil {
+		handle.Release()
+		return "", nil, fmt.Errorf("open run store: %w", dbErr)
+	}
+	if create {
+		if err := persistence.CreateAgentRun(context.Background(), db, persistence.CreateRunParams{
+			ID:        runID,
+			SessionID: s.id,
+			TenantID:  s.tenantID,
+			UserID:    s.userID,
+			AgentID:   s.activeAgentID,
+			ProjectID: s.projectID,
+			Request: map[string]any{
+				"message":        message,
+				"attachment_ids": attachmentIDs,
+				"plan_mode":      plan.Mode,
+				"plan_action":    plan.Action,
+			},
+		}); err != nil {
+			handle.Release()
+			return "", nil, err
+		}
+	}
+	claimCtx, claimCancel := context.WithTimeout(parent, 10*time.Second)
+	if err := persistence.MarkAgentRunRunning(claimCtx, db, runID, runWorkerID(), attempt); err != nil {
+		claimCancel()
+		handle.Release()
+		return "", nil, err
+	}
+	var resumeCheckpoint *persistence.AgentRunCheckpoint
+	if !create && attempt > 1 {
+		if s.chainCfg != nil {
+			if err := persistence.ResetAgentRunHistoryForRetry(claimCtx, db, runID, s.id, s.tenantID); err != nil {
+				claimCancel()
+				handle.Release()
+				return "", nil, err
+			}
+		} else {
+			checkpoint, err := persistence.LoadAgentRunCheckpoint(claimCtx, db, runID)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				claimCancel()
+				handle.Release()
+				return "", nil, err
+			}
+			if err == nil {
+				resumeCheckpoint = &checkpoint
+			}
+		}
+	}
+	claimCancel()
+
+	ctx, cancel := context.WithTimeout(parent, durationFromEnv("LEA_AGENT_RUN_TIMEOUT", defaultRunTimeout))
+	ctx = persistence.WithAgentRunAttempt(ctx, runID, attempt)
+	done := make(chan error, 1)
 	s.turnMu.Lock()
 	s.turnCancel = cancel
 	s.turnEpoch++
 	s.turnStopped = false
+	s.turnRunID = runID
 	myEpoch := s.turnEpoch
 	s.turnMu.Unlock()
 
 	go func() {
+		defer close(done)
+		if db != nil {
+			go s.watchRunCancellation(ctx, db, runID, attempt, myEpoch, cancel)
+		}
 		// 最先声明 = 最后执行：执行权要持到收尾（落库）真的做完，否则另一个 pod
 		// 可能在我们还在 INSERT 的时候就开始写同一段历史。
 		defer handle.Release()
@@ -648,6 +806,7 @@ func (s *AgentSession) Send(message string, attachmentIDs []int64, plan PlanCont
 			s.turnMu.Lock()
 			if s.turnEpoch == myEpoch {
 				s.turnCancel = nil
+				s.turnRunID = ""
 			}
 			s.turnMu.Unlock()
 			// 本轮跑的时候有人挂/摘了资源 —— 现在丢掉这份引擎对象，下一条消息重建时
@@ -659,17 +818,15 @@ func (s *AgentSession) Send(message string, attachmentIDs []int64, plan PlanCont
 		}()
 		// 必须排在第一次 broadcast 之前 —— 序号一旦发歪，这一整轮的日志都写不进去。
 		s.seedEventSeq()
-		s.broadcast(SSEEvent{Type: "start", Data: nil})
+		s.broadcast(SSEEvent{Type: "start", Data: map[string]any{
+			"run_id":  runID,
+			"attempt": attempt,
+		}})
 
 		// H1: 起新 collector，同时 touch session 行（首次自动 INSERT）
 		s.collectorMu.Lock()
 		s.collector = newCollector()
 		s.collectorMu.Unlock()
-
-		db, dbErr := persistence.DB()
-		if dbErr != nil {
-			log.Printf("db_unavailable err=%v (persistence disabled for this turn)", dbErr)
-		}
 
 		// H4: 附件注入 — 拉 chat_attachments 把路径和元信息拼进 message
 		userMsg := message
@@ -783,11 +940,92 @@ func (s *AgentSession) Send(message string, attachmentIDs []int64, plan PlanCont
 			// 接力型不需要这一步：runChain 每轮都由引擎重新建 leg，天然每轮重载。
 			//
 			// 失败只记日志不拒服：读不到就用内存里那份，是降级不是不可用。
-			if err := s.engine.ReloadHistory(ctx); err != nil {
-				log.Printf("history_reload_failed session=%s err=%v (沿用内存中的历史)", s.id, err)
+			//
+			// 重试时先试 inflight 快照：它比库里那份新。库里的历史只到上一个
+			// checkpoint 边界（agent_messages 的写入和 checkpoint 同事务），而上一次
+			// 尝试可能在那之后又跑完了整批工具 —— 那份结果只在 Redis 快照里。用它接手
+			// 就不会把已经生效的工具（Write / Bash / code_interpreter）再做一遍。
+			reloaded := false
+			if inflightHistory := persistence.LoadInflightHistory(ctx, s.tenantID, s.id, runID, attempt-1); inflightHistory != nil {
+				if replaceErr := s.engine.ReplaceHistory(inflightHistory); replaceErr != nil {
+					log.Printf("inflight_replace_failed session=%s run=%s attempt=%d err=%v —— 回落到库里的历史",
+						s.id, runID, attempt, replaceErr)
+				} else {
+					log.Printf("run_resume_inflight session=%s run=%s attempt=%d msgs=%d",
+						s.id, runID, attempt, len(inflightHistory))
+					reloaded = true
+				}
 			}
-			result, err = s.engine.RunTurn(ctx, message)
+			if !reloaded {
+				if reloadErr := s.engine.ReloadHistory(ctx); reloadErr != nil {
+					if resumeCheckpoint != nil {
+						err = fmt.Errorf("reload checkpoint history: %w", reloadErr)
+					} else {
+						log.Printf("history_reload_failed session=%s err=%v (沿用内存中的历史)", s.id, reloadErr)
+					}
+				}
+			}
+			if err == nil {
+				switch {
+				case resumeCheckpoint == nil:
+					result, err = s.engine.RunTurn(ctx, message)
+				case resumeCheckpoint.Checkpoint.Phase == enginesessions.CheckpointTurnCompleted:
+					result = resultFromCheckpoint(resumeCheckpoint.Checkpoint)
+					log.Printf("run_checkpoint_completed run=%s session=%s attempt=%d iteration=%d",
+						runID, s.id, attempt, result.Iterations)
+				default:
+					log.Printf("run_checkpoint_resuming run=%s session=%s attempt=%d phase=%s iteration=%d",
+						runID, s.id, attempt, resumeCheckpoint.Checkpoint.Phase, resumeCheckpoint.Checkpoint.Iteration)
+					result, err = s.engine.ResumeTurn(ctx, resumeCheckpoint.Checkpoint)
+				}
+			}
 		}
+
+		if errors.Is(ctx.Err(), context.Canceled) {
+			s.turnMu.Lock()
+			stopped := s.turnEpoch == myEpoch && s.turnStopped
+			s.turnMu.Unlock()
+			if !stopped && db != nil {
+				cancelCtx, cancelCheck := context.WithTimeout(context.Background(), 3*time.Second)
+				requested, cancelErr := persistence.IsAgentRunCancellationRequested(cancelCtx, db, runID)
+				cancelCheck()
+				if cancelErr != nil {
+					log.Printf("run_cancel_fence_failed run=%s session=%s attempt=%d err=%v", runID, s.id, attempt, cancelErr)
+					done <- cancelErr
+					return
+				}
+				if requested {
+					s.turnMu.Lock()
+					if s.turnEpoch == myEpoch {
+						s.turnStopped = true
+					}
+					s.turnMu.Unlock()
+					stopped = true
+				}
+			}
+			if !stopped {
+				done <- ctx.Err()
+				return
+			}
+		}
+
+		if db != nil {
+			fenceCtx, fenceCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			current, fenceErr := persistence.IsAgentRunAttemptCurrent(fenceCtx, db, runID, attempt)
+			fenceCancel()
+			if fenceErr != nil {
+				log.Printf("run_attempt_fence_failed run=%s session=%s attempt=%d err=%v", runID, s.id, attempt, fenceErr)
+				done <- fenceErr
+				return
+			}
+			if !current {
+				staleErr := fmt.Errorf("run %s attempt %d is stale", runID, attempt)
+				log.Printf("run_attempt_stale run=%s session=%s attempt=%d", runID, s.id, attempt)
+				done <- staleErr
+				return
+			}
+		}
+
 		switch {
 		case err != nil && errors.Is(err, context.Canceled):
 			// 用户主动停：不是错误。已经流出去的 delta 就是这轮的成果，
@@ -800,6 +1038,7 @@ func (s *AgentSession) Send(message string, attachmentIDs []int64, plan PlanCont
 			)
 			s.mu.Unlock()
 			inTok, outTok := sumUsages(result.Usages)
+			metrics.RecordLLMCall(s.cfg.Model, "stopped", 0, inTok, outTok)
 			s.recordTurnUsage(result)
 			s.broadcast(SSEEvent{Type: "result", Data: map[string]any{
 				"text":            assistantText,
@@ -811,12 +1050,19 @@ func (s *AgentSession) Send(message string, attachmentIDs []int64, plan PlanCont
 			}})
 		case err != nil:
 			runErr = err
+			// 提取部分输出文本（预算耗尽时 result.FinalAssistant 里有已经产出的部分文本）。
+			assistantText = extractText(result.FinalAssistant)
+			if assistantText != "" {
+				// 先播文本事件，让用户看到耗尽前已经输出的内容。
+				s.broadcast(SSEEvent{Type: "text", Data: assistantText})
+			}
 			// 失败也要记用量 —— 花掉的钱不因为这轮失败而退回。此前这条分支不记，于是一轮
 			// 跑到一半失败的对话在库里 token_count 是空的，而它可能已经烧了几十万 token
 			// （handoff 链中途某棒预算耗尽就是这个形状：前面几棒全跑完了）。
 			//
 			// 这种丢失没有可见症状：前端照常显示错误，只有对账时才发现账单少了一笔。
 			s.recordTurnUsage(result)
+			// 再播错误事件（预算耗尽会在这里显示）。
 			s.broadcast(SSEEvent{Type: "error", Data: err.Error()})
 		default:
 			assistantText = extractText(result.FinalAssistant)
@@ -830,6 +1076,7 @@ func (s *AgentSession) Send(message string, attachmentIDs []int64, plan PlanCont
 			s.mu.Unlock()
 
 			inTok, outTok := sumUsages(result.Usages)
+			metrics.RecordLLMCall(s.cfg.Model, "ok", 0, inTok, outTok)
 			s.recordTurnUsage(result)
 
 			resultData := map[string]any{
@@ -875,12 +1122,157 @@ func (s *AgentSession) Send(message string, attachmentIDs []int64, plan PlanCont
 		// 结果恰好在最该留痕的场景下什么都没落库。取消只该掐断 LLM 和工具，
 		// 不该掐断收尾。
 		persistCtx, persistCancel := context.WithTimeout(context.Background(), 15*time.Second)
-		s.persistTurn(persistCtx, userMsg, assistantText, runErr)
+		persistCtx = persistence.WithAgentRunAttempt(persistCtx, runID, attempt)
+		if err := s.persistTurn(persistCtx, userMsg, assistantText, runErr); err != nil {
+			log.Printf("persist_turn_failed run=%s session=%s attempt=%d err=%v", runID, s.id, attempt, err)
+			persistCancel()
+			done <- err
+			return
+		}
+		status, finishErr := s.runTerminalState(ctx, myEpoch, runErr)
+		if err := persistence.FinishAgentRun(persistCtx, db, runID, attempt, status, finishErr); err != nil {
+			log.Printf("finish_agent_run_failed run=%s session=%s status=%s err=%v", runID, s.id, status, err)
+			persistCancel()
+			done <- err
+			return
+		}
 		persistCancel()
 
+		// 排在 done 之前广播一次——不是逐轮实时更新（引擎现在没有"一轮完成"的
+		// 回调，做不到那个程度，见 usageSnapshot 的说明），但至少让用户在这轮
+		// 跑完的那一刻就看到花了多少 token，不用刷新页面、翻历史才找得到
+		// （chat_messages.extra.usage 有同一份数据，但那是给历史重放用的）。
+		//
+		// in==0 && out==0 跳过：链式拓扑（chainCfg != nil）main 用量本来就是
+		// 零（真实的零，见 setChainUsage 的说明），广播一个"用了 0 token"
+		// 的事件只会误导人。
+		if in, out := s.currentCollector().usageSnapshot(); in > 0 || out > 0 {
+			s.broadcast(SSEEvent{Type: "usage", Data: map[string]any{
+				"input_tokens": in, "output_tokens": out,
+			}})
+		}
 		s.broadcast(SSEEvent{Type: "done", Data: nil})
+		if status == persistence.RunCancelled && errors.Is(ctx.Err(), context.Canceled) {
+			done <- context.Canceled
+		} else {
+			done <- finishErr
+		}
 	}()
-	return nil
+	return runID, done, nil
+}
+
+func resultFromCheckpoint(checkpoint enginesessions.TurnCheckpoint) turn.Result {
+	result := turn.Result{
+		FinalAssistant:     checkpoint.FinalAssistant,
+		FinalStopReason:    checkpoint.FinalStopReason,
+		Usages:             append([]*llm.Usage(nil), checkpoint.Usages...),
+		Iterations:         checkpoint.Iteration,
+		Stopped:            checkpoint.Stopped,
+		AwaitingUser:       checkpoint.AwaitingUser,
+		ContextTokens:      checkpoint.ContextTokens,
+		ContextTokensSaved: checkpoint.ContextTokensSaved,
+	}
+	if checkpoint.HandoffExpert != "" {
+		result.Handoff = &turn.HandoffRequest{Expert: checkpoint.HandoffExpert, Brief: checkpoint.HandoffBrief}
+	}
+	return result
+}
+
+func (s *AgentSession) acquireRetryTurnLock(parent context.Context) (*lock.Handle, error) {
+	waitCtx, cancel := context.WithTimeout(parent, durationFromEnv("LEA_AGENT_RETRY_LOCK_WAIT", defaultRetryLockWait))
+	defer cancel()
+
+	ticker := time.NewTicker(lockPollEvery)
+	defer ticker.Stop()
+	for {
+		acquireCtx, acquireCancel := context.WithTimeout(waitCtx, 5*time.Second)
+		handle, err := s.locker.Acquire(acquireCtx, s.id)
+		acquireCancel()
+		if err == nil {
+			return handle, nil
+		}
+		if !errors.Is(err, lock.ErrHeld) {
+			return nil, err
+		}
+		select {
+		case <-waitCtx.Done():
+			return nil, fmt.Errorf("wait for previous run attempt lock: %w", waitCtx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func runWorkerID() string {
+	host, _ := os.Hostname()
+	if host == "" {
+		host = "unknown"
+	}
+	return fmt.Sprintf("%s/%d", host, os.Getpid())
+}
+
+func (s *AgentSession) watchRunCancellation(ctx context.Context, db *sql.DB, runID string, attempt int, epoch uint64, cancel context.CancelFunc) {
+	check := func() bool {
+		checkCtx, checkCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer checkCancel()
+		run, err := persistence.GetAgentRunByID(checkCtx, db, runID)
+		if err != nil {
+			log.Printf("run_attempt_check_failed run=%s session=%s attempt=%d err=%v", runID, s.id, attempt, err)
+			return false
+		}
+		if run.Attempt != attempt {
+			log.Printf("run_attempt_ownership_lost run=%s session=%s attempt=%d", runID, s.id, attempt)
+			cancel()
+			return true
+		}
+		switch run.Status {
+		case persistence.RunCompleted, persistence.RunFailed, persistence.RunTimedOut:
+			return true
+		case persistence.RunRunning:
+			return false
+		case persistence.RunCancelling, persistence.RunCancelled:
+		default:
+			cancel()
+			return true
+		}
+		s.turnMu.Lock()
+		if s.turnEpoch == epoch {
+			s.turnStopped = true
+		}
+		s.turnMu.Unlock()
+		cancel()
+		return true
+	}
+	if check() {
+		return
+	}
+	ticker := time.NewTicker(runCancellationPollGap)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if check() {
+				return
+			}
+		}
+	}
+}
+
+func (s *AgentSession) runTerminalState(ctx context.Context, epoch uint64, runErr error) (persistence.RunStatus, error) {
+	s.turnMu.Lock()
+	stopped := s.turnEpoch == epoch && s.turnStopped
+	s.turnMu.Unlock()
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return persistence.RunTimedOut, context.DeadlineExceeded
+	}
+	if stopped {
+		return persistence.RunCancelled, nil
+	}
+	if runErr != nil {
+		return persistence.RunFailed, runErr
+	}
+	return persistence.RunCompleted, nil
 }
 
 // recordTurnUsage 把一轮的用量交给 collector，按拓扑走对应的那条路。
@@ -981,17 +1373,50 @@ func (s *AgentSession) runChain(ctx context.Context, message string) (turn.Resul
 // req 的 ctx 中断。沙箱里已经起来的进程不受影响（那是远端 lea-tools 的事），
 // 但引擎不会再等它，也不会进下一轮迭代。
 func (s *AgentSession) Stop() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	stopped, err := s.RequestStop(ctx)
+	if err != nil {
+		log.Printf("run_cancel_persist_failed session=%s err=%v", s.id, err)
+	}
+	return stopped
+}
+
+func (s *AgentSession) interruptCurrentRun() bool {
 	s.turnMu.Lock()
 	cancel := s.turnCancel
-	if cancel != nil {
-		s.turnStopped = true
-	}
 	s.turnMu.Unlock()
 	if cancel == nil {
 		return false
 	}
 	cancel()
 	return true
+}
+
+// RequestStop 先持久化取消意图，再中断本进程里的执行。持久化失败也会调用 cancel，
+// 避免数据库抖动让用户连本地这轮都停不下来；调用方可通过 err 观察降级。
+func (s *AgentSession) RequestStop(ctx context.Context) (bool, error) {
+	s.turnMu.Lock()
+	cancel := s.turnCancel
+	runID := s.turnRunID
+	if cancel != nil {
+		s.turnStopped = true
+	}
+	s.turnMu.Unlock()
+	if cancel == nil {
+		return false, nil
+	}
+	var persistErr error
+	if runID != "" {
+		db, err := persistence.DB()
+		if err != nil {
+			persistErr = err
+		} else if db != nil {
+			_, persistErr = persistence.RequestAgentRunCancellation(ctx, db, runID)
+		}
+	}
+	cancel()
+	return true, persistErr
 }
 
 // currentCollector 拿当前 turn 的 collector；未 Send 前调用返回 no-op 实例。
@@ -1004,10 +1429,13 @@ func (s *AgentSession) currentCollector() *messageCollector {
 	return s.collector
 }
 
-func (s *AgentSession) persistTurn(ctx context.Context, userMsg, assistantMsg string, runErr error) {
+func (s *AgentSession) persistTurn(ctx context.Context, userMsg, assistantMsg string, runErr error) error {
 	db, err := persistence.DB()
-	if err != nil || db == nil {
-		return
+	if err != nil {
+		return err
+	}
+	if db == nil {
+		return nil
 	}
 	c := s.currentCollector()
 
@@ -1045,7 +1473,7 @@ func (s *AgentSession) persistTurn(ctx context.Context, userMsg, assistantMsg st
 		})
 	}
 	if err := persistence.SaveMessages(ctx, db, msgs...); err != nil {
-		log.Printf("save_messages_failed session=%s err=%v", s.id, err)
+		return fmt.Errorf("save chat messages: %w", err)
 	}
 
 	// agent_messages（给模型的那份）在两条拓扑上由不同的人写，互斥不重叠：
@@ -1061,6 +1489,7 @@ func (s *AgentSession) persistTurn(ctx context.Context, userMsg, assistantMsg st
 	if s.chainCfg != nil {
 		s.appendChainHistory(ctx, db, runErr)
 	}
+	return nil
 }
 
 // appendChainHistory 把一整条链新产生的那段对话落到 agent_messages。
@@ -1241,6 +1670,13 @@ func (s *AgentSession) forwardToolEvents(ch <-chan tool.Event) {
 	for ev := range ch {
 		s.currentCollector().onToolEvent(ev)
 		s.broadcast(SSEEvent{Type: "tool_event", Data: ev})
+		if ev.Type == tool.EventTypeCompleted || ev.Type == tool.EventTypeFailed {
+			status := "ok"
+			if ev.Type == tool.EventTypeFailed {
+				status = "error"
+			}
+			metrics.RecordToolCall(ev.ToolName, status, 0)
+		}
 		if refs := referencesFromToolEvent(ev); len(refs) > 0 {
 			s.broadcast(SSEEvent{Type: "references", Data: map[string]any{"references": refs}})
 		}

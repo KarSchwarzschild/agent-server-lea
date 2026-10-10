@@ -104,7 +104,7 @@ func TestConfigRouteReplacesClientIdentityHeaders(t *testing.T) {
 		verifier:      g.verifier,
 		internalToken: "internal-token",
 		tenantClient:  testTenantClient(t, "Super", "管理者", "Master"),
-		config:        newProxy(upstream.URL, "/api/user"),
+		config:        newProxy(upstream.URL, "/api/user", "/api"),
 	}
 	h := g.auth(http.HandlerFunc(g.configRoute))
 	req := httptest.NewRequest(http.MethodGet, "/api/user/skills", nil)
@@ -139,6 +139,98 @@ func TestConfigRouteRequiresInternalToken(t *testing.T) {
 	}
 }
 
+func TestConfigRouteAppliesTestAdminRoleAfterMembershipValidation(t *testing.T) {
+	var got http.Header
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	g, key := testGateway(t)
+	g = &gateway{
+		issuer:        g.issuer,
+		verifier:      g.verifier,
+		internalToken: "internal-token",
+		tenantClient:  testTenantClient(t, "Regular", "编辑", "Editor"),
+		testAdminRole: "admin",
+		config:        newProxy(upstream.URL, "/api"),
+	}
+	h := g.auth(http.HandlerFunc(g.configRoute))
+	req := httptest.NewRequest(http.MethodGet, "/api/publication-requests", nil)
+	req.Header.Set("Authorization", "Bearer "+token(t, key, nil))
+	req.Header.Set("X-Selected-Tenant-ID", "t1")
+	res := httptest.NewRecorder()
+	h.ServeHTTP(res, req)
+
+	if res.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+	}
+	if got.Get("X-User-Role") != "admin" {
+		t.Fatalf("role=%q", got.Get("X-User-Role"))
+	}
+}
+
+func TestTestAdminRoleDoesNotBypassTenantMembership(t *testing.T) {
+	upstreamCalled := false
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamCalled = true
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	g, key := testGateway(t)
+	g = &gateway{
+		issuer:        g.issuer,
+		verifier:      g.verifier,
+		internalToken: "internal-token",
+		tenantClient:  testTenantClient(t, "Regular", "编辑", "Editor"),
+		testAdminRole: "platform_admin",
+		config:        newProxy(upstream.URL, "/api"),
+	}
+	h := g.auth(http.HandlerFunc(g.configRoute))
+	req := httptest.NewRequest(http.MethodGet, "/api/publication-requests", nil)
+	req.Header.Set("Authorization", "Bearer "+token(t, key, nil))
+	req.Header.Set("X-Selected-Tenant-ID", "tenant-not-owned-by-user")
+	res := httptest.NewRecorder()
+	h.ServeHTTP(res, req)
+
+	if res.Code != http.StatusForbidden {
+		t.Fatalf("status=%d body=%s", res.Code, res.Body.String())
+	}
+	if upstreamCalled {
+		t.Fatal("request reached upstream without valid tenant membership")
+	}
+}
+
+func TestParseTestAdminRole(t *testing.T) {
+	tests := []struct {
+		name        string
+		environment string
+		configured  string
+		want        string
+		wantErr     bool
+	}{
+		{name: "disabled by default", environment: "test"},
+		{name: "explicitly disabled", environment: "test", configured: "disabled"},
+		{name: "tenant admin", environment: "test", configured: "admin", want: "admin"},
+		{name: "platform admin", environment: "TEST", configured: "platform_admin", want: "platform_admin"},
+		{name: "rejected outside test", environment: "prod", configured: "admin", wantErr: true},
+		{name: "invalid role", environment: "test", configured: "root", wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseTestAdminRole(test.environment, test.configured)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("err=%v wantErr=%v", err, test.wantErr)
+			}
+			if got != test.want {
+				t.Fatalf("role=%q want=%q", got, test.want)
+			}
+		})
+	}
+}
+
 func TestRagRouteForwardsTrustedIdentity(t *testing.T) {
 	var got http.Header
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -156,7 +248,7 @@ func TestRagRouteForwardsTrustedIdentity(t *testing.T) {
 		verifier:      g.verifier,
 		internalToken: "internal-token",
 		tenantClient:  testTenantClient(t, "Regular", "编辑", "Editor"),
-		rag:           newProxy(upstream.URL, "/api/user"),
+		rag:           newProxy(upstream.URL, "/api/user", "/api"),
 	}
 	h := g.auth(http.HandlerFunc(g.ragRoute))
 	req := httptest.NewRequest(http.MethodGet, "/api/user/knowledge-bases", nil)
@@ -192,7 +284,7 @@ func TestAgentRouteForwardsTrustedIdentity(t *testing.T) {
 		verifier:      g.verifier,
 		internalToken: "internal-token",
 		tenantClient:  testTenantClient(t, "Regular", "编辑", "Editor"),
-		agent:         newProxy(upstream.URL, ""),
+		agent:         newProxy(upstream.URL),
 	}
 	h := g.auth(http.HandlerFunc(g.agentRoute))
 	req := httptest.NewRequest(http.MethodGet, "/api/sessions", nil)
@@ -236,7 +328,7 @@ func TestRouteTableDispatch(t *testing.T) {
 		t.Cleanup(server.Close)
 		return server
 	}
-	agent, config, rag := newUpstream("agent"), newUpstream("config"), newUpstream("rag")
+	agent, config, rag, parser := newUpstream("agent"), newUpstream("config"), newUpstream("rag"), newUpstream("parser")
 
 	base, key := testGateway(t)
 	g := &gateway{
@@ -245,9 +337,10 @@ func TestRouteTableDispatch(t *testing.T) {
 		internalToken: "internal-token",
 		tenantClient:  testTenantClient(t, "Regular", "编辑", "Editor"),
 		// 前缀跟 main() 里建 proxy 时保持一致，否则测的就不是生产的那张表了。
-		agent:  newProxy(agent.URL, ""),
-		config: newProxy(config.URL, "/api/user"),
-		rag:    newProxy(rag.URL, "/api/user"),
+		agent:  newProxy(agent.URL),
+		config: newProxy(config.URL, "/api/user", "/api"),
+		rag:    newProxy(rag.URL, "/api/user", "/api"),
+		parser: newProxy(parser.URL, "/api"),
 	}
 	h := g.auth(g.routes())
 
@@ -284,6 +377,26 @@ func TestRouteTableDispatch(t *testing.T) {
 		// 知识面。
 		{"/api/user/knowledge-bases", "rag", "/knowledge-bases"},
 		{"/api/user/memories", "rag", "/memories"},
+		// 中性资源路径：跟 /api/user/* 兼容别名落到同一上游、同一路径。
+		{"/api/agents", "config", "/agents"},
+		{"/api/agents/7/bindings", "config", "/agents/7/bindings"},
+		{"/api/teams/9", "config", "/teams/9"},
+		{"/api/skills/publish-requests", "config", "/skills/publish-requests"},
+		{"/api/tools/3", "config", "/tools/3"},
+		{"/api/mcp-servers/3/sync", "config", "/mcp-servers/3/sync"},
+		{"/api/publication-requests/8/review", "config", "/publication-requests/8/review"},
+		{"/api/audit-events", "config", "/audit-events"},
+		{"/api/knowledge-bases", "rag", "/knowledge-bases"},
+		{"/api/knowledge-bases/4/documents", "rag", "/knowledge-bases/4/documents"},
+		{"/api/publications/tool/3/suspend", "config", "/publications/tool/3/suspend"},
+		{"/api/resources/tool/3/checks", "config", "/resources/tool/3/checks"},
+		{"/api/providers", "config", "/providers"},
+		{"/api/retrieval/models", "config", "/retrieval/models"},
+		{"/api/console-context", "config", "/console-context"},
+		{"/api/operations/runs", "agent", "/api/operations/runs"},
+		{"/api/operations/document-jobs/9/retry", "rag", "/operations/document-jobs/9/retry"},
+		{"/api/usage", "parser", "/usage"},
+		{"/api/quotas/users/alice", "parser", "/quotas/users/alice"},
 		// 白名单没有兜底 pattern，未列出的一律 404 —— 这是故意的，一并钉住。
 		{"/api/user/nope", "", ""},
 		{"/api/nope", "", ""},

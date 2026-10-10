@@ -70,12 +70,26 @@ func SaveMessages(ctx context.Context, db *sql.DB, msgs ...Message) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	run, tracked := agentRunAttemptFromContext(ctx)
+	if tracked {
+		if err := lockAgentRunAttempt(ctx, tx, run); err != nil {
+			return err
+		}
+	}
 
-	stmt, err := tx.PrepareContext(ctx,
-		`INSERT INTO chat_messages
+	query := `INSERT INTO chat_messages
 		    (session_id, role, content, token_count, artifact_id, extra)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
-	)
+		 VALUES (?, ?, ?, ?, ?, ?)`
+	if tracked {
+		query = `INSERT INTO chat_messages
+		    (session_id, role, content, token_count, artifact_id, extra, run_id, run_attempt)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		 ON DUPLICATE KEY UPDATE
+		    session_id = VALUES(session_id), content = VALUES(content),
+		    token_count = VALUES(token_count), artifact_id = VALUES(artifact_id),
+		    extra = VALUES(extra), run_attempt = VALUES(run_attempt)`
+	}
+	stmt, err := tx.PrepareContext(ctx, query)
 	if err != nil {
 		return err
 	}
@@ -98,9 +112,11 @@ func SaveMessages(ctx context.Context, db *sql.DB, msgs ...Message) error {
 		if m.ArtifactID != nil {
 			artifactID = *m.ArtifactID
 		}
-		if _, err := stmt.ExecContext(ctx,
-			m.SessionID, m.Role, m.Content, tokenCount, artifactID, extraJSON,
-		); err != nil {
+		args := []any{m.SessionID, m.Role, m.Content, tokenCount, artifactID, extraJSON}
+		if tracked {
+			args = append(args, run.RunID, run.Attempt)
+		}
+		if _, err := stmt.ExecContext(ctx, args...); err != nil {
 			return err
 		}
 	}

@@ -1,0 +1,35 @@
+# lea-tools 独立部署（跟 Cube 沙箱、NFS 共享目录同一台机器）。
+#
+# 启动（在本目录）：
+#     cp .env.example .env      # 然后按 .env.example 里的说明填
+#     docker compose up -d --build
+#
+# 解决的问题：之前是 ssh 里手敲 `uv run uvicorn ...`，ssh 一断进程就没了，机器重启也不会
+# 自动拉起。restart: unless-stopped 之后断 ssh、重启机器都会自己回来。
+#
+# ── 两个不能省的设计点 ────────────────────────────────────────────────────
+#
+# 1. network_mode: host。Cube API（127.0.0.1:3000）和 Redis（127.0.0.1:6379）在宿主机上，
+#    而 127.0.0.1 在桥接网络的容器里指的是容器自己。host 网络下这些地址原样可用，也不用管
+#    envd 到沙箱内网 IP 的路由（桥接下容器未必路由得到沙箱的 tap 网段）。
+#    代价：端口就是宿主机的 8400，不需要（也不能）写 ports。
+#
+# 2. NFS 目录以**相同路径**挂进去。lea-tools 把 session 目录建在 NFS_ROOT 下，然后把这个
+#    路径交给 Cube 做 host-mount——Cube 在宿主机上解析它，所以容器里看到的路径必须跟宿主机
+#    一模一样，不能映射成别的别名。
+#    ⚠️ 下面的路径必须等于 .env 里的 NFS_ROOT。这里不用 ${NFS_ROOT} 插值：compose 的插值不
+#    读 env_file，只会静默落到默认值；两边对不上的表现是沙箱文件丢失而服务照常起来（见
+#    Dockerfile.standalone 里 "host-mount skipped" 那段）。
+
+services:
+  lea-tools:
+    build:
+      context: .
+      dockerfile: Dockerfile.standalone
+    image: lea-tools:prod
+    container_name: lea-tools
+    network_mode: host
+    env_file: .env
+    volumes:
+      - /data/cubelet/lea:/data/cubelet/lea
+    restart: unless-stopped

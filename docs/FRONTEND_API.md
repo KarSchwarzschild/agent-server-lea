@@ -26,6 +26,7 @@
 | POST | `/api/chat/stream` | **发消息并在同一条连接上回 SSE（主链路）** |
 | GET | `/api/chat/stream/:session_id` | **断线重连**：从 `?from=` 补齐事件再接直播 |
 | GET | `/api/chat/status/:session_id` | 这个会话此刻还在生成吗 |
+| GET | `/api/chat/runs/:run_id` | 查询一轮 Run 的持久化状态 |
 | POST | `/api/chat/send` | 发消息（立即返回，结果走 SSE）—— 旧链路 |
 | POST | `/api/chat/stop/:session_id` | 中断当前回答 |
 | POST | `/api/chat/attachments/upload` | 上传附件 |
@@ -130,7 +131,8 @@ RFC3339 带纳秒和时区偏移，例如 `2026-07-29T10:04:05.123456789+08:00`�
 
 **200** 响应体直接就是事件流（`text/event-stream`）。事件顺序：
 
-1. `session` —— `{"session_id": "uuid"}`。新建会话时前端从这儿拿 id（旧链路是从
+1. `session` —— `{"session_id": "uuid", "run_id": "uuid"}`。新建会话时前端从这儿拿
+   `session_id`，每一轮的持久化执行标识是 `run_id`（旧链路是从
    `send` 的 JSON body 拿的，现在整个 body 是事件流）。**这条没有 `id:` 字段**，
    见下面那条注意。
 2. 之后是 `start` / `delta` / `thinking` / `tool_event` / `result` / `ask_user` / `done`，
@@ -190,7 +192,7 @@ RFC3339 带纳秒和时区偏移，例如 `2026-07-29T10:04:05.123456789+08:00`�
 - `agent_id` 传 `0` 走租户默认的 super-agent
 - `attachment_ids` 是 `/attachments/upload` 返回的 `id` 数组（int64）
 
-**202** `{"session_id": "uuid", "status": "processing"}`
+**202** `{"session_id": "uuid", "run_id": "uuid", "status": "processing"}`
 
 只是受理，回答内容完全走 SSE。
 
@@ -269,12 +271,33 @@ const url = `/api/chat/stream/${sessionId}?from=${lastEventId ?? 0}`;
 | 404 | 会话不存在 |
 | 503 | 判断不了（控制面/库不可达）。**别当 `running: false` 处理** —— 会过早放弃正在生成的回答 |
 
+### GET /api/chat/runs/:run_id
+
+返回这一轮的持久化状态。`run_id` 来自主流式接口的第一条 `session` 事件，或旧
+`/chat/send` 的 202 响应。
+
+```json
+{
+  "run_id": "uuid",
+  "session_id": "uuid",
+  "status": "running",
+  "cancel_requested_at": null,
+  "started_at": "2026-09-17T10:00:00+08:00",
+  "finished_at": null,
+  "error": ""
+}
+```
+
+状态取值：`queued`、`running`、`cancelling`、`cancelled`、`completed`、`failed`、
+`timed_out`。查询同时按租户和用户过滤，别人的 `run_id` 一律表现为 404。
+
 ### POST /api/chat/stop/:session_id
 
 无 body。
 
-**200** `{"session_id": "uuid", "stopped": true}`，跨副本转发时多一个 `"forwarded": true`
-（纯排查信息，前端可忽略）。
+**200/202** 响应含 `{"session_id": "uuid", "run_id": "uuid", "stopped": true,
+"durable": true}`。跨副本实时转发成功时还有 `"forwarded": true`。202 表示取消意图已经
+持久化，但即时取消通道没有确认送达；runner 最迟会在下一次数据库轮询时停止。
 
 `stopped: false` 表示这一轮已经自己结束了 —— 用户点停的同一瞬间回答刚好完成，属于正常
 竞态，**不是错误**，前端不用提示。
@@ -316,6 +339,7 @@ const url = `/api/chat/stream/${sessionId}?from=${lastEventId ?? 0}`;
 | `thinking` | 裸文本 | 思考过程增量 |
 | `tool_event` | JSON | 工具调用，见下 |
 | `result` | JSON | 本轮定稿 |
+| `usage` | JSON | 这轮的累计 token 用量，见下——排在 `done` 之前发一次，不是逐轮实时更新（引擎没有"一轮完成"的回调，只能在整轮跑完后一次性算出来），handoff 链拓扑下这一条不会出现（那种拓扑没有"主会话"用量，见 lea-agent 的 setChainUsage） |
 | `error` | 裸文本 | 错误描述 |
 | `done` | 字面量 `<nil>` | 流结束，**忽略 payload** |
 
@@ -338,6 +362,16 @@ const url = `/api/chat/stream/${sessionId}?from=${lastEventId ?? 0}`;
 
 `stopped: true` 有两种来源 —— 用户主动停，或者引擎因为工具被拒而终止。**从这个字段
 分不出是哪种**。
+
+### usage
+
+```json
+{"input_tokens": 35374, "output_tokens": 375}
+```
+
+这轮**累计**用量（多轮工具调用的输入 token 会算多次——每一轮都要把前面的历史重新发一遍，
+这是正常的，不是重复计费的 bug）。跟历史消息里 `extra.usage.main` 是同一份数据，只是提前
+在关闭连接之前吐一次，省得用户必须刷新页面才能看到这轮花了多少 token。
 
 ### tool_event
 

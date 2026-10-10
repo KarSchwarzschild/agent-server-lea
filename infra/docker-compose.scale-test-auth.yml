@@ -1,0 +1,21 @@
+# scale-test 栈的 dev-auth 覆盖层 —— 把 gateway 的两个外部 OIDC 依赖指向本机 dev stub。
+#
+# ⚠️ 只在本机手动验证时用。等于关掉鉴权，不能带进共享环境。
+#
+# 用法（每次重建 gateway 后生效，其余容器不重建）：
+#   uv run --no-sync python scripts/dev_gateway_stub.py &
+#   cd infra
+#   docker compose -f docker-compose.scale-test.yml \
+#                  -f docker-compose.scale-test-auth.yml \
+#                  up -d --force-recreate --no-deps gateway
+
+services:
+  gateway:
+    environment:
+      LEA_ENV: test
+      LEA_TEST_ADMIN_ROLE: platform_admin
+      OIDC_ISSUER: http://host.docker.internal:9310
+      OIDC_JWKS_URL: http://host.docker.internal:9310/jwks.json
+      TENANT_MEMBERSHIP_URL: http://host.docker.internal:9310/api/TenantUser/CurrUserTenants
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

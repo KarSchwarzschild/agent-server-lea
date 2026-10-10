@@ -47,6 +47,11 @@ OWNER_SCOPE_USER = "user"
 
 VISIBILITY_PRIVATE = "private"
 VISIBILITY_PUBLIC = "public"
+VISIBILITY_SHARED = "shared"
+"""同租户内所有人可读，跨租户不可见。目前只有 knowledge_bases 用这个值 ——
+kb_service.py 的 list_kbs() 早就按它过滤了，但 can()/scoped_filter() 一直没跟上，
+于是"真正用户会经过"的 server_user_kb.py（走 scoped_filter，不走 kb_service）
+把 shared 库当成了私有库：非 owner 的同租户用户什么都看不到。"""
 
 # ── 角色 ──────────────────────────────────────────────────────────────────
 
@@ -163,6 +168,11 @@ def can(actor: Actor, action: str, obj: Any) -> bool:
     if actor.is_platform_admin:
         return True
 
+    # public 是真正的跨租户公开读。必须在租户边界之前判断；否则把资源发布到
+    # default/public 后，其他租户仍会在下面直接返回 False，形成“发布成功但不可见”。
+    if action == READ and own.visibility == VISIBILITY_PUBLIC:
+        return True
+
     # 2. 跨租户：一律拒绝。放在最前面 —— 后面所有规则都隐含"同租户"这个前提，
     #    顺序反了的话"我是自己资源的 owner"会跨租户成立（user_id 在两个租户里
     #    可以是同一个字符串，seed 数据就是故意这么造的）。
@@ -179,8 +189,10 @@ def can(actor: Actor, action: str, obj: Any) -> bool:
 
     # 5. 到这里 = 同租户里**别人**的私有资源。
     if action == READ:
-        # 公开的可读。注意这不给写权限 —— 把 visibility 当可变性用是个常见错误。
-        if own.visibility == VISIBILITY_PUBLIC:
+        # public 是跨租户也能看的公开；shared 是同租户内共享 —— 到这一行时已经
+        # 过了第 2 条的跨租户检查，两者在这里都成立。注意这不给写权限：
+        # 把 visibility 当可变性用是个常见错误，改/删仍然只认 owner 或租户管理员。
+        if own.visibility in (VISIBILITY_PUBLIC, VISIBILITY_SHARED):
             return True
         return actor.is_tenant_admin and TENANT_ADMIN_READS_PRIVATE
 
@@ -381,8 +393,13 @@ def scoped_filter(actor: Actor, model: Any) -> Any:
             "没法安全地按 actor 过滤。先给它加上归属，见 migrations/004。"
         )
 
+    public_clause = None
     if "visibility" in cols:
-        clauses.append(model.visibility == VISIBILITY_PUBLIC)
+        public_clause = model.visibility == VISIBILITY_PUBLIC
+        clauses.append(public_clause)
+        # shared：同租户内所有人可读。不用单独判 tenant_id —— 最外层的
+        # and_(model.tenant_id == actor.tenant_id, ...) 已经把它卡死了。
+        clauses.append(model.visibility == VISIBILITY_SHARED)
 
     if TENANT_ADMIN_READS_PRIVATE and actor.is_tenant_admin:
         # 租户管理员看全租户。注意仍然被下面的 tenant_id 约束夹着。
@@ -393,7 +410,10 @@ def scoped_filter(actor: Actor, model: Any) -> Any:
     if "tenant_id" not in cols:
         raise TypeError(f"{model.__name__} 没有 tenant_id，无法做租户隔离")
 
-    return and_(model.tenant_id == actor.tenant_id, scope_clause)
+    tenant_scope = and_(model.tenant_id == actor.tenant_id, scope_clause)
+    if public_clause is not None:
+        return or_(tenant_scope, public_clause)
+    return tenant_scope
 
 
 def _allow_untrusted_headers() -> bool:

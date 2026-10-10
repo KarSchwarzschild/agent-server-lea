@@ -53,6 +53,7 @@ COPY packages/lea-agent/ ./
 # -trimpath 去掉构建机的绝对路径（否则栈里会有 /src/... 和构建者的目录结构）。
 # 静态链接，运行镜像里不需要 libc。
 RUN go build -trimpath -ldflags="-s -w" -o /out/lea-agent ./cmd/server
+RUN go build -trimpath -ldflags="-s -w" -o /out/lea-agent-worker ./cmd/worker
 
 # ── 阶段 2：运行镜像 ──────────────────────────────────────────────────────
 FROM alpine:3.20
@@ -68,6 +69,7 @@ RUN apk add --no-cache ca-certificates tzdata \
     && adduser -S -u 10001 lea
 
 COPY --from=build /out/lea-agent /usr/local/bin/lea-agent
+COPY --from=build /out/lea-agent-worker /usr/local/bin/lea-agent-worker
 
 USER 10001
 

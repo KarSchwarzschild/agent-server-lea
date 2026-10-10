@@ -1,0 +1,33 @@
+# lea-agent Temporal Worker。它不接收客户端流量，只从 Temporal Task Queue 拉取 Agent Run。
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lea-agent-worker
+  labels: {app: lea-agent-worker}
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: lea-agent-worker}
+  template:
+    metadata:
+      labels: {app: lea-agent-worker}
+    spec:
+      terminationGracePeriodSeconds: 200
+      containers:
+        - name: lea-agent-worker
+          image: lea-agent:dev
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/lea-agent-worker"]
+          envFrom:
+            - configMapRef: {name: lea-common}
+            - secretRef: {name: lea-secrets}
+          resources:
+            requests: {cpu: 200m, memory: 256Mi}
+            limits: {cpu: "2", memory: 1Gi}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: ["ALL"]}

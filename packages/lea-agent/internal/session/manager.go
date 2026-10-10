@@ -13,6 +13,7 @@ import (
 
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/control"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/lock"
+	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/metrics"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/persistence"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/runtime"
 )
@@ -210,6 +211,7 @@ func (m *Manager) GetOrCreate(ctx context.Context, p Params) (*AgentSession, err
 				return s, nil
 			}
 			log.Printf("session_rebuild_needed session=%s reason=attachments_changed", p.SessionID)
+			metrics.RecordSessionRebuild("attachments_changed")
 			if !m.Drop(p.SessionID) {
 				// 正在跑一轮（或有 SSE 订阅者）—— 那个引擎对象正被占用，丢不得。
 				// 置标志让它本轮收尾时自己丢，这一轮继续用旧工具集：用户等着这轮的
@@ -293,6 +295,7 @@ func (m *Manager) GetOrCreate(ctx context.Context, p Params) (*AgentSession, err
 	m.mu.Lock()
 	m.sessions[s.ID()] = s
 	m.mu.Unlock()
+	metrics.UpdateActiveSessions(m.Count())
 	return s, nil
 }
 
@@ -380,6 +383,7 @@ func (m *Manager) ensureCapacity() error {
 	m.mu.Unlock()
 
 	log.Printf("session_evicted id=%s idle=%s reason=capacity", victimID, oldest.Round(time.Second))
+	metrics.UpdateActiveSessions(len(m.sessions) - 1)
 	victim.Close() // 在锁外：Close 会跑 memory OnSessionEnd
 	return nil
 }
@@ -421,6 +425,7 @@ func (m *Manager) sweepIdle(now time.Time) int {
 	}
 	if len(expired) > 0 {
 		log.Printf("session_sweep expired=%d remaining=%d ttl=%s", len(expired), remaining, m.idleTTL)
+		metrics.UpdateActiveSessions(remaining)
 	}
 	return len(expired)
 }

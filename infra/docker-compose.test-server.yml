@@ -1,0 +1,414 @@
+# infra/docker-compose.test-server.yml — 测试服务器单机 Docker 部署
+#
+# 为什么需要这一份：仓库里没有任何一个 compose 文件能单独把整套跑起来。
+#   docker-compose.yml       业务服务最全，但 rag 声明 depends_on: milvus 而这个文件里
+#                            没定义 milvus 服务 —— 直接 up 会失败。而且它自带 mysql，
+#                            跟"继续用外部 202.205.160.9:3307"的意图冲突。
+#   docker-compose.dev.yml   唯一定义 milvus / milvus-etcd 的地方，但业务侧只有
+#                            retrieval / retrieval-worker，且 DB 写死在 env 里。
+#   docker-compose.scale-test.yml  本机压测用，两副本 + nginx 一致性哈希，外部依赖
+#                            全靠 host.docker.internal 回宿主 —— 测试服务器上不该这么连。
+#
+# 这份的取舍：有外部实例的一律用外部，只有本仓库自己的服务和没有外部实例的组件
+# 起在栈里。业务服务各 × 1。
+#
+#   外部不动：MySQL 202.205.160.9:3307、Redis 202.205.160.9:16379/9、
+#             中转 API tenantapi-ai.ouchn.edu.cn、lea-tools 10.192.241.137:8400、
+#             Cube 沙箱 10.192.241.137:3000 + 其 S3、本地大模型 202.205.160.8:11434
+#   栈内自带：minio / milvus(+etcd) / temporal（temporal 接外部 MySQL，见下）
+#   业务服务：gateway / agent / agent-worker / config / rag / retrieval-worker / parser
+#   前端：    frontend（frontend-lab 的生产构建，唯一对外暴露的前端，见该服务的说明）
+#   不在栈内：lea-tools（按约定指远端 10.192.241.137:8400）
+#
+# 启动（务必带 -p 和 --env-file，见下面第 1 条）：
+#   docker compose -p lea-test --env-file .env \
+#     -f infra/docker-compose.test-server.yml up -d --build
+#
+# 前置条件：
+#   1. compose 的 ${VAR} 插值**不读 env_file**。`env_file: ../.env` 只负责把变量注进
+#      容器，插值读的是项目目录下的 .env（这个文件在 infra/ 下，所以默认是 infra/.env）。
+#      下面 ${VAR:?...} 引用的变量必须在 --env-file 指的那份里有值 —— 缺了 compose
+#      直接报错，不会静默起一个坏服务。实测目前 .env 和 infra/.env 里都没有
+#      LEA_INTERNAL_TOKEN，必须先补。
+#   2. agentloop 必须是本仓库的兄弟目录（../../agentloop）。go.mod 里的 replace 指向它，
+#      少了 build context buildkit 会把 agentloop 当 Docker Hub 镜像去拉，报
+#      "failed size validation"，完全看不出是缺上下文。
+#   3. migrations/：001–030 在这台 MySQL 上已经跑过了（一直在用同一个库），**只需确认
+#      031_agent_runs.sql**。它不幂等 —— 两张表是 CREATE TABLE IF NOT EXISTS，但对
+#      agent_messages / chat_messages 的四个 ADD COLUMN 没有防重，重复执行会报
+#      duplicate column。先查 `SHOW TABLES LIKE 'agent_runs'`，没有才跑。
+#   4. Temporal 接外部 MySQL 需要该账号有建库权限（它自建 temporal 和
+#      temporal_visibility 两个 schema）。见下面 temporal 服务的说明。
+#
+# 端口策略：对外只有 gateway（宿主 8840，容器内仍是 8080，LEA_GATEWAY_PORT 没改，
+# 只是宿主映射改了）和 frontend（宿主 8880）。minio / milvus / temporal UI 一律绑
+# 127.0.0.1，运维要看就 ssh 端口转发。测试服务器多半有公网 IP，而 minio 用的是
+# .env 里那套口令，暴露出去等于把对象存储和向量库送人。
+
+# ── 所有业务服务共享的环境变量 ───────────────────────────────────────────────
+#
+# 这些是"必须覆盖 .env"的部分。.env 里对应的值是给"裸机跑 uvicorn"写的：
+#   MINIO_ENDPOINT=http://127.0.0.1:9000     容器里 127.0.0.1 指向自己
+#   REDIS_URL=redis://lea-redis-dev:6379/0   写死了 dev 栈的容器名
+#   LEA_CONFIG_URL / LEA_RAG_URL=127.0.0.1   同上
+#   LEA_PARSER_URL=http://127.0.0.1:8600     同上
+#   LEA_MILVUS_URI                           .env 里根本没有这一项，代码默认
+#                                            http://localhost:19530（memory/service.py:111
+#                                            等多处），容器里是连接超时而不是配置报错
+x-service-env: &service-env
+  # 测试服务器暂时没有基座管理员账号。Gateway 仍校验 JWT 和租户成员关系，但把
+  # 已登录成员映射为指定管理角色。默认 admin 只管理所选租户；需要联调全局审批时
+  # 可在 .env 改成 platform_admin；设 disabled 即恢复真实角色判断。
+  LEA_ENV: test
+  LEA_TEST_ADMIN_ROLE: ${LEA_TEST_ADMIN_ROLE:-admin}
+
+  # 服务间认证。.env 里没有这一项，必须显式给 —— 留空的话服务间调用的鉴权行为要
+  # 逐个确认，不是一个可以"先不管"的值。
+  LEA_INTERNAL_TOKEN: ${LEA_INTERNAL_TOKEN:?请在 --env-file 指定的那份 .env 里设置 LEA_INTERNAL_TOKEN}
+
+  # 栈内服务，用 compose 服务名。注意端口是各服务的容器内监听端口，不是宿主端口。
+  LEA_CONFIG_URL: http://config:8500
+  LEA_RAG_URL: http://rag:8300
+  LEA_PARSER_URL: http://parser:8600
+  MINIO_ENDPOINT: http://minio:9000
+  LEA_MILVUS_URI: http://milvus:19530
+
+  # ── 外部 Redis ─────────────────────────────────────────────────────────
+  #
+  # 用外部实例的 9 号库。db 号必须独占，不能跟别的服务混：
+  #   lea-rag   Celery broker + result backend（队列键、任务结果键）
+  #   lea-agent 分布式锁、SSE 事件投递
+  # 都在同一个 URL 上，跟别人共用 db 会互相看到对方的键。
+  #
+  # 一个 db 号隔不开的东西：pub/sub。Redis 的频道是**实例级**的，不按 db 隔离 ——
+  # lea-agent 的停止信号走 `lea:agent:control:stop`（control.go:52）。如果这台 Redis
+  # 上还有另一套 lea-agent（比如本机 dev 栈也连过来），两边会收到彼此的 stop 信号。
+  # 前缀只能帮运维在 MONITOR 里看出是谁，隔不开跨环境串台。
+  REDIS_URL: ${REDIS_URL:-redis://202.205.160.9:16379/9}
+
+  # 外部服务，原样沿用。写在这里而不是只靠 env_file，是为了让"哪些是远端"一眼可见。
+  LEA_TOOLS_URL: ${LEA_TOOLS_URL:-http://10.192.241.137:8400}
+
+  TEMPORAL_ADDRESS: temporal:7233
+  TEMPORAL_NAMESPACE: ${TEMPORAL_NAMESPACE:-default}
+  LEA_AGENT_TEMPORAL_TASK_QUEUE: ${LEA_AGENT_TEMPORAL_TASK_QUEUE:-lea-agent-runs}
+
+services:
+
+  # ── 入口网关 ──────────────────────────────────────────────────────────────
+  #
+  # OIDC_* 和 TENANT_MEMBERSHIP_URL 在 main.go:35-36 有默认值，但默认值指向生产
+  # passport，别靠它 —— 显式写出来，将来切测试 IdP 时改这里一处。
+  gateway:
+    build:
+      context: ..
+      dockerfile: packages/lea-gateway/Dockerfile
+    image: lea-gateway:test
+    container_name: lea-gateway-test
+    ports:
+      - "8840:8080"
+    env_file:
+      - ../.env
+    environment:
+      <<: *service-env
+      LEA_AGENT_URL: http://agent:8100
+      OIDC_ISSUER: ${OIDC_ISSUER:-https://passport-ai.ouchn.edu.cn}
+      OIDC_JWKS_URL: ${OIDC_JWKS_URL:-https://passport-ai.ouchn.edu.cn/.well-known/openid-configuration/jwks}
+      TENANT_MEMBERSHIP_URL: ${TENANT_MEMBERSHIP_URL:-https://ai.ouchn.edu.cn/api/TenantUser/CurrUserTenants}
+    depends_on:
+      - agent
+      - config
+      - rag
+    restart: unless-stopped
+
+  # ── frontend-lab ─────────────────────────────────────────────────────────
+  #
+  # 唯一允许改动的前端（frontend-user / frontend-admin 不动）。生产构建 +
+  # Nginx 托管，反代表见 frontend-lab/nginx.conf —— 那份文件里的路径清单
+  # 必须跟 frontend-lab/vite.config.ts 的 dev proxy 表保持一致。
+  #
+  # 只有这一个前端服务对外，宿主端口 8880。8080/80 在这台服务器上已经被
+  # 别的项目占了（ss -tlnp 查过），8840 是 gateway 自己的公网端口，8880 是
+  # 确认空闲之后选的。
+  frontend:
+    build:
+      context: ../frontend-lab
+      dockerfile: Dockerfile
+    image: lea-frontend-lab:test
+    container_name: lea-frontend-lab-test
+    ports:
+      - "8880:80"
+    depends_on:
+      - gateway
+    restart: unless-stopped
+
+  # 独立治理控制台。与遗留 frontend-admin 和用户实验前端并存，
+  # 只接本仓库当前的中性治理接口。
+  admin-console:
+    build:
+      context: ../frontend-console
+      dockerfile: Dockerfile
+    image: lea-frontend-console:test
+    container_name: lea-frontend-console-test
+    environment:
+      LEA_GATEWAY_URL: http://gateway:8080
+    ports:
+      - "8890:80"
+    depends_on:
+      - gateway
+    restart: unless-stopped
+
+  # ── lea-agent HTTP server ────────────────────────────────────────────────
+  #
+  # 有状态：持有 SSE 长连接、内存 session、session 锁、interrupt 信号。
+  # 单副本所以不需要 nginx 一致性哈希（那是 scale-test 栈在验证的东西）。
+  # 要扩副本的话不能简单改 deploy.replicas —— 必须先加一层按 session_id 哈希的
+  # 路由，否则 SSE 和中断/恢复会落到错的副本上。
+  agent:
+    build:
+      context: ..
+      dockerfile: packages/lea-agent/Dockerfile
+      additional_contexts:
+        agentloop: ../../agentloop
+    image: lea-agent:test
+    container_name: lea-agent-test
+    env_file:
+      - ../.env
+    environment:
+      <<: *service-env
+      LEA_AGENT_EXECUTION_MODE: temporal
+    depends_on:
+      temporal:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Temporal worker ──────────────────────────────────────────────────────
+  #
+  # 无状态：从队列拉任务，跑 agentloop，写 DB。没起 HTTP server，所以
+  # healthcheck 必须 disable —— 镜像里带的是 HTTP 探针，在 worker 上永远失败。
+  agent-worker:
+    image: lea-agent:test
+    container_name: lea-agent-worker-test
+    entrypoint: ["/usr/local/bin/lea-agent-worker"]
+    healthcheck:
+      disable: true
+    env_file:
+      - ../.env
+    environment:
+      <<: *service-env
+      LEA_AGENT_EXECUTION_MODE: temporal
+    depends_on:
+      agent:
+        condition: service_started
+      temporal:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── lea-config ───────────────────────────────────────────────────────────
+  config:
+    build:
+      context: ..
+      dockerfile: packages/lea-config/Dockerfile
+    image: lea-config:test
+    container_name: lea-config-test
+    env_file:
+      - ../.env
+    environment:
+      <<: *service-env
+    restart: unless-stopped
+
+  # ── lea-rag ──────────────────────────────────────────────────────────────
+  rag:
+    build:
+      context: ..
+      dockerfile: packages/lea-rag/Dockerfile
+    image: lea-rag:test
+    container_name: lea-rag-test
+    env_file:
+      - ../.env
+    environment:
+      <<: *service-env
+    depends_on:
+      milvus:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── lea-rag 检索 Celery worker ───────────────────────────────────────────
+  #
+  # server_kb.py 的上传接口把解析/切片/embedding 派给 celery 任务
+  # lea_rag.tasks.process_document（queue=retrieval）。没有这个 worker，文档永远
+  # 卡在 status=processing，KB 搜索也就永远搜不到东西 —— 是"上传成功但搜不到"
+  # 这个现象最常见的原因。
+  retrieval-worker:
+    image: lea-rag:test
+    container_name: lea-rag-retrieval-worker-test
+    entrypoint: ["celery", "-A", "lea_rag.tasks", "worker", "--loglevel=info", "--pool=solo", "--concurrency=2", "-Q", "retrieval"]
+    healthcheck:
+      disable: true
+    env_file:
+      - ../.env
+    environment:
+      <<: *service-env
+    depends_on:
+      rag:
+        condition: service_started
+    restart: unless-stopped
+
+  # ── lea-parser ───────────────────────────────────────────────────────────
+  #
+  # /parse 和用户 /usage 继续使用 Parser 自己的 JWT 鉴权、限流和计费。
+  # 管理控制台 /usage、/quotas 使用 Gateway 注入身份 + LEA_INTERNAL_TOKEN，
+  # 不安装全局 authkit 中间件，避免改变现有用户接口契约。
+  parser:
+    build:
+      context: ..
+      dockerfile: packages/lea-parser/Dockerfile
+    image: lea-parser:test
+    container_name: lea-parser-test
+    env_file:
+      - ../.env
+    environment:
+      <<: *service-env
+    restart: unless-stopped
+
+  # ── Temporal（持久化接外部 MySQL）─────────────────────────────────────────
+  #
+  # 用 auto-setup 而不是 temporal server start-dev：后者是 SQLite 单文件，数据跟着
+  # 容器卷走，卷一删 workflow 历史全没。接外部 MySQL 之后，agent 的 run 状态机
+  # （migrations/031 那两张表）和 Temporal 自己的 workflow 历史落在同一台 DB 上，
+  # 排查问题时能对起来。
+  #
+  # auto-setup 会在启动时**自建两个 schema 库**：DBNAME 和 VISIBILITY_DBNAME
+  # （下面给的是 temporal / temporal_visibility），并把表结构刷进去。所以
+  # DB_USER 必须有 CREATE DATABASE 权限 —— 没有的话容器起不来，日志里是建库被拒。
+  # 已经建好之后可以把权限收回，auto-setup 检测到 schema 版本一致就跳过。
+  #
+  # DB=mysql8 而不是 mysql：后者是 MySQL 5.7 的驱动，接 8.0 会在
+  # information_schema 查询上出错。
+  #
+  # 库名带前缀是为了跟业务库 lea-platform-test 分开，别让人误以为是平台自己的表。
+  temporal:
+    image: temporalio/auto-setup:1.27.2
+    container_name: lea-temporal-test
+    environment:
+      DB: mysql8
+      DB_PORT: ${DB_PORT:-3307}
+      MYSQL_SEEDS: ${DB_HOST:?请设置 DB_HOST}
+      MYSQL_USER: ${DB_USER:?请设置 DB_USER}
+      MYSQL_PWD: ${DB_PASSWORD:?请设置 DB_PASSWORD}
+      DBNAME: ${TEMPORAL_DBNAME:-temporal}
+      VISIBILITY_DBNAME: ${TEMPORAL_VISIBILITY_DBNAME:-temporal_visibility}
+      SKIP_DEFAULT_NAMESPACE_CREATION: "false"
+      DEFAULT_NAMESPACE: ${TEMPORAL_NAMESPACE:-default}
+      # auto-setup 镜像默认按 hostname 解析出的容器自身 IP 绑定（比如
+      # 192.168.x.x:7233），不是 127.0.0.1，也不是 0.0.0.0。下面健康检查探针
+      # 用的是 127.0.0.1:7233 —— 不加这个就永远连接被拒，容器起来了但健康检查
+      # 一直失败，跟 DB/建库权限无关。
+      BIND_ON_IP: "0.0.0.0"
+      # 默认 1 天太短，压测/排查时 workflow 历史会在看之前就被清掉。
+      DEFAULT_NAMESPACE_RETENTION: ${TEMPORAL_RETENTION:-72h}
+    healthcheck:
+      test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "127.0.0.1:7233"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      # auto-setup 首次启动要建两个库 + 刷 schema，比 start-dev 慢不少。
+      start_period: 60s
+    restart: unless-stopped
+
+  # ── Temporal Web UI ──────────────────────────────────────────────────────
+  #
+  # auto-setup 镜像不含 UI（start-dev 的 8233 是自带的，换镜像就没了）。
+  # 只绑 127.0.0.1，ssh 转发着看。
+  temporal-ui:
+    image: temporalio/ui:2.34.0
+    container_name: lea-temporal-ui-test
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: http://localhost:8233
+    ports:
+      - "127.0.0.1:8233:8080"
+    depends_on:
+      temporal:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── MinIO ────────────────────────────────────────────────────────────────
+  #
+  # 注意：这个 MinIO 只服务本平台的上传（MINIO_BUCKET=lea-uploads）和 Milvus 的
+  # 对象存储。Cube 沙箱产物用的是另一个 S3（S3_INTERNAL_ENDPOINT=10.192.241.137:9000），
+  # 两者不是一回事，别混。
+  # 口令直接沿用 .env 里的 MINIO_ACCESS_KEY / MINIO_SECRET_KEY，不在文件里写明文。
+  minio:
+    image: minio/minio:RELEASE.2024-12-13T22-19-12Z
+    container_name: lea-minio-test
+    command: server /data --console-address ":9001"
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:?请在 .env 里设置 MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:?请在 .env 里设置 MINIO_SECRET_KEY}
+    volumes:
+      - minio-test-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ── Milvus standalone + etcd ─────────────────────────────────────────────
+  #
+  # 复用上面那个 MinIO 做对象存储（dev 栈也是这么接的），不另起一个。
+  milvus-etcd:
+    image: quay.io/coreos/etcd:v3.5.18
+    container_name: lea-milvus-etcd-test
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+      ETCD_SNAPSHOT_COUNT: "50000"
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    volumes:
+      - milvus-etcd-test-data:/etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  milvus:
+    image: milvusdb/milvus:v2.5.8
+    container_name: lea-milvus-test
+    command: milvus run standalone
+    ports:
+      - "127.0.0.1:19530:19530"
+      - "127.0.0.1:9091:9091"
+    environment:
+      ETCD_ENDPOINTS: milvus-etcd:2379
+      MINIO_ADDRESS: minio:9000
+      MINIO_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY:?请在 .env 里设置 MINIO_ACCESS_KEY}
+      MINIO_SECRET_ACCESS_KEY: ${MINIO_SECRET_KEY:?请在 .env 里设置 MINIO_SECRET_KEY}
+    volumes:
+      - milvus-test-data:/var/lib/milvus
+    depends_on:
+      milvus-etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+volumes:
+  minio-test-data:
+  milvus-etcd-test-data:
+  milvus-test-data:

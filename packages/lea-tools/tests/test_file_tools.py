@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from lea_tools.services.file_store import (  # noqa: E402
     NFSFileStore,
+    SandboxFileStore,
     StaleWriteError,
     Stat,
 )
@@ -283,6 +284,42 @@ def test_read_refuses_escape(store: NFSFileStore, bad_path: str):
 def test_write_refuses_escape(store: NFSFileStore, bad_path: str):
     with pytest.raises(PermissionError):
         store.write(bad_path, b"pwned")
+
+
+# 模型跑 Bash 工具时看到的是沙箱里真实的绝对路径 /workspace/x（nfs_provisioner
+# 的 mountPath），跟 Write/Edit/Read 期望的"相对于会话 workspace 根"的相对
+# 路径是两套约定——模型很容易把两者搞混，传一个 "/workspace/x" 过来。这几个
+# 测试钉住"两种写法必须等价"，而不是让模型自己想起来要去掉这段前缀（那句
+# "路径越界"报错完全看不出该怎么改，实测会让模型反复重试白烧 ReAct 轮次）。
+def test_write_accepts_workspace_absolute_prefix(store: NFSFileStore):
+    store.write("/workspace/slides/a.js", b"content")
+    assert store.read("slides/a.js") == b"content", "绝对路径和相对路径必须落到同一个文件"
+
+
+def test_read_accepts_workspace_absolute_prefix(store: NFSFileStore):
+    store.write("slides/a.js", b"content")
+    assert store.read("/workspace/slides/a.js") == b"content"
+
+
+def test_workspace_prefix_normalization_does_not_loosen_other_absolute_paths(store: NFSFileStore):
+    """只认 /workspace 这一个前缀——别的绝对路径（不管是不是长得像）依旧要拒。"""
+    with pytest.raises(PermissionError):
+        store.write("/etc/passwd", b"pwned")
+    with pytest.raises(PermissionError):
+        store.read("/etc/passwd")
+
+
+# SandboxFileStore 是走 envd 直接操作沙箱里 /workspace 的第二条路径（跟
+# NFSFileStore 分开实现），同样的"模型把绝对路径带过来"的问题在这边独立发生
+# 过一次——_check 是纯字符串处理的 staticmethod，不需要真沙箱后端就能测。
+def test_sandbox_check_accepts_workspace_absolute_prefix():
+    assert SandboxFileStore._check("/workspace/slides/a.js") == "/workspace/slides/a.js"
+    assert SandboxFileStore._check("slides/a.js") == "/workspace/slides/a.js"
+
+
+def test_sandbox_check_still_refuses_other_absolute_paths():
+    with pytest.raises(PermissionError):
+        SandboxFileStore._check("/etc/passwd")
 
 
 def test_write_creates_nested_dirs(store: NFSFileStore):

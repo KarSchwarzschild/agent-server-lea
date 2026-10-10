@@ -26,24 +26,32 @@ type gateway struct {
 	issuer        string
 	verifier      *jwksVerifier
 	tenantClient  *tenantMembershipClient
+	testAdminRole string
 	agent         *httputil.ReverseProxy
 	config        *httputil.ReverseProxy
 	rag           *httputil.ReverseProxy
+	parser        *httputil.ReverseProxy
 }
 
 func main() {
 	issuer := env("OIDC_ISSUER", defaultOIDCIssuer)
 	jwksURL := env("OIDC_JWKS_URL", issuer+"/.well-known/openid-configuration/jwks")
+	testAdminRole, err := parseTestAdminRole(os.Getenv("LEA_ENV"), os.Getenv("LEA_TEST_ADMIN_ROLE"))
+	if err != nil {
+		log.Fatal(err)
+	}
 	tenantRoleCache, tenantRoleCacheTTL := newTenantRoleCache()
 	redisKeyPrefix := env("REDIS_KEY_PREFIX", "lea:skill-market:")
 
-	agent := newProxy(env("LEA_AGENT_URL", "http://lea-agent:8100"), "")
-	config := newProxy(env("LEA_CONFIG_URL", "http://lea-config:8500"), "/api/user")
-	rag := newProxy(env("LEA_RAG_URL", "http://lea-rag:8300"), "/api/user")
+	agent := newProxy(env("LEA_AGENT_URL", "http://lea-agent:8100"))
+	config := newProxy(env("LEA_CONFIG_URL", "http://lea-config:8500"), "/api/user", "/api")
+	rag := newProxy(env("LEA_RAG_URL", "http://lea-rag:8300"), "/api/user", "/api")
+	parser := newProxy(env("LEA_PARSER_URL", "http://lea-parser:8600"), "/api")
 	g := &gateway{
 		internalToken: strings.TrimSpace(os.Getenv("LEA_INTERNAL_TOKEN")),
 		issuer:        issuer,
 		verifier:      newJWKSVerifier(jwksURL),
+		testAdminRole: testAdminRole,
 		tenantClient: &tenantMembershipClient{
 			url:         env("TENANT_MEMBERSHIP_URL", "https://aibase-preview.ouc-online.com.cn/api/TenantUser/CurrUserTenants"),
 			client:      &http.Client{Timeout: 10 * time.Second},
@@ -54,6 +62,7 @@ func main() {
 		agent:  agent,
 		config: config,
 		rag:    rag,
+		parser: parser,
 	}
 
 	server := &http.Server{
@@ -85,6 +94,40 @@ func (g *gateway) routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", g.health)
 	mux.HandleFunc("/api/tenants", g.tenants)
+	// 中性资源路径是新契约。角色、租户和对象归属由下游服务决定，不把调用者角色
+	// 编进 URL。/api/user/* 暂留作兼容别名。
+	mux.HandleFunc("/api/agents", g.configRoute)
+	mux.HandleFunc("/api/agents/", g.configRoute)
+	mux.HandleFunc("/api/teams", g.configRoute)
+	mux.HandleFunc("/api/teams/", g.configRoute)
+	mux.HandleFunc("/api/skills", g.configRoute)
+	mux.HandleFunc("/api/skills/", g.configRoute)
+	mux.HandleFunc("/api/tools", g.configRoute)
+	mux.HandleFunc("/api/tools/", g.configRoute)
+	mux.HandleFunc("/api/mcp-servers", g.configRoute)
+	mux.HandleFunc("/api/mcp-servers/", g.configRoute)
+	mux.HandleFunc("/api/publication-requests", g.configRoute)
+	mux.HandleFunc("/api/publication-requests/", g.configRoute)
+	mux.HandleFunc("/api/audit-events", g.configRoute)
+	mux.HandleFunc("/api/audit-events/", g.configRoute)
+	mux.HandleFunc("/api/publications", g.configRoute)
+	mux.HandleFunc("/api/publications/", g.configRoute)
+	mux.HandleFunc("/api/resources/", g.configRoute)
+	mux.HandleFunc("/api/providers", g.configRoute)
+	mux.HandleFunc("/api/providers/", g.configRoute)
+	mux.HandleFunc("/api/retrieval/models", g.configRoute)
+	mux.HandleFunc("/api/retrieval/models/", g.configRoute)
+	mux.HandleFunc("/api/console-context", g.configRoute)
+	mux.HandleFunc("/api/operations/runs", g.agentRoute)
+	mux.HandleFunc("/api/operations/runs/", g.agentRoute)
+	mux.HandleFunc("/api/operations/document-jobs", g.ragRoute)
+	mux.HandleFunc("/api/operations/document-jobs/", g.ragRoute)
+	mux.HandleFunc("/api/usage", g.parserRoute)
+	mux.HandleFunc("/api/quotas", g.parserRoute)
+	mux.HandleFunc("/api/quotas/", g.parserRoute)
+	mux.HandleFunc("/api/knowledge-bases", g.ragRoute)
+	mux.HandleFunc("/api/knowledge-bases/", g.ragRoute)
+
 	mux.HandleFunc("/api/user/agents", g.configRoute)
 	mux.HandleFunc("/api/user/agents/", g.configRoute)
 	mux.HandleFunc("/api/user/teams", g.configRoute)
@@ -97,6 +140,8 @@ func (g *gateway) routes() *http.ServeMux {
 	mux.HandleFunc("/api/user/mcp-servers/", g.configRoute)
 	// 可选聊天模型列表（只投影模型名，不含 provider 的 base_url/api_key）。
 	mux.HandleFunc("/api/user/llm-models", g.configRoute)
+	// 可选检索模型列表（embedding/reranker/vlm，建库表单用），同样只投影安全字段。
+	mux.HandleFunc("/api/user/retrieval-models", g.configRoute)
 	mux.HandleFunc("/api/user/knowledge-bases", g.ragRoute)
 	mux.HandleFunc("/api/user/knowledge-bases/", g.ragRoute)
 	mux.HandleFunc("/api/user/memories", g.ragRoute)
@@ -145,7 +190,7 @@ func (g *gateway) tenants(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		result = append(result, map[string]string{
-			"id": item.TenantID, "type": item.TenantType, "role": mapTenantRole(item.TenantType, item.UserTenantRoleName, item.Role),
+			"id": item.TenantID, "type": item.TenantType, "role": g.effectiveRole(mapTenantRole(item.TenantType, item.UserTenantRoleName, item.Role)),
 		})
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -209,6 +254,10 @@ func (g *gateway) ragRoute(w http.ResponseWriter, r *http.Request) {
 	g.trustedRoute(w, r, g.rag)
 }
 
+func (g *gateway) parserRoute(w http.ResponseWriter, r *http.Request) {
+	g.trustedRoute(w, r, g.parser)
+}
+
 func (g *gateway) trustedRoute(w http.ResponseWriter, r *http.Request, proxy *httputil.ReverseProxy) {
 	if g.internalToken == "" {
 		http.Error(w, `{"error":"gateway internal token is not configured"}`, http.StatusServiceUnavailable)
@@ -225,6 +274,7 @@ func (g *gateway) trustedRoute(w http.ResponseWriter, r *http.Request, proxy *ht
 		http.Error(w, `{"error":"selected tenant is invalid"}`, http.StatusForbidden)
 		return
 	}
+	role = g.effectiveRole(role)
 	// The config service consumes these only after the gateway has verified JWT.
 	r.Header.Del("X-User-ID")
 	r.Header.Del("X-Tenant-ID")
@@ -249,6 +299,7 @@ func (g *gateway) agentRoute(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":"selected tenant is invalid"}`, http.StatusForbidden)
 		return
 	}
+	role = g.effectiveRole(role)
 	r.Header.Del("Authorization")
 	r.Header.Del("X-User-ID")
 	r.Header.Del("X-Tenant-ID")
@@ -259,6 +310,27 @@ func (g *gateway) agentRoute(w http.ResponseWriter, r *http.Request) {
 	r.Header.Set("X-User-Role", role)
 	r.Header.Set("X-Internal-Token", g.internalToken)
 	g.agent.ServeHTTP(w, r)
+}
+
+func parseTestAdminRole(environment, configuredRole string) (string, error) {
+	role := strings.ToLower(strings.TrimSpace(configuredRole))
+	if role == "" || role == "disabled" {
+		return "", nil
+	}
+	if !strings.EqualFold(strings.TrimSpace(environment), "test") {
+		return "", fmt.Errorf("LEA_TEST_ADMIN_ROLE is only allowed when LEA_ENV=test")
+	}
+	if role != "admin" && role != "platform_admin" {
+		return "", fmt.Errorf("invalid LEA_TEST_ADMIN_ROLE %q: expected disabled, admin, or platform_admin", configuredRole)
+	}
+	return role, nil
+}
+
+func (g *gateway) effectiveRole(membershipRole string) string {
+	if g.testAdminRole != "" {
+		return g.testAdminRole
+	}
+	return membershipRole
 }
 
 func trustedRole(roles []string) string {
@@ -272,7 +344,7 @@ func trustedRole(roles []string) string {
 	return ""
 }
 
-func newProxy(raw, stripPrefix string) *httputil.ReverseProxy {
+func newProxy(raw string, stripPrefixes ...string) *httputil.ReverseProxy {
 	target, err := url.Parse(raw)
 	if err != nil {
 		log.Fatalf("invalid upstream URL %q: %v", raw, err)
@@ -281,11 +353,15 @@ func newProxy(raw, stripPrefix string) *httputil.ReverseProxy {
 	original := p.Director
 	p.Director = func(r *http.Request) {
 		original(r)
-		if stripPrefix != "" {
+		for _, stripPrefix := range stripPrefixes {
+			if stripPrefix == "" || (r.URL.Path != stripPrefix && !strings.HasPrefix(r.URL.Path, stripPrefix+"/")) {
+				continue
+			}
 			r.URL.Path = strings.TrimPrefix(r.URL.Path, stripPrefix)
 			if r.URL.Path == "" {
 				r.URL.Path = "/"
 			}
+			break
 		}
 		r.Host = target.Host
 	}

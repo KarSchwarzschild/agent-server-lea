@@ -6,6 +6,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"strings"
+	"time"
+
+	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/metrics"
 )
 
 type MemoryMiddleware struct {
@@ -62,10 +65,13 @@ func (m *MemoryMiddleware) fetchProfile(ctx context.Context, agentID string) str
 	if err != nil {
 		return ""
 	}
+	start := time.Now()
 	resp, err := httpClient.Do(req)
 	if err != nil || resp.StatusCode != 200 {
+		metrics.RecordDownstreamCall("memory", "error", time.Since(start))
 		return ""
 	}
+	metrics.RecordDownstreamCall("memory", "ok", time.Since(start))
 	defer resp.Body.Close()
 	var out struct {
 		Profile string `json:"profile"`
@@ -85,10 +91,13 @@ func (m *MemoryMiddleware) searchMemories(ctx context.Context, query string) str
 		m.ragURL+"/memory/search", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 
+	start := time.Now()
 	resp, err := httpClient.Do(req)
 	if err != nil || resp.StatusCode != 200 {
+		metrics.RecordDownstreamCall("memory", "error", time.Since(start))
 		return ""
 	}
+	metrics.RecordDownstreamCall("memory", "ok", time.Since(start))
 	defer resp.Body.Close()
 
 	var results []struct {
@@ -114,9 +123,13 @@ func (m *MemoryMiddleware) extractMemories(ctx context.Context, messages []Messa
 	req, _ := http.NewRequestWithContext(ctx, "POST",
 		m.ragURL+"/memory/extract", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	start := time.Now()
 	resp, err := httpClient.Do(req)
 	if err == nil {
+		metrics.RecordDownstreamCall("memory", "ok", time.Since(start))
 		resp.Body.Close()
+	} else {
+		metrics.RecordDownstreamCall("memory", "error", time.Since(start))
 	}
 }
 
@@ -129,9 +142,13 @@ func (m *MemoryMiddleware) mergeProfile(ctx context.Context, sessionID, agentID 
 	req, _ := http.NewRequestWithContext(ctx, "POST",
 		m.ragURL+"/memory/profile/merge", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	mergeStart := time.Now()
 	resp, err := httpClient.Do(req)
 	if err == nil {
+		metrics.RecordDownstreamCall("memory", "ok", time.Since(mergeStart))
 		resp.Body.Close()
+	} else {
+		metrics.RecordDownstreamCall("memory", "error", time.Since(mergeStart))
 	}
 }
 

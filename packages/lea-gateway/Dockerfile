@@ -1,5 +1,9 @@
 FROM golang:1.26-alpine AS build
 
+# GOPROXY 默认是 proxy.golang.org，国内网络连不通；换成国内镜像
+# （跟 lea-agent/Dockerfile 保持一致）。
+ENV GOPROXY=https://goproxy.cn,direct
+
 WORKDIR /src
 COPY packages/lea-gateway/go.mod packages/lea-gateway/go.sum ./packages/lea-gateway/
 WORKDIR /src/packages/lea-gateway

@@ -1,0 +1,18 @@
+# 只作用于 packages/lea-tools 作为构建上下文的构建（Dockerfile.standalone）。
+# monorepo 里用仓库根做上下文的构建读的是仓库根的 .dockerignore，不受这份影响。
+
+# 密钥不进构建上下文——Dockerfile 里本来就没 COPY 它，这里是多一道保险。
+.env
+.env.*
+!.env.example
+
+# 运行时用不到、又可能很大的东西
+*.db
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+tests/
+scripts/
+skills/
+sandbox/

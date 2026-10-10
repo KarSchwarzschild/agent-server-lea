@@ -42,10 +42,12 @@ app.add_middleware(
 from lea_parser.api.parse import router as parse_router
 from lea_parser.api.admin import router as admin_router
 from lea_parser.api.usage import router as usage_router
+from lea_parser.api.console import router as console_router
 
 app.include_router(parse_router)
 app.include_router(admin_router)
 app.include_router(usage_router)
+app.include_router(console_router)
 
 
 @app.get("/health")

@@ -302,7 +302,16 @@ func loadAgentConfigFromSource(ctx context.Context, agentID int, tenantID string
 		cfg.MaxTokens = 4096
 	}
 	if cfg.MaxTurns == 0 {
-		cfg.MaxTurns = 20
+		// 100 而不是原来的 20：一次 ReAct 迭代 = 一次模型往返，多文件任务的每个
+		// Write 都吃掉一轮。实测"生成一套 PPT"（读 4 份参考文档 + 逐个写 14 个
+		// slide 文件 + 编译）会在 20 轮处被 ErrMaxIterations 截断，而截断点往往
+		// 是最后的打包步骤 —— 前面几十次工具调用的产出全都白费，用户看到的是
+		// "max react iterations reached"，完全看不出是预算不够而不是任务失败。
+		//
+		// 上限存在的意义是"防止模型陷在一个工具循环里无限烧钱"，不是给正常任务
+		// 设配额，所以宁可给宽。真正约束成本的是 MaxContextTokens（达 80% 触发
+		// 语义压缩）和单轮 MaxTokens，那两个才是按量计费的闸门。
+		cfg.MaxTurns = 100
 	}
 
 	// 适配 lea-config 字段格式

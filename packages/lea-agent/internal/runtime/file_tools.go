@@ -224,7 +224,7 @@ type ReadFileTool struct{ fileToolBase }
 
 func (t *ReadFileTool) Name() string { return "Read" }
 func (t *ReadFileTool) Description() string {
-	return "读取一个文件的内容。既能读工作空间（/workspace）里的文本文件，也能读用户上传的原件" +
+	return "读取一个文件的内容。既能读工作空间里的文本文件，也能读用户上传的原件" +
 		"（/mnt/uploads/... —— pdf、docx、pptx、xlsx 这类二进制文档会自动返回解析出来的文本）。" +
 		"修改工作空间里的文件前必须先读 —— 未读过的文件不允许覆盖，这可以防止抹掉你没看过的内容。"
 }

@@ -24,14 +24,69 @@ services:
       # "failed to solve: agentloop: ... failed size validation" —— 完全看不出是缺上下文。
       additional_contexts:
         agentloop: ../../agentloop
+    image: lea-agent:dev
     container_name: lea-agent
     env_file:
       - ../.env
+    environment:
+      LEA_AGENT_EXECUTION_MODE: temporal
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      LEA_AGENT_TEMPORAL_TASK_QUEUE: lea-agent-runs
     depends_on:
       mysql:
         condition: service_healthy
       redis:
         condition: service_healthy
+      temporal:
+        condition: service_healthy
+    restart: unless-stopped
+
+  agent-worker:
+    image: lea-agent:dev
+    container_name: lea-agent-worker
+    entrypoint: ["/usr/local/bin/lea-agent-worker"]
+    healthcheck:
+      disable: true
+    env_file:
+      - ../.env
+    environment:
+      LEA_AGENT_EXECUTION_MODE: temporal
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      LEA_AGENT_TEMPORAL_TASK_QUEUE: lea-agent-runs
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      temporal:
+        condition: service_healthy
+    restart: unless-stopped
+
+  temporal:
+    image: temporalio/temporal@sha256:ad4c82c97bd12b417d1ea942610dbcd511afb250c4d5ed26c694009533df447e
+    container_name: lea-temporal
+    # start-dev 的 SQLite 文件位于 named volume；本地开发栈用 root 初始化该卷。
+    user: "0:0"
+    command:
+      - server
+      - start-dev
+      - --ip
+      - 0.0.0.0
+      - --db-filename
+      - /var/lib/temporal/temporal.db
+    ports:
+      - "7233:7233"
+      - "8233:8233"
+    volumes:
+      - temporal_data:/var/lib/temporal
+    healthcheck:
+      test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "127.0.0.1:7233"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
     restart: unless-stopped
 
   config:
@@ -133,3 +188,4 @@ volumes:
   mysql_data:
   redis_data:
   minio_data:
+  temporal_data:

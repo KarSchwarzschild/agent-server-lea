@@ -5,6 +5,12 @@ from lea_config.models.binding import AgentKbBinding, AgentSkillBinding, AgentTo
 from lea_config.models.knowledge import KnowledgeBase  # noqa: F401
 from lea_config.models.llm_provider import LLMProvider  # noqa: F401
 from lea_config.models.mcp_server import MCPServer  # noqa: F401
+from lea_config.models.publication import (  # noqa: F401
+    AuditEvent,
+    PublicationRequest,
+    ResourceCheck,
+    ResourcePublication,
+)
 from lea_config.models.retrieval_model import RetrievalModel  # noqa: F401
 from lea_config.models.skill import Skill, SkillVersion  # noqa: F401
 from lea_config.models.skill_publish import SkillPublishRequest  # noqa: F401
@@ -22,6 +28,8 @@ __all__ = [
     "KnowledgeBase",
     "LLMProvider",
     "MCPServer",
+    "AuditEvent",
+    "PublicationRequest",
     "RetrievalModel",
     "Role",
     "SkillPublishRequest",

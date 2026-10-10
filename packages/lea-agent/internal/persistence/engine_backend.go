@@ -67,9 +67,10 @@ type EngineBackend struct {
 // 编译期钉住接口。少一个方法的后果不是编译失败而是 Build 时才报错 ——
 // 那时已经是运行期，且表现为会话建不起来。
 var (
-	_ sessions.Backend      = (*EngineBackend)(nil)
-	_ sessions.Store        = (*engineStore)(nil)
-	_ sessions.SummaryStore = (*engineStore)(nil)
+	_ sessions.Backend       = (*EngineBackend)(nil)
+	_ sessions.Store         = (*engineStore)(nil)
+	_ sessions.SummaryStore  = (*engineStore)(nil)
+	_ sessions.InflightStore = (*engineStore)(nil)
 )
 
 // NewEngineBackend returns a Backend scoped to one tenant.
@@ -324,7 +325,15 @@ type engineStore struct {
 // half-written is worse than one not written, because the next LoadHistory would
 // hand the model a user message whose reply is missing.
 func (s *engineStore) Append(ctx context.Context, messages []llm.Message) error {
-	if s.db == nil || len(messages) == 0 {
+	return s.append(ctx, messages, nil)
+}
+
+func (s *engineStore) AppendCheckpoint(ctx context.Context, messages []llm.Message, checkpoint sessions.TurnCheckpoint) error {
+	return s.append(ctx, messages, &checkpoint)
+}
+
+func (s *engineStore) append(ctx context.Context, messages []llm.Message, checkpoint *sessions.TurnCheckpoint) error {
+	if s.db == nil || (len(messages) == 0 && checkpoint == nil) {
 		return nil
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -332,27 +341,107 @@ func (s *engineStore) Append(ctx context.Context, messages []llm.Message) error 
 		return fmt.Errorf("begin append: %w", err)
 	}
 	defer tx.Rollback() //nolint:errcheck // no-op once Commit succeeded
-
-	stmt, err := tx.PrepareContext(ctx,
-		`INSERT INTO agent_messages (session_id, tenant_id, role, message) VALUES (?, ?, ?, ?)`)
-	if err != nil {
-		return fmt.Errorf("prepare append: %w", err)
-	}
-	defer stmt.Close()
-
-	for _, m := range messages {
-		raw, err := json.Marshal(m)
-		if err != nil {
-			return fmt.Errorf("marshal message: %w", err)
+	run, tracked := agentRunAttemptFromContext(ctx)
+	if tracked {
+		if err := lockAgentRunAttempt(ctx, tx, run); err != nil {
+			log.Printf("agent_history_fence_rejected session=%s run=%s attempt=%d err=%v",
+				s.sessionID, run.RunID, run.Attempt, err)
+			return err
 		}
-		if _, err := stmt.ExecContext(ctx, s.sessionID, s.tenantID, string(m.Role), raw); err != nil {
-			return fmt.Errorf("insert message: %w", err)
+	}
+	if checkpoint != nil && !tracked {
+		checkpoint = nil
+	}
+
+	if err := s.appendMessages(ctx, tx, messages, run, tracked); err != nil {
+		return err
+	}
+	if checkpoint != nil {
+		raw, err := json.Marshal(checkpoint)
+		if err != nil {
+			return fmt.Errorf("marshal turn checkpoint: %w", err)
+		}
+		_, err = tx.ExecContext(ctx,
+			`INSERT INTO agent_run_checkpoints
+			    (run_id, attempt, phase, iteration, checkpoint_json)
+			 VALUES (?, ?, ?, ?, ?)
+			 ON DUPLICATE KEY UPDATE
+			    attempt = VALUES(attempt), phase = VALUES(phase),
+			    iteration = VALUES(iteration), checkpoint_json = VALUES(checkpoint_json),
+			    updated_at = CURRENT_TIMESTAMP(6)`,
+			run.RunID, run.Attempt, checkpoint.Phase, checkpoint.Iteration, raw,
+		)
+		if err != nil {
+			return fmt.Errorf("upsert turn checkpoint: %w", err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit append: %w", err)
 	}
 	return nil
+}
+
+func (s *engineStore) appendMessages(ctx context.Context, tx *sql.Tx, messages []llm.Message, run agentRunAttempt, tracked bool) error {
+	if len(messages) == 0 {
+		return nil
+	}
+	query := `INSERT INTO agent_messages (session_id, tenant_id, role, message) VALUES (?, ?, ?, ?)`
+	if tracked {
+		query = `INSERT INTO agent_messages
+		          (session_id, tenant_id, role, message, run_id, run_attempt)
+		         VALUES (?, ?, ?, ?, ?, ?)`
+	}
+	stmt, err := tx.PrepareContext(ctx, query)
+	if err != nil {
+		return fmt.Errorf("prepare append: %w", err)
+	}
+	defer stmt.Close()
+	for _, message := range messages {
+		raw, err := json.Marshal(message)
+		if err != nil {
+			return fmt.Errorf("marshal message: %w", err)
+		}
+		args := []any{s.sessionID, s.tenantID, string(message.Role), raw}
+		if tracked {
+			args = append(args, run.RunID, run.Attempt)
+		}
+		if _, err := stmt.ExecContext(ctx, args...); err != nil {
+			return fmt.Errorf("insert message: %w", err)
+		}
+	}
+	return nil
+}
+
+// WriteInflight mirrors the working history to Redis after every engine step, so a
+// replacement worker resumes from what this one had rather than from the last
+// CheckpointStore boundary.
+//
+// Best-effort by contract (sessions.InflightStore): the engine logs a failure and
+// keeps going. Losing the snapshot costs the finer granularity — the retry falls
+// back to re-running the tail of the current batch — not the turn.
+//
+// The run id and attempt come from the context, set by WithAgentRunAttempt at the
+// top of a run. Outside a tracked run (an interactive HTTP turn with no Temporal
+// activity behind it) there is nothing to key on, so this is a no-op: those turns
+// have no retry to recover.
+func (s *engineStore) WriteInflight(ctx context.Context, messages []llm.Message) error {
+	run, tracked := agentRunAttemptFromContext(ctx)
+	if !tracked {
+		return nil
+	}
+	return WriteInflightSnapshot(ctx, inflightStore(), s.tenantID, s.sessionID, run.RunID, run.Attempt, messages)
+}
+
+// ClearInflight drops the snapshot and the in-process append anchor once the
+// turn reached a durable end. Dropping the anchor ensures a subsequent write
+// for the same key (same run re-queued) starts with a full re-anchor rather
+// than appending onto a list that no longer exists.
+func (s *engineStore) ClearInflight(ctx context.Context) error {
+	run, tracked := agentRunAttemptFromContext(ctx)
+	if !tracked {
+		return nil
+	}
+	return ClearInflightSnapshot(ctx, inflightStore(), s.tenantID, s.sessionID, run.RunID, run.Attempt)
 }
 
 // SaveSummary persists a compaction summary and how many recent messages follow it.
@@ -389,11 +478,21 @@ func (s *engineStore) SaveSummary(ctx context.Context, summary llm.Message, rece
 			s.sessionID, s.tenantID, recentCount, err)
 		return err
 	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fail(fmt.Errorf("begin summary save: %w", err))
+	}
+	defer func() { _ = tx.Rollback() }()
+	if run, tracked := agentRunAttemptFromContext(ctx); tracked {
+		if err := lockAgentRunAttempt(ctx, tx, run); err != nil {
+			return fail(err)
+		}
+	}
 
 	// Find the id of the last covered message: skip recentCount rows from the end,
 	// take the next one's id. This is the boundary LoadHistory uses (WHERE id > covered_id).
 	var coveredID int64
-	err := s.db.QueryRowContext(ctx,
+	err = tx.QueryRowContext(ctx,
 		`SELECT id FROM agent_messages
 		  WHERE tenant_id = ? AND session_id = ?
 		  ORDER BY id DESC
@@ -416,7 +515,7 @@ func (s *engineStore) SaveSummary(ctx context.Context, summary llm.Message, rece
 		return fail(fmt.Errorf("marshal summary: %w", err))
 	}
 
-	_, err = s.db.ExecContext(ctx,
+	_, err = tx.ExecContext(ctx,
 		`INSERT INTO session_summaries (session_id, tenant_id, summary, covered_id)
 		  VALUES (?, ?, ?, ?)
 		  ON DUPLICATE KEY UPDATE
@@ -427,6 +526,24 @@ func (s *engineStore) SaveSummary(ctx context.Context, summary llm.Message, rece
 	)
 	if err != nil {
 		return fail(fmt.Errorf("upsert summary: %w", err))
+	}
+	if err := tx.Commit(); err != nil {
+		return fail(fmt.Errorf("commit summary: %w", err))
+	}
+	return nil
+}
+
+func lockAgentRunAttempt(ctx context.Context, tx *sql.Tx, run agentRunAttempt) error {
+	var attempt int
+	var status RunStatus
+	if err := tx.QueryRowContext(ctx,
+		`SELECT attempt, status FROM agent_runs WHERE id = ? FOR UPDATE`, run.RunID,
+	).Scan(&attempt, &status); err != nil {
+		return fmt.Errorf("lock agent run attempt: %w", err)
+	}
+	if attempt != run.Attempt || (status != RunRunning && status != RunCancelling) {
+		return fmt.Errorf("agent run %s attempt %d is stale (current=%d status=%s)",
+			run.RunID, run.Attempt, attempt, status)
 	}
 	return nil
 }

@@ -1,0 +1,302 @@
+# infra/docker-compose.scale-test.yml — 本地生产架构验证栈
+#
+# 完整模拟 Temporal 执行模式的生产架构：
+#
+#   用户 → gateway → agent-lb（nginx consistent hash） → agent-1 / agent-2
+#                                                              ↓ 提交 Temporal workflow
+#                                                    agent-worker-1 / agent-worker-2
+#                                                              ↓ LLM + tool 执行
+#                                                              ↓ 结果写 DB
+#
+# 两层分工：
+#   HTTP server（agent-1/2）：持有 SSE 长连接、内存 session 对象、session 锁、interrupt 信号
+#   Temporal worker（worker-1/2）：无状态，从队列拉任务，跑 agentloop，写 DB
+#
+# nginx consistent hash（按 session_id）：同一个 session 永远落到同一 HTTP 副本。
+#   这是 Temporal 模式下的正确生产路由，SSE 和中断/恢复才能工作。
+#   停掉 agent-1 → 流量重新哈希到 agent-2 → 触发指纹自愈路径，可以手动验证。
+#
+# 两个 worker 验证：
+#   同一 task queue，两个 worker 并发拉取，验证不重跑、不竞争、Temporal 幂等性正确。
+#
+# 外部依赖（MySQL / Redis / Milvus / MinIO / Temporal）从宿主直接连接，不在这里起。
+#
+# 启动：
+#   cd lea-platform
+#   docker compose -f infra/docker-compose.scale-test.yml up --build
+#
+# 前端连接（另开终端）：
+#   cd frontend-lab
+#   VITE_API_TARGET=http://localhost:8080 npm run dev
+#   浏览器打开 http://localhost:9300，在 UI 填入基座 access token 即可使用。
+
+services:
+
+  # ── 入口：HTTP 网关（无状态，× 1）─────────────────────────────────────────
+  gateway:
+    build:
+      context: ..
+      dockerfile: packages/lea-gateway/Dockerfile
+    container_name: lea-gateway-scale
+    ports:
+      - "8080:8080"
+    env_file:
+      - ../.env
+    environment:
+      LEA_AGENT_URL: http://agent-lb:8100
+      LEA_CONFIG_URL: http://config:8500
+      LEA_RAG_URL: http://rag:8300
+      LEA_TOOLS_URL: http://10.192.241.137:8400
+      LEA_INTERNAL_TOKEN: local-dev-internal-token
+      OIDC_ISSUER: https://passport-ai.ouchn.edu.cn
+      OIDC_JWKS_URL: https://passport-ai.ouchn.edu.cn/.well-known/openid-configuration/jwks
+      TENANT_MEMBERSHIP_URL: https://ai.ouchn.edu.cn/api/TenantUser/CurrUserTenants
+    depends_on:
+      - agent-lb
+      - config
+      - rag
+      - tools
+    restart: unless-stopped
+
+  # ── nginx：按 session_id 一致性哈希路由到两个 HTTP 副本─────────────────────
+  agent-lb:
+    image: nginx:alpine
+    container_name: lea-agent-lb-scale
+    volumes:
+      - ./nginx/agent-lb.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - agent-1
+      - agent-2
+    restart: unless-stopped
+
+  # ── lea-agent HTTP server 副本 1（有状态）────────────────────────────────
+  agent-1:
+    build:
+      context: ..
+      dockerfile: packages/lea-agent/Dockerfile
+      additional_contexts:
+        agentloop: ../../agentloop
+    image: lea-agent:scale
+    container_name: lea-agent-1
+    env_file:
+      - ../.env
+    environment:
+      LEA_INTERNAL_TOKEN: local-dev-internal-token
+      LEA_CONFIG_URL: http://config:8500
+      LEA_RAG_URL: http://rag:8300
+      LEA_TOOLS_URL: http://10.192.241.137:8400
+      LEA_AGENT_EXECUTION_MODE: temporal
+      TEMPORAL_ADDRESS: host.docker.internal:7233
+      TEMPORAL_NAMESPACE: default
+      LEA_AGENT_TEMPORAL_TASK_QUEUE: lea-agent-runs
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    restart: unless-stopped
+
+  # ── lea-agent HTTP server 副本 2（有状态）────────────────────────────────
+  agent-2:
+    image: lea-agent:scale
+    container_name: lea-agent-2
+    env_file:
+      - ../.env
+    environment:
+      LEA_INTERNAL_TOKEN: local-dev-internal-token
+      LEA_CONFIG_URL: http://config:8500
+      LEA_RAG_URL: http://rag:8300
+      LEA_TOOLS_URL: http://10.192.241.137:8400
+      LEA_AGENT_EXECUTION_MODE: temporal
+      TEMPORAL_ADDRESS: host.docker.internal:7233
+      TEMPORAL_NAMESPACE: default
+      LEA_AGENT_TEMPORAL_TASK_QUEUE: lea-agent-runs
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    depends_on:
+      - agent-1
+    restart: unless-stopped
+
+  # ── Temporal Worker 副本 1（无状态，并发执行验证）────────────────────────
+  agent-worker-1:
+    image: lea-agent:scale
+    container_name: lea-agent-worker-1
+    entrypoint: ["/usr/local/bin/lea-agent-worker"]
+    healthcheck:
+      disable: true
+    env_file:
+      - ../.env
+    environment:
+      LEA_INTERNAL_TOKEN: local-dev-internal-token
+      LEA_CONFIG_URL: http://config:8500
+      LEA_RAG_URL: http://rag:8300
+      LEA_TOOLS_URL: http://10.192.241.137:8400
+      LEA_AGENT_EXECUTION_MODE: temporal
+      TEMPORAL_ADDRESS: host.docker.internal:7233
+      TEMPORAL_NAMESPACE: default
+      LEA_AGENT_TEMPORAL_TASK_QUEUE: lea-agent-runs
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    depends_on:
+      - agent-1
+      - agent-2
+    restart: unless-stopped
+
+  # ── Temporal Worker 副本 2（无状态，并发执行验证）────────────────────────
+  agent-worker-2:
+    image: lea-agent:scale
+    container_name: lea-agent-worker-2
+    entrypoint: ["/usr/local/bin/lea-agent-worker"]
+    healthcheck:
+      disable: true
+    env_file:
+      - ../.env
+    environment:
+      LEA_INTERNAL_TOKEN: local-dev-internal-token
+      LEA_CONFIG_URL: http://config:8500
+      LEA_RAG_URL: http://rag:8300
+      LEA_TOOLS_URL: http://10.192.241.137:8400
+      LEA_AGENT_EXECUTION_MODE: temporal
+      TEMPORAL_ADDRESS: host.docker.internal:7233
+      TEMPORAL_NAMESPACE: default
+      LEA_AGENT_TEMPORAL_TASK_QUEUE: lea-agent-runs
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    depends_on:
+      - agent-1
+      - agent-2
+    restart: unless-stopped
+
+  # ── lea-config（无状态，× 1）─────────────────────────────────────────────
+  config:
+    build:
+      context: ..
+      dockerfile: packages/lea-config/Dockerfile
+    container_name: lea-config-scale
+    env_file:
+      - ../.env
+    environment:
+      LEA_INTERNAL_TOKEN: local-dev-internal-token
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    restart: unless-stopped
+
+  # ── lea-rag（无状态，× 1）────────────────────────────────────────────────
+  #
+  # MINIO_ENDPOINT / LEA_MILVUS_URI 必须在这里覆盖：.env 里那两个值
+  # （127.0.0.1:9000、默认 localhost:19530）是给"裸机跑 uvicorn"场景写的，
+  # 在容器里 127.0.0.1/localhost 指向自己，不是宿主也不是 minio/milvus 容器。
+  # lea-rag-scale 和 lea-minio-dev / lea-milvus-dev 同在 infra_default 网络
+  # （两个 compose 文件都在 infra/ 目录下，默认 project 名相同），用容器名直连。
+  rag:
+    build:
+      context: ..
+      dockerfile: packages/lea-rag/Dockerfile
+    image: lea-rag:scale
+    container_name: lea-rag-scale
+    env_file:
+      - ../.env
+    environment:
+      LEA_INTERNAL_TOKEN: local-dev-internal-token
+      MINIO_ENDPOINT: http://lea-minio-dev:9000
+      LEA_MILVUS_URI: http://lea-milvus-dev:19530
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    restart: unless-stopped
+
+  # ── lea-rag 检索 Celery worker（无状态，× 1）────────────────────────────
+  #
+  # server_kb.py 的上传接口把解析/切片/embedding 派给 celery 任务
+  # `lea_rag.tasks.process_document`（queue=retrieval）——没有 worker 消费这个
+  # 队列，文档永远卡在 status=processing，KB 搜索也就永远搜不到东西。
+  # scale-test 栈原来没有这个服务（对照 infra/docker-compose.dev.yml 的
+  # retrieval-worker），是文档处理这条链路缺的最后一环。
+  retrieval-worker:
+    image: lea-rag:scale
+    container_name: lea-rag-retrieval-worker-scale
+    depends_on:
+      - rag
+    env_file:
+      - ../.env
+    environment:
+      LEA_INTERNAL_TOKEN: local-dev-internal-token
+      MINIO_ENDPOINT: http://lea-minio-dev:9000
+      LEA_MILVUS_URI: http://lea-milvus-dev:19530
+    entrypoint: ["celery", "-A", "lea_rag.tasks", "worker", "--loglevel=info", "--pool=solo", "--concurrency=2", "-Q", "retrieval"]
+    healthcheck:
+      disable: true
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    restart: unless-stopped
+
+  # ── lea-tools（无状态，× 1）──────────────────────────────────────────────
+  tools:
+    build:
+      context: ..
+      dockerfile: packages/lea-tools/Dockerfile
+    container_name: lea-tools-scale
+    env_file:
+      - ../.env
+    environment:
+      LEA_INTERNAL_TOKEN: local-dev-internal-token
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    restart: unless-stopped
+
+  # ── 可观测性：Prometheus + Grafana ───────────────────────────────────────
+  #
+  # 四个服务的埋点和 alerts.yml 里的 18 条规则早就写好了，但这两个容器此前只存在于
+  # docker-compose.verify.yml —— 也就是说平时指标一直在产出、没人采集。这里把采集端
+  # 补进常用的 scale-test 栈。
+  #
+  # 端口错开 verify 栈（9090/3000 → 9091/3001）：两个栈默认 project 名相同、共用
+  # infra_default 网络，同时起来的话宿主端口会撞。
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: lea-prometheus-scale
+    ports:
+      - "9091:9090"
+    volumes:
+      # 挂 scale-test 专用配置，不是 prometheus.yml —— 那份写的是 verify 栈的服务名，
+      # 而且 lea-agent 端口写错成 8200（实际 8100）。见该文件头部注释。
+      - ./prometheus/prometheus.scale-test.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-scale-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=15d'
+      - '--web.enable-lifecycle'
+    depends_on:
+      - agent-1
+      - agent-2
+      - config
+      - rag
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: lea-grafana-scale
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana-scale-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  prometheus-scale-data:
+  grafana-scale-data:

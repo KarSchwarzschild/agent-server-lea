@@ -11,6 +11,8 @@ migration 之前 agent 用 authkit 的 scoped_filter（tenant_id == 我的，没
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -101,3 +103,45 @@ def test_get_single_global_agent_cross_tenant(client):
     # 但别人 default 里的私有专家，t2 用户 GET 不到（404，不泄露存在性）
     priv = mk(client, "default私有", "default", OWNER_SCOPE_USER, owner="carol")
     assert client.get(f"/agents/{priv}", headers=h("alice", "t2")).status_code == 404
+
+
+def test_platform_admin_projection_reports_visibility_and_editability(client):
+    global_agent = mk(client, "global", "default", OWNER_SCOPE_PLATFORM)
+    tenant_agent = mk(client, "tenant", "t1", OWNER_SCOPE_PLATFORM)
+    private_agent = mk(client, "private", "t1", OWNER_SCOPE_USER, owner="bob")
+
+    response = client.get(
+        "/agents?page_size=200",
+        headers={"X-User-ID": "root", "X-Tenant-ID": "t1", "X-User-Role": "platform_admin"},
+    )
+
+    assert response.status_code == 200, response.text
+    items = {item["id"]: item for item in response.json()["items"]}
+    assert items[global_agent]["visibility"] == "global"
+    assert items[tenant_agent]["visibility"] == "tenant"
+    assert items[private_agent]["visibility"] == "private"
+    assert all(items[agent_id]["can_edit"] for agent_id in (global_agent, tenant_agent, private_agent))
+    assert items[private_agent]["tenant_id"] == "t1"
+    assert items[private_agent]["owner_user_id"] == "bob"
+
+
+def test_update_rejects_stale_expected_updated_at(client):
+    agent_id = mk(client, "stale", "t1", OWNER_SCOPE_USER, owner="alice")
+    db = client.Session()
+    try:
+        from lea_config.models.agent import Agent
+
+        agent = db.get(Agent, agent_id)
+        agent.updated_at = datetime(2026, 1, 2, 3, 4, 5)
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.put(
+        f"/agents/{agent_id}",
+        headers=h("alice", "t1"),
+        json={"description": "stale write", "expected_updated_at": "2026-01-02T03:04:04"},
+    )
+
+    assert response.status_code == 409, response.text
+    assert "已被修改" in response.json()["detail"]

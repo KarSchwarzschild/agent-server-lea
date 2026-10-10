@@ -1,18 +1,22 @@
 package router
 
 import (
+	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/cache"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/persistence"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/session"
+	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/temporalrun"
 )
 
 // 全局消息缓存实例
@@ -44,6 +48,25 @@ type SendRequest struct {
 	// 老实现拿 plan_mode=false 当批准信号，于是用户回一句"算了不用了"也会激活
 	// 那份计划。批准必须是用户显式做的动作，前端从 ask_user 的选项按钮发出来。
 	PlanAction string `json:"plan_action"`
+	// Attachments 是这条会话本轮应该挂载的资源完整清单——**替换语义，不是增量**：
+	// 凡是不在这份清单里的旧挂载都会被摘掉（跟 /sessions/:id/attachments 那三个
+	// 端点的"逐条增删"是两种语义，服务两种场景，见 persistence.ReplaceSessionAttachments
+	// 的说明）。
+	//
+	// 用指针而不是裸 slice：nil（字段整个没出现）表示这次请求不关心挂载，现有的
+	// 原样不动——旧客户端（不知道这个字段的存在）必须走这条路，否则升级后端会
+	// 悄悄清空所有人已经挂好的工具。非 nil（哪怕是空数组，代表"清空"）才会真的
+	// 触发替换，这个区分只有指针才做得到。
+	//
+	// 跟 AttachmentIDs（聊天附件，用户上传的文件）完全是两个东西，别混——那个见
+	// persistence/attachments.go 文件头的区分说明。
+	Attachments *[]AttachmentSpec `json:"attachments,omitempty"`
+}
+
+// AttachmentSpec 是 Attachments 字段里的一项。
+type AttachmentSpec struct {
+	Kind  string `json:"kind"`
+	RefID int    `json:"ref_id"`
 }
 
 // planControl 把请求里那两个字段收成 session 层的入参。
@@ -51,7 +74,70 @@ func (r SendRequest) planControl() session.PlanControl {
 	return session.PlanControl{Mode: r.PlanMode, Action: r.PlanAction}
 }
 
-func handleSend(mgr *session.Manager) gin.HandlerFunc {
+// applyRequestAttachments 处理请求里的 Attachments 字段：非 nil 就跟当前挂载
+// 集合比一次指纹，不一样才整体替换并让引擎按新集合重建，好让**这一条**正在
+// 处理的消息就用得上，不用等到下一条。
+//
+// 前端约定是每条消息都带上"当前完整清单"（不判断这一轮是否真的改过），所以
+// 这里必须自己先判断"有没有变化"再决定要不要动数据库——否则日常聊天的每一条
+// 消息都会白白付一次 DELETE+INSERT+Drop+重建的开销。
+//
+// 跟 handleAttachToSession 那条路径故意让重建推迟到"下一条消息"不一样：这里
+// Drop 之后立刻重新 GetOrCreate——Drop 只是把内存里那份引擎对象丢掉，不会自动
+// 重建，必须原地拿一次才能拿到按新挂载 build 出来的对象，交给调用方继续往下发
+// 这条消息。
+//
+// req.Attachments 为 nil 时原样返回传入的 sess，什么都不做——这是不知道这个
+// 字段的旧客户端会走的分支。
+func applyRequestAttachments(
+	ctx context.Context, mgr *session.Manager, sess *session.AgentSession,
+	req SendRequest, tenantID, userID string,
+) (*session.AgentSession, error) {
+	if req.Attachments == nil {
+		return sess, nil
+	}
+	db, err := persistence.DB()
+	if err != nil {
+		return sess, err
+	}
+	desired := make([]persistence.SessionAttachment, 0, len(*req.Attachments))
+	for _, item := range *req.Attachments {
+		desired = append(desired, persistence.SessionAttachment{Kind: item.Kind, RefID: item.RefID})
+	}
+	// 先比指纹再决定要不要真的写——前端每条消息都会带上"当前完整清单"（不管这一轮
+	// 有没有新增，见 frontend-lab 的说明），绝大多数消息其实什么都没变。指纹一样
+	// 就直接跳过整套 DELETE+INSERT+Drop+重建，不然每条消息都要付这个开销，
+	// 日常聊天会被这个功能拖慢。
+	//
+	// 复用 Fingerprint 而不是另写一套比较：GetOrCreate 自己也靠它判断"要不要
+	// 自愈重建"（见 session_attachments.go 顶部注释），两处比较的必须是同一个
+	// 函数——用两套不同的比较逻辑，"一样"的定义就可能对不齐（比如大小写、
+	// 排序方式），产生"该跳过却没跳过"或者反过来的不一致。
+	current, err := persistence.LoadSessionAttachments(ctx, db, tenantID, sess.ID())
+	if err != nil {
+		return sess, fmt.Errorf("load current session attachments: %w", err)
+	}
+	if persistence.Fingerprint(current) == persistence.Fingerprint(desired) {
+		return sess, nil
+	}
+	if err := persistence.ReplaceSessionAttachments(ctx, db, tenantID, sess.ID(), userID, desired); err != nil {
+		return sess, fmt.Errorf("replace session attachments: %w", err)
+	}
+	mgr.Drop(sess.ID())
+	refreshed, err := mgr.GetOrCreate(ctx, session.Params{
+		SessionID: sess.ID(),
+		AgentID:   req.AgentID,
+		TenantID:  tenantID,
+		UserID:    userID,
+		ProjectID: req.ProjectID,
+	})
+	if err != nil {
+		return sess, fmt.Errorf("rebuild session after attachment replace: %w", err)
+	}
+	return refreshed, nil
+}
+
+func handleSend(mgr *session.Manager, coordinator RunCoordinator) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req SendRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
@@ -67,6 +153,7 @@ func handleSend(mgr *session.Manager) gin.HandlerFunc {
 			AgentID:   req.AgentID,
 			TenantID:  tenantID,
 			UserID:    userID,
+			ProjectID: req.ProjectID,
 		})
 		if err != nil {
 			if errors.Is(err, session.ErrForbidden) {
@@ -89,17 +176,36 @@ func handleSend(mgr *session.Manager) gin.HandlerFunc {
 			c.JSON(500, gin.H{"error": err.Error()})
 			return
 		}
+		sess, err = applyRequestAttachments(c.Request.Context(), mgr, sess, req, tenantID, userID)
+		if err != nil {
+			c.JSON(500, gin.H{"error": err.Error()})
+			return
+		}
 
-		if err := sess.Send(req.Message, req.AttachmentIDs, req.planControl()); err != nil {
+		var runID string
+		if coordinator != nil {
+			runID, err = submitTemporalRun(c.Request.Context(), coordinator, sess, req, tenantID, userID)
+		} else {
+			runID, err = sess.SendWithRun(req.Message, req.AttachmentIDs, req.planControl())
+		}
+		if err != nil {
 			// plan_mode 被拒（handoff 团、或 agent 的 plan_mode=off）。400 而不是 500：
 			// 请求本身不成立，重试不会变好，客户端该做的是别发 plan_mode。
 			if errors.Is(err, session.ErrPlanModeUnsupported) {
 				c.JSON(400, gin.H{"error": err.Error()})
 				return
 			}
+			// 会话已经被软删（另一个标签页点了"删除"）。410 Gone——这个会话
+			// 曾经存在、被明确移除了，不是"从来没有"（404）也不是"这次抖动一下"
+			// （503）。code 让前端能专门分支：提示"该对话已被删除"而不是把
+			// 一句裸错误糊在用户脸上，参照 log_expired 那个先例。
+			if errors.Is(err, persistence.ErrSessionArchived) {
+				c.JSON(410, gin.H{"error": "该对话已被删除", "code": "session_archived"})
+				return
+			}
 			// 这个会话已经有一轮在别的 pod 上跑着。409 而不是 500 —— 这是可预期的
 			// 并发，客户端该做的是等当前这轮结束（它的 SSE 还在流），而不是立刻重试。
-			if errors.Is(err, session.ErrBusy) {
+			if errors.Is(err, session.ErrBusy) || errors.Is(err, persistence.ErrActiveRun) {
 				c.JSON(409, gin.H{"error": "a turn is already running for this session"})
 				return
 			}
@@ -107,8 +213,34 @@ func handleSend(mgr *session.Manager) gin.HandlerFunc {
 			return
 		}
 
-		c.JSON(202, gin.H{"session_id": sess.ID(), "status": "processing"})
+		c.JSON(202, gin.H{"session_id": sess.ID(), "run_id": runID, "status": "processing"})
 	}
+}
+
+func submitTemporalRun(ctx context.Context, coordinator RunCoordinator, sess *session.AgentSession, req SendRequest, tenantID, userID string) (string, error) {
+	runID, err := sess.SubmitRun(ctx, req.Message, req.AttachmentIDs, req.planControl())
+	if err != nil {
+		return "", err
+	}
+	agentID, projectID := sess.ExecutionParams()
+	dispatchCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	err = coordinator.Dispatch(dispatchCtx, temporalrun.Input{
+		RunID:         runID,
+		SessionID:     sess.ID(),
+		TenantID:      tenantID,
+		UserID:        userID,
+		AgentID:       agentID,
+		ProjectID:     projectID,
+		Message:       req.Message,
+		AttachmentIDs: req.AttachmentIDs,
+		PlanMode:      req.PlanMode,
+		PlanAction:    req.PlanAction,
+	})
+	cancel()
+	if err != nil {
+		log.Printf("run_initial_dispatch_failed run=%s err=%v (queued for reconciliation)", runID, err)
+	}
+	return runID, nil
 }
 
 // handleStop 掐断该会话正在跑的 turn。
@@ -123,18 +255,26 @@ func handleSend(mgr *session.Manager) gin.HandlerFunc {
 //
 // stopped=false 表示这一轮已经自己结束了，属于正常竞态（用户点停的同一瞬间 turn
 // 收尾），返 200 不报错。
-func handleStop(mgr *session.Manager) gin.HandlerFunc {
+func handleStop(mgr *session.Manager, coordinator RunCoordinator) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		sessionID := c.Param("session_id")
 		tenantID := c.GetString("tenant_id")
 		userID := c.GetString("user_id")
+		if coordinator != nil {
+			handleTemporalStop(c, mgr, coordinator, sessionID, tenantID, userID)
+			return
+		}
 
 		if sess := mgr.Get(sessionID); sess != nil {
 			if !sess.OwnedBy(tenantID, userID) {
 				c.JSON(403, gin.H{"error": "forbidden"})
 				return
 			}
-			c.JSON(200, gin.H{"session_id": sessionID, "stopped": sess.Stop()})
+			stopped, err := sess.RequestStop(c.Request.Context())
+			if err != nil {
+				log.Printf("stop_persist_failed session=%s err=%v", sessionID, err)
+			}
+			c.JSON(200, gin.H{"session_id": sessionID, "stopped": stopped, "durable": err == nil})
 			return
 		}
 
@@ -143,12 +283,35 @@ func handleStop(mgr *session.Manager) gin.HandlerFunc {
 			return
 		}
 
-		forwarded, err := mgr.ForwardStop(c.Request.Context(), sessionID)
+		db, err := persistence.DB()
+		if err != nil || db == nil {
+			c.JSON(503, gin.H{"error": "persistence unavailable"})
+			return
+		}
+		runID, durable, err := persistence.RequestActiveRunCancellation(c.Request.Context(), db, sessionID)
+		if err != nil {
+			log.Printf("stop_persist_failed session=%s err=%v", sessionID, err)
+			c.JSON(503, gin.H{"error": "cannot persist cancellation request"})
+			return
+		}
+
+		forwarded, forwardErr := mgr.ForwardStop(c.Request.Context(), sessionID)
+		if forwardErr != nil && durable {
+			// Pub/Sub 只是低延迟通道；runner 还会轮询数据库中的取消标记。
+			log.Printf("stop_forward_failed_but_durable session=%s run=%s err=%v", sessionID, runID, forwardErr)
+			c.JSON(202, gin.H{"session_id": sessionID, "run_id": runID, "stopped": true, "durable": true})
+			return
+		}
+		err = forwardErr
 		if err != nil {
 			// 控制面不通（没配 Redis，或连不上）。返 503 而不是 404 —— 404 会让
 			// 前端以为"没什么在跑"，而真相是"我们不知道，也送不出去信号"。
 			log.Printf("stop_forward_failed session=%s err=%v", sessionID, err)
 			c.JSON(503, gin.H{"error": "cannot reach the runner for this session"})
+			return
+		}
+		if !forwarded && durable {
+			c.JSON(202, gin.H{"session_id": sessionID, "run_id": runID, "stopped": true, "durable": true})
 			return
 		}
 		if !forwarded {
@@ -158,7 +321,66 @@ func handleStop(mgr *session.Manager) gin.HandlerFunc {
 		}
 		// stopped=true 只表示信号已经发出去了。权威的完成信号是 SSE 流上的
 		// result + done —— 那条流就挂在跑这一轮的 pod 上，所以用户一定收得到。
-		c.JSON(200, gin.H{"session_id": sessionID, "stopped": true, "forwarded": true})
+		c.JSON(200, gin.H{"session_id": sessionID, "run_id": runID, "stopped": true, "forwarded": true, "durable": durable})
+	}
+}
+
+func handleTemporalStop(c *gin.Context, mgr *session.Manager, coordinator RunCoordinator, sessionID, tenantID, userID string) {
+	if sess := mgr.Get(sessionID); sess != nil {
+		if !sess.OwnedBy(tenantID, userID) {
+			c.JSON(403, gin.H{"error": "forbidden"})
+			return
+		}
+	} else if !authorizeAbsentSession(c, sessionID, tenantID, userID) {
+		return
+	}
+
+	db, err := persistence.DB()
+	if err != nil || db == nil {
+		c.JSON(503, gin.H{"error": "persistence unavailable"})
+		return
+	}
+	runID, durable, err := persistence.RequestActiveRunCancellation(c.Request.Context(), db, sessionID)
+	if err != nil {
+		log.Printf("stop_persist_failed session=%s err=%v", sessionID, err)
+		c.JSON(503, gin.H{"error": "cannot persist cancellation request"})
+		return
+	}
+	if runID == "" {
+		c.JSON(200, gin.H{"session_id": sessionID, "stopped": false, "durable": true})
+		return
+	}
+	if err := coordinator.Cancel(c.Request.Context(), runID); err != nil {
+		// MySQL is the durable fallback. A running worker polls the cancellation flag, and a
+		// queued run was atomically moved to cancelled before this call.
+		log.Printf("temporal_cancel_failed_but_durable session=%s run=%s err=%v", sessionID, runID, err)
+	}
+	c.JSON(202, gin.H{"session_id": sessionID, "run_id": runID, "stopped": true, "durable": durable})
+}
+
+func handleGetRun() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		db, err := persistence.DB()
+		if err != nil || db == nil {
+			c.JSON(503, gin.H{"error": "persistence unavailable"})
+			return
+		}
+		run, err := persistence.GetAgentRun(
+			c.Request.Context(), db, c.Param("run_id"), c.GetString("tenant_id"), c.GetString("user_id"),
+		)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				c.JSON(404, gin.H{"error": "run not found"})
+				return
+			}
+			c.JSON(500, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(200, gin.H{
+			"run_id": run.ID, "session_id": run.SessionID, "status": run.Status,
+			"cancel_requested_at": run.CancelRequestedAt, "started_at": run.StartedAt,
+			"finished_at": run.FinishedAt, "error": run.ErrorMessage,
+		})
 	}
 }
 
@@ -201,7 +423,7 @@ func authorizeAbsentSession(c *gin.Context, sessionID, tenantID, userID string) 
 // 没收到"都表现为"列表里没有新消息"。
 //
 // 这也是 OpenAI 的形状：GET /v1/responses/{id} 返回 status: in_progress / completed。
-func handleTurnStatus(mgr *session.Manager) gin.HandlerFunc {
+func handleTurnStatus(mgr *session.Manager, coordinator RunCoordinator) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		sessionID := c.Param("session_id")
 		tenantID := c.GetString("tenant_id")
@@ -214,6 +436,25 @@ func handleTurnStatus(mgr *session.Manager) gin.HandlerFunc {
 				return
 			}
 		} else if !authorizeAbsentSession(c, sessionID, tenantID, userID) {
+			return
+		}
+
+		if coordinator != nil {
+			db, err := persistence.DB()
+			if err != nil || db == nil {
+				c.JSON(503, gin.H{"error": "persistence unavailable"})
+				return
+			}
+			run, err := persistence.FindActiveAgentRun(c.Request.Context(), db, sessionID)
+			if errors.Is(err, sql.ErrNoRows) {
+				c.JSON(200, gin.H{"session_id": sessionID, "running": false})
+				return
+			}
+			if err != nil {
+				c.JSON(503, gin.H{"error": "cannot determine turn status"})
+				return
+			}
+			c.JSON(200, gin.H{"session_id": sessionID, "run_id": run.ID, "status": run.Status, "running": true})
 			return
 		}
 

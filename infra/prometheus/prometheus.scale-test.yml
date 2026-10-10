@@ -1,0 +1,97 @@
+# infra/prometheus/prometheus.scale-test.yml — scale-test 栈专用采集配置
+#
+# 跟 prometheus.yml（verify 栈那份）分开放，不是重复：两个栈的服务名和副本数都不同。
+#   verify 栈：  lea-agent / lea-config / lea-rag / lea-tools，各 × 1
+#   scale 栈：   agent-1 / agent-2 两个 HTTP 副本 + config / rag，tools 在远端宿主
+# 想共用一份的话只能靠 network alias 硬凑，代价是 scale 栈里看不到"哪个副本"这个维度
+# —— 而那正是这个栈存在的理由（一致性哈希路由、副本级指纹自愈都要按副本看）。
+#
+# 另外修掉了 prometheus.yml 里一个真的错：那份写的是 lea-agent:8200，而 lea-agent
+# 实际监听 8100（cmd/server/main.go:49-51 默认值，nginx/agent-lb.conf 也是 8100），
+# /metrics 注册在 main.go:167。8200 从来没抓到过东西。
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'lea-platform'
+    environment: 'scale-test'
+
+rule_files:
+  - 'alerts.yml'
+
+scrape_configs:
+  # lea-agent HTTP 副本：按实例分开采，才能看出一致性哈希把流量压到了哪一个副本上。
+  # instance 标签用容器名而不是 __address__，Grafana 里 agent-1 / agent-2 比
+  # agent-1:8100 好读。
+  - job_name: 'lea-agent'
+    static_configs:
+      - targets: ['agent-1:8100']
+        labels:
+          instance: 'agent-1'
+      - targets: ['agent-2:8100']
+        labels:
+          instance: 'agent-2'
+    metrics_path: '/metrics'
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    relabel_configs:
+      - target_label: service
+        replacement: 'lea-agent'
+
+  # Temporal worker（worker-1/2）故意不在这里：它们是 entrypoint 换成
+  # lea-agent-worker 的纯 worker 进程，没起 HTTP server（cmd/worker 里没有
+  # ListenAndServe），compose 里连 healthcheck 都 disable 了。配上去只会得到两个
+  # 永久 down 的 target，把 PrometheusScrapeFailed 告警长期点亮。
+  # worker 侧的可观测性要么给它加个 metrics 端口，要么从 Temporal 自己的指标看。
+
+  - job_name: 'lea-config'
+    static_configs:
+      - targets: ['config:8500']
+        labels:
+          instance: 'lea-config-scale'
+    metrics_path: '/metrics'
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    relabel_configs:
+      - target_label: service
+        replacement: 'lea-config'
+
+  - job_name: 'lea-rag'
+    static_configs:
+      - targets: ['rag:8300']
+        labels:
+          instance: 'lea-rag-scale'
+    metrics_path: '/metrics'
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    relabel_configs:
+      - target_label: service
+        replacement: 'lea-rag'
+
+  # lea-tools：栈里确实起了一个本地 tools 容器（lea-tools-scale），所以采得到。
+  # 但要清楚它的语义 —— gateway 和 agent 的 LEA_TOOLS_URL 都指向远端宿主
+  # 10.192.241.137:8400，真实工具调用**不走**这个本地副本。也就是说这里的
+  # lea_tools_* 指标基本会是一条平的 0 线，它不代表"工具链路的健康度"。
+  # 真实工具指标在那台远端机器上，得在那边采（本栈的 Prometheus 抓不到）。
+  # 留着它的意义只是让这个容器本身的存活/内存可见，别把它当业务指标看。
+  - job_name: 'lea-tools'
+    static_configs:
+      - targets: ['tools:8400']
+        labels:
+          instance: 'lea-tools-scale'
+    metrics_path: '/metrics'
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    relabel_configs:
+      - target_label: service
+        replacement: 'lea-tools'
+
+  # Prometheus 自采。alerts.yml 的 PrometheusHighMemoryUsage 用的是
+  # process_resident_memory_bytes{job="prometheus"}，不配这个 job 那条规则永远不会
+  # 有数据，是条静默失效的告警。job 名必须正好是 "prometheus"。
+  # 注意它不匹配 PrometheusScrapeFailed 的 job=~"lea-.*"，不会自己告自己。
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+    metrics_path: '/metrics'

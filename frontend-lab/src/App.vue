@@ -1,11 +1,22 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, ref } from 'vue'
+import MarkdownIt from 'markdown-it'
+import hljs from 'highlight.js/lib/core'
+import javascript from 'highlight.js/lib/languages/javascript'
+import typescript from 'highlight.js/lib/languages/typescript'
+import python from 'highlight.js/lib/languages/python'
+import json from 'highlight.js/lib/languages/json'
+import xml from 'highlight.js/lib/languages/xml'
+import css from 'highlight.js/lib/languages/css'
+import bash from 'highlight.js/lib/languages/bash'
+import 'highlight.js/styles/github.css'
 import {
   createSession,
   createAgent,
   deleteAgent,
   checkAgentShare,
   listChatModels,
+  listRetrievalModels,
   listPublishRequests,
   reviewPublishRequest,
   shareAgent,
@@ -52,7 +63,6 @@ import {
   toggleMcpServer,
   syncMcpServer,
   removeTeamMember,
-  attachSessionResource,
   detachSessionResource,
   updateAgent,
   uploadSkillBundle,
@@ -85,7 +95,7 @@ import {
   type McpMarketItem,
   type SkillMarketItem,
   type ToolMarketItem, type ProjectItem,
-  type ShareCheck, type ShareBlocker, type ChatModel, type PublishRequest
+  type ShareCheck, type ShareBlocker, type ChatModel, type RetrievalModel, type PublishRequest
   , type AgentInfo, type AgentBindings, type KnowledgeBaseItem, type KnowledgeDocument, type KnowledgeSearchHit, type SessionAttachment, type TeamInfo, type TeamMember, type TenantItem
 } from './api'
 import {
@@ -116,6 +126,7 @@ import {
   NInputNumber,
   NModal,
   NSelect,
+  NSwitch,
   NTag,
   NUpload,
   lightTheme,
@@ -142,6 +153,11 @@ type Message = {
     options: string[]
     resolved?: 'approved' | 'rejected'
   }
+  // 只有历史重放（chat_messages.extra.usage）才有——直播的 SSE 事件表里
+  // 没有专门的 usage 事件（见 docs/FRONTEND_API.md 的七种事件类型），token
+  // 数只在这一轮落库之后、刷新/重新打开会话时才能看到，不是漏加了字段，
+  // 是这一步本来就拿不到直播数据。
+  usage?: { inputTokens: number; outputTokens: number }
 }
 
 type ReferenceItem = {
@@ -185,6 +201,20 @@ type ActivityItem = {
     durationMs?: number
     truncated?: boolean
     artifacts: SandboxArtifact[]
+  }
+  // ── AskUser 专用的结构化字段 ──────────────────────────────────
+  //
+  // AskUser 是引擎里的一个普通工具，走的是跟 Skill/Read 一样的 tool_event 通道——
+  // 不是像计划批准那样的专门 SSE 事件类型。之前没特殊处理，界面上就是把工具的
+  // 原始 stdout 行数组（[{stream,text}, ...]）整个 pretty 打印出来，问题文本和
+  // 候选项都在一大段 JSON 里，候选项也不能点。
+  //
+  // answered 记"这条卡片已经点过一个候选"，纯本地 UI 状态，不落库——只是让
+  // 按钮点过之后变灰，避免同一屏里对着一张已经回复过的卡片再点一次候选。
+  askUser?: {
+    question: string
+    candidates: string[]
+    answered?: boolean
   }
 }
 
@@ -238,6 +268,10 @@ const expertForm = ref({ name: '', description: '', category: 'general', soul_pr
 const teamFormOpen = ref(false)
 const editingTeamId = ref<number | null>(null)
 const teamForm = ref({ agent_id: 0, strategy: 'star', decomposer_prompt: '', synthesizer_prompt: '', max_subtasks: 5, member_ids: [] as number[] })
+// 注意：selectedTeamId 只表示"当前对话用的是哪个专家团"。成员面板开在哪个团由
+// editingTeamId 决定 —— 以前两件事挤在 selectedTeamId 一个 ref 里，于是在聊天里选中
+// 一个团（previewConfiguration/startWithConfiguration 都会写它）就顺带把成员面板弹出来，
+// 而那条路径不会去拉成员，面板只能显示"还没有成员。"。
 const selectedTeamId = ref<number | null>(null)
 const configurationPanelOpen = ref(false)
 const configurationSelection = ref('default')
@@ -245,8 +279,32 @@ const chatMode = ref<ChatMode>('default')
 const teamMembers = ref<TeamMember[]>([])
 const expertBindings = ref<Record<number, AgentBindings>>({})
 const teamMemberForm = ref({ member_agent_id: 0, role: 'worker', name: '' })
-const knowledgeForm = ref({ name: '', description: '', visibility: 'private' })
+const knowledgeForm = ref({
+  name: '', description: '', visibility: 'private',
+  embedding_model: '', reranker_model: '', reranker_enabled: true,
+  vlm_model: '', vlm_enabled: true, multimodal: false
+})
 const attachmentFiles = ref<{ id: number; name: string; size: string; downloadable?: boolean }[]>([])
+// 从文件库选中但还没真正导入的文件——点选中只是本地暂存，真正调导入接口
+// 推迟到发消息那一刻（见 flushPendingLibraryImports）。跟 skill/tool 那次
+// 是同一个原则,但没法完全照抄那次的"直接把 id 塞进发消息请求"做法：
+// attachment_id 是导入这个动作本身的产物，选中的时候根本还不存在,没有
+// id 可以先塞进去,所以这里必须先调一次导入接口拿到 id,再继续发消息——
+// 区别只是"第一次碰后端"从"点选中"挪到了"点发送",不是完全没有网络请求。
+const pendingLibraryImports = ref<UserFile[]>([])
+// 工具卡片默认收起的原始输出（Read/Skill/Bash 那种大段 dump）,点标题展开——
+// 故意跟 activity 数据本身分开放,不掺进 ActivityItem：那份数据每条 SSE 事件
+// 都会重新构造、用 Object.assign 合并进已有对象（见 addActivity），如果把
+// "展开没展开"也塞进 activity 上,下一条事件一来就会被覆盖回默认值,用户刚
+// 点开的卡片会莫名其妙又收起——AskUser 那个合并覆盖的坑就是这个模式踩过的,
+// 这次直接用一个独立的集合，只由用户点击改，SSE 事件完全碰不到它。
+const expandedActivities = ref<Set<string>>(new Set())
+function toggleActivity(id: string) {
+  const next = new Set(expandedActivities.value)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
+  expandedActivities.value = next
+}
 
 const marketItems = ref<{ skills: SkillMarketItem[]; mcp: McpMarketItem[]; tools: ToolMarketItem[] }>({ skills: [], mcp: [], tools: [] })
 const marketLoading = ref(false)
@@ -269,6 +327,12 @@ const toolForm = ref({ name: '', display_name: '', description: '', category: 'g
 const mcpFormOpen = ref(false)
 const mcpForm = ref({ name: '', description: '', category: 'general', endpoint: '', bearerToken: '', toolFilter: '' })
 const sessionAttachments = ref<SessionAttachment[]>([])
+// 选了 skill/mcp/tool 但还没点发送——只是本地暂存,不调"挂载"接口。真正挂上去
+// 是发送那一刻跟消息一起完成的（见 sendChatMessage），不需要用户先手动点一次
+// "挂载到当前会话"再回来发消息——那是两步做一件事,还容易让人以为选完就已经
+// 生效了(其实挂载要等下一条消息重建引擎才生效,见 session_attachments.go 顶部
+// 的说明,选跟挂根本不需要拆成两次用户操作)。
+const pendingAttachments = ref<{ kind: SessionAttachment['kind']; ref_id: number; name: string }[]>([])
 const mountPanelOpen = ref(false)
 const mountKind = ref<SessionAttachment['kind']>('skill')
 const mountSelection = ref(0)
@@ -292,6 +356,47 @@ async function loadChatModels() {
     chatModels.value = []
   }
 }
+
+// 建库/改库表单的 embedding/reranker/vlm 下拉供数，跟 chatModels 是同一个模式：
+// 读不到就退回空数组，表单退化成手输，不在界面上顶红色报错。
+const retrievalModels = ref<{ embedding: RetrievalModel[]; reranker: RetrievalModel[]; vlm: RetrievalModel[] }>({ embedding: [], reranker: [], vlm: [] })
+
+async function loadRetrievalModels() {
+  try {
+    const [embedding, reranker, vlm] = await Promise.all([
+      listRetrievalModels('embedding'),
+      listRetrievalModels('reranker'),
+      listRetrievalModels('vlm')
+    ])
+    retrievalModels.value = {
+      embedding: embedding.items || [],
+      reranker: reranker.items || [],
+      vlm: vlm.items || []
+    }
+  } catch {
+    retrievalModels.value = { embedding: [], reranker: [], vlm: [] }
+  }
+}
+
+// 正在编辑的知识库已经处理过多少文档——embedding_model/embedding_dim 只在这个数
+// 为 0 时才可能改成功（后端按同一条件门，见 server_user_kb.py），编辑一个已有
+// 文档的库时把输入框禁掉，别让用户点了保存才在错误提示里第一次知道改不了。
+const editingKnowledgeBaseDocCount = computed(() => {
+  if (!editingKnowledgeBaseId.value) return 0
+  return knowledgeBases.value.find(kb => kb.id === editingKnowledgeBaseId.value)?.document_count || 0
+})
+
+// 建库/改库表单的三个模型下拉——跟聊天模型选择器（modelOptions）同一个套路：
+// 真实列表渲染选项，同时 filterable+tag 允许手输，列表读不到也不影响填表。
+const embeddingModelOptions = computed(() => retrievalModels.value.embedding.map(model => ({
+  label: model.is_default ? `${model.name}（默认）` : model.name, value: model.name
+})))
+const rerankerModelOptions = computed(() => retrievalModels.value.reranker.map(model => ({
+  label: model.is_default ? `${model.name}（默认）` : model.name, value: model.name
+})))
+const vlmModelOptions = computed(() => retrievalModels.value.vlm.map(model => ({
+  label: model.is_default ? `${model.name}（默认）` : model.name, value: model.name
+})))
 
 const files = ref<AssetFile[]>([])
 const messages = ref<Message[]>([])
@@ -318,6 +423,15 @@ const projectFormOpen = ref(false)
 const editingProjectId = ref<number | null>(null)
 const projectForm = ref({ name: '', description: '' })
 const currentSessionId = ref('')
+// openSession 世代计数——每次调用 +1，openSession 自己在每个 await 之后
+// 比对"发起时的世代"跟"现在的世代"，不一致就说明用户在它跑到一半时又点了
+// 别的会话，整段剩余步骤全部丢弃，不再写任何共享状态。
+//
+// 不能只判断 currentSessionId.value === sessionId：如果用户快速来回点
+// A→B→A（最后又点回 A），currentSessionId 又变回了 A，但这次残留的、
+// 该丢弃的其实是"中间那次 A"的过时响应,不是真正最新的第三次调用——只有
+// 一个严格递增的计数器才能唯一标识"这是不是最新发起的那一次"。
+let openSessionGeneration = 0
 const agentId = ref(0)
 const prompt = ref('')
 const token = ref(localStorage.getItem('lea_workspace_token') || '')
@@ -330,7 +444,7 @@ const workspacePublishLoading = ref(false)
 const requestLogs = ref<LogItem[]>([])
 const attachmentIds = ref<number[]>([])
 const filePreviewUrl = ref('')
-const filePreviewKind = ref<'text' | 'image' | 'unsupported'>('unsupported')
+const filePreviewKind = ref<'text' | 'image' | 'pdf' | 'html' | 'unsupported'>('unsupported')
 const filePreviewText = ref('')
 const filePreviewLoading = ref(false)
 const workspaceLoading = ref(false)
@@ -458,12 +572,30 @@ async function loadWorkspace() {
   }
 }
 
+// 创建/编辑共用一个弹窗，所以"打开新建"必须显式清掉编辑态 —— 否则上次编辑完
+// 留下的 editingExpertId 会让"创建"变成又改一遍那个专家。跟知识库那边同一个套路。
+function openCreateExpertForm() {
+  editingExpertId.value = null
+  expertForm.value = { name: '', description: '', category: 'general', soul_prompt: '', model: 'qwen3-max', skill_ids: [], mcp_ids: [], tool_ids: [], kb_ids: [] }
+  expertFormOpen.value = true
+}
+
+function closeExpertForm() {
+  expertFormOpen.value = false
+  editingExpertId.value = null
+  expertForm.value = { name: '', description: '', category: 'general', soul_prompt: '', model: 'qwen3-max', skill_ids: [], mcp_ids: [], tool_ids: [], kb_ids: [] }
+}
+
 async function createMarketExpert() {
-  if (!expertForm.value.name.trim()) return
+  if (!expertForm.value.name.trim() || submitBusyKey.value) return
+  submitBusyKey.value = 'expert-save'
   try {
     const { skill_ids, mcp_ids, tool_ids, kb_ids, ...agentPayload } = expertForm.value
+    const editingExpert = editingExpertId.value
+      ? expertItems.value.find(e => e.id === editingExpertId.value)
+      : null
     const item = editingExpertId.value
-      ? await updateAgent(editingExpertId.value, { ...agentPayload, name: expertForm.value.name.trim() })
+      ? await updateAgent(editingExpertId.value, { ...agentPayload, name: expertForm.value.name.trim(), expected_updated_at: editingExpert?.updated_at })
       : await createAgent({ ...agentPayload, name: expertForm.value.name.trim() })
     const old = expertBindings.value[item.id] || { skills: [], mcp_servers: [], tools: [], knowledge_bases: [] }
     const wanted = {
@@ -485,31 +617,45 @@ async function createMarketExpert() {
     const index = expertItems.value.findIndex(expert => expert.id === item.id)
     if (index >= 0) expertItems.value[index] = item
     else expertItems.value.unshift(item)
-    editingExpertId.value = null
-    expertFormOpen.value = false
-    expertForm.value = { name: '', description: '', category: 'general', soul_prompt: '', model: 'qwen3-max', skill_ids: [], mcp_ids: [], tool_ids: [], kb_ids: [] }
+    closeExpertForm()
   } catch (error) {
-    requestLogs.value.unshift({ method: 'POST', path: '/api/user/agents', status: 'ERR', time: 0, body: error instanceof Error ? error.message : String(error) })
+    if (error instanceof ApiError && error.status === 409) {
+      connectionError.value = error.message || '该专家已被修改，请刷新后重试'
+    } else {
+      requestLogs.value.unshift({ method: 'POST', path: '/api/user/agents', status: 'ERR', time: 0, body: error instanceof Error ? error.message : String(error) })
+    }
+  } finally {
+    submitBusyKey.value = ''
   }
 }
 
+// 先开窗、再拉绑定。以前是拉成功才开窗，绑定接口一挂就整个点击没反应——用户看到的
+// 是"编辑按钮点了没用"，而错误只进了右侧请求日志。
 async function editExpert(expert: AgentInfo) {
   editingExpertId.value = expert.id
+  expertForm.value = {
+    name: expert.name,
+    description: expert.description || '',
+    category: expert.category || 'general',
+    soul_prompt: expert.soul_prompt || '',
+    model: expert.model || 'qwen3-max',
+    skill_ids: [], mcp_ids: [], tool_ids: [], kb_ids: []
+  }
+  expertFormOpen.value = true
   try {
     const bindings = await listAgentBindings(expert.id)
+    // 陈旧响应丢弃：这个请求发出去之后，用户可能已经点开了另一个专家的编辑
+    // 面板——两个 listAgentBindings 请求同时在途，网络顺序不保证跟点击顺序
+    // 一致。如果不判断，后到达的响应会不看是谁发的、直接覆盖 expertForm，
+    // 而 editingExpertId 早已经指向另一个专家：用户看着"专家 B"的名字，
+    // 保存时却把"专家 A"的技能/工具/知识库绑定提交上去——不是显示错乱，
+    // 是会把 A 的绑定写到 B 身上、冲掉 B 原有的绑定，一次真实的数据损坏。
+    if (editingExpertId.value !== expert.id) return
     expertBindings.value[expert.id] = bindings
-    expertForm.value = {
-      name: expert.name,
-      description: expert.description || '',
-      category: expert.category || 'general',
-      soul_prompt: expert.soul_prompt || '',
-      model: expert.model || 'qwen3-max',
-      skill_ids: bindings.skills.map(item => item.skill_id),
-      mcp_ids: bindings.mcp_servers.map(item => item.mcp_server_id),
-      tool_ids: bindings.tools.map(item => item.tool_id),
-      kb_ids: bindings.knowledge_bases.map(item => item.kb_id)
-    }
-    expertFormOpen.value = true
+    expertForm.value.skill_ids = bindings.skills.map(item => item.skill_id)
+    expertForm.value.mcp_ids = bindings.mcp_servers.map(item => item.mcp_server_id)
+    expertForm.value.tool_ids = bindings.tools.map(item => item.tool_id)
+    expertForm.value.kb_ids = bindings.knowledge_bases.map(item => item.kb_id)
   } catch (error) {
     requestLogs.value.unshift({ method: 'GET', path: `/api/user/agents/${expert.id}/bindings`, status: 'ERR', time: 0, body: error instanceof Error ? error.message : String(error) })
   }
@@ -517,12 +663,16 @@ async function editExpert(expert: AgentInfo) {
 
 async function removeExpert(expert: AgentInfo) {
   if (!window.confirm(`删除专家「${expert.name}」？已绑定的资源不会被删除。`)) return
+  if (submitBusyKey.value) return
+  submitBusyKey.value = 'expert-delete'
   try {
     await deleteAgent(expert.id)
     expertItems.value = expertItems.value.filter(item => item.id !== expert.id)
     if (agentId.value === expert.id) await selectChatMode('default')
   } catch (error) {
     requestLogs.value.unshift({ method: 'DELETE', path: `/api/user/agents/${expert.id}`, status: 'ERR', time: 0, body: error instanceof Error ? error.message : String(error) })
+  } finally {
+    submitBusyKey.value = ''
   }
 }
 
@@ -534,6 +684,25 @@ async function removeExpert(expert: AgentInfo) {
 // 界面做成"先预检、再动手"而不是"点了再说"：后端专门给了只读的 share-check 就是
 // 为这个。直接 POST 的话用户拿到的是一句"有 3 项没共享"，而他真正需要知道的是
 // 哪 3 项 —— 那才是他能拿来行动的东西。
+
+// ── 提交守卫：防止慢接口期间重复点击建出多份数据 ──────────────────
+//
+// 实测踩过：建知识库的接口要 5~6 秒，用户以为没反应连点了几下，就真的建出了
+// 几个同名知识库——POST 本身不幂等，前端不挡就没人挡。
+//
+// 用一个"当前正在提交哪个动作"的键，而不是给每个函数各加一个 ref：这类提交
+// 函数有二十多个（建/改/删 专家、专家团、知识库、MCP、工具、项目…），各写一个
+// 标志位必然漏几个，而漏掉的那个要等用户点出脏数据才会被发现。
+//
+// 每个提交函数三步：
+//
+//	if (submitBusyKey.value) return        ← 已在提交中，丢弃这次点击
+//	submitBusyKey.value = '<动作名>'        ← 占位，顺便给按钮做 :loading
+//	... finally { submitBusyKey.value = '' } ← 必定清空，失败也不卡死按钮
+//
+// 丢弃而不是排队：用户连点的第二下想要的不是"再建一个"，是"你倒是有点反应"。
+const submitBusyKey = ref('')
+
 const sharePanelExpert = ref<AgentInfo | null>(null)
 const shareCheck = ref<ShareCheck | null>(null)
 const shareBusy = ref(false)
@@ -557,7 +726,13 @@ async function openSharePanel(expert: AgentInfo) {
   shareWarnings.value = []
   shareBusy.value = true
   try {
-    shareCheck.value = await checkAgentShare(expert.id)
+    const result = await checkAgentShare(expert.id)
+    // 陈旧响应丢弃：同一个原因，见 editExpert 的说明——这里严重度低一些，
+    // 因为真正共享时后端会重新校验 blockers，不会因为前端预检显示错了就
+    // 放过一次不该共享的 agent；但用户看着"专家 B 的面板"却读到"专家 A 的
+    // 阻塞项清单"，仍然是个会误导判断的真实 bug。
+    if (sharePanelExpert.value !== expert) return
+    shareCheck.value = result
   } catch (error) {
     shareNotice.value = error instanceof Error ? error.message : String(error)
   } finally {
@@ -611,34 +786,36 @@ async function confirmUnshare() {
   }
 }
 
-async function openTeamMembers(team: TeamInfo) {
-  selectedTeamId.value = team.id
-  teamMemberForm.value = { member_agent_id: 0, role: 'worker', name: '' }
-  try {
-    teamMembers.value = (await listTeamMembers(team.id)).items || []
-  } catch (error) {
-    requestLogs.value.unshift({ method: 'GET', path: `/api/user/teams/${team.id}/members`, status: 'ERR', time: 0, body: error instanceof Error ? error.message : String(error) })
-  }
-}
-
+// 成员增删都作用在"弹窗里正在编辑的这个团"，也就是 editingTeamId，而不是聊天选中的
+// selectedTeamId。两者同名很久，导致成员加到了另一个团上这种错位。
 async function saveTeamMember() {
-  if (!selectedTeamId.value || !teamMemberForm.value.member_agent_id) return
+  if (!editingTeamId.value || !teamMemberForm.value.member_agent_id || submitBusyKey.value) return
+  submitBusyKey.value = 'team-member-add'
   try {
-    const item = await addTeamMember(selectedTeamId.value, teamMemberForm.value)
+    const item = await addTeamMember(editingTeamId.value, teamMemberForm.value)
     teamMembers.value.push(item)
+    // 表单里那份 member_ids 也要跟上：它是保存整个团时的期望成员集，落后的话
+    // 紧接着点"保存"会把刚加的人当成"多出来的"再删掉。
+    if (!teamForm.value.member_ids.includes(item.member_agent_id)) teamForm.value.member_ids.push(item.member_agent_id)
     teamMemberForm.value = { member_agent_id: 0, role: 'worker', name: '' }
   } catch (error) {
-    requestLogs.value.unshift({ method: 'POST', path: `/api/user/teams/${selectedTeamId.value}/members`, status: 'ERR', time: 0, body: error instanceof Error ? error.message : String(error) })
+    requestLogs.value.unshift({ method: 'POST', path: `/api/user/teams/${editingTeamId.value}/members`, status: 'ERR', time: 0, body: error instanceof Error ? error.message : String(error) })
+  } finally {
+    submitBusyKey.value = ''
   }
 }
 
 async function deleteTeamMember(member: TeamMember) {
-  if (!selectedTeamId.value) return
+  if (!editingTeamId.value || submitBusyKey.value) return
+  submitBusyKey.value = 'team-member-delete'
   try {
-    await removeTeamMember(selectedTeamId.value, member.id)
+    await removeTeamMember(editingTeamId.value, member.id)
     teamMembers.value = teamMembers.value.filter(item => item.id !== member.id)
+    teamForm.value.member_ids = teamForm.value.member_ids.filter(id => id !== member.member_agent_id)
   } catch (error) {
-    requestLogs.value.unshift({ method: 'DELETE', path: `/api/user/teams/${selectedTeamId.value}/members/${member.id}`, status: 'ERR', time: 0, body: error instanceof Error ? error.message : String(error) })
+    requestLogs.value.unshift({ method: 'DELETE', path: `/api/user/teams/${editingTeamId.value}/members/${member.id}`, status: 'ERR', time: 0, body: error instanceof Error ? error.message : String(error) })
+  } finally {
+    submitBusyKey.value = ''
   }
 }
 
@@ -650,53 +827,51 @@ function useTeam(team: TeamInfo) {
   void startWithConfiguration(team)
 }
 
-async function startWithConfiguration(configuration: AgentInfo | TeamInfo) {
+// startWithConfiguration 只是选定"下一条消息用哪个 agent/团队"，同样不碰
+// 后端——原因跟 newConversation 一样：POST /api/sessions 建一个新会话要串行
+// 打两次 lea-config 的网络请求，不是"内存操作所以很便宜"。真正建会话推迟到
+// 发第一条消息（session_id 传空，后端顺手建）。
+function startWithConfiguration(configuration: AgentInfo | TeamInfo) {
+  detachCurrentStream()
   const nextAgentId = 'agent_id' in configuration ? configuration.agent_id : configuration.id
-  try {
-    const result = await createSession(nextAgentId, selectedProjectId.value || undefined)
-    agentId.value = nextAgentId
-    selectedTeamId.value = 'agent_id' in configuration ? configuration.id : null
-    modelDraft.value = expertItems.value.find(expert => expert.id === nextAgentId)?.model || 'qwen3-max'
-    configurationSelection.value = 'agent_id' in configuration ? `team:${configuration.id}` : `agent:${configuration.id}`
-    currentSessionId.value = result.session_id
-    selectedConversation.value = result.session_id
-    messages.value = []
-    activeNav.value = 'chat'
-  } catch (error) {
-    requestLogs.value.unshift({ method: 'POST', path: '/api/sessions', status: 'ERR', time: 0, body: error instanceof Error ? error.message : String(error) })
-  }
+  agentId.value = nextAgentId
+  selectedTeamId.value = 'agent_id' in configuration ? configuration.id : null
+  modelDraft.value = expertItems.value.find(expert => expert.id === nextAgentId)?.model || 'qwen3-max'
+  configurationSelection.value = 'agent_id' in configuration ? `team:${configuration.id}` : `agent:${configuration.id}`
+  currentSessionId.value = ''
+  selectedConversation.value = ''
+  messages.value = []
+  sessionAttachments.value = []
+  pendingAttachments.value = []
+  attachmentIds.value = []
+  attachmentFiles.value = []
+  pendingLibraryImports.value = []
+  files.value = []
+  selectedFile.value = undefined
+  clearFilePreview()
+  activeNav.value = 'chat'
 }
 
-async function applyConfiguration(agent: AgentInfo | TeamInfo | null) {
+// 选择专家时只更新本地预选。真正写 active_agent_id 放到发送前：一是符合客户端
+// "选配置 -> 发送后生效" 的心智，二是刚建、尚未发送过消息的 session 还没有持久化
+// 行，提前 PUT /active-agent 必然会收到 session not found。
+function previewConfiguration(agent: AgentInfo | TeamInfo | null) {
   const nextAgentId = agent && 'agent_id' in agent ? agent.agent_id : agent?.id || 0
   agentId.value = nextAgentId
   modelDraft.value = expertItems.value.find(expert => expert.id === nextAgentId)?.model || 'qwen3-max'
   selectedTeamId.value = agent && 'agent_id' in agent ? agent.id : null
   chatMode.value = agent && 'agent_id' in agent ? 'team' : agent ? 'expert' : 'default'
-  if (!currentSessionId.value) {
-    activeNav.value = 'chat'
-    return
-  }
-  try {
-    await setSessionActiveAgent(currentSessionId.value, nextAgentId)
-    const conversation = conversations.value.find(item => item.id === currentSessionId.value)
-    if (conversation) conversation.agent_id = nextAgentId || null
-    await openSession(currentSessionId.value)
-    activeNav.value = 'chat'
-  } catch (error) {
-    requestLogs.value.unshift({ method: 'PUT', path: `/api/sessions/${currentSessionId.value}/active-agent`, status: 'ERR', time: 0, body: error instanceof Error ? error.message : String(error) })
-  }
 }
 
 async function selectChatMode(mode: ChatMode) {
   if (mode === 'plan' && handoffTeamActive.value) return
   chatMode.value = mode
   if (mode === 'expert' || mode === 'team') {
-    if (mode === 'expert' && !expertItems.value.length) {
+    if (mode === 'expert') {
       const result = await listAgents()
       expertItems.value = Array.isArray(result) ? result : result.items || []
     }
-    if (mode === 'team' && !teamItems.value.length) teamItems.value = (await listTeams()).items || []
+    if (mode === 'team') teamItems.value = (await listTeams()).items || []
     const prefix = mode === 'expert' ? 'agent:' : 'team:'
     if (!configurationSelection.value.startsWith(prefix)) configurationSelection.value = modeConfigurations.value[0]?.value || ''
     if (!configurationSelection.value) {
@@ -709,16 +884,6 @@ async function selectChatMode(mode: ChatMode) {
   agentId.value = 0
   selectedTeamId.value = null
   configurationSelection.value = 'default'
-  if (currentSessionId.value) {
-    try {
-      await setSessionActiveAgent(currentSessionId.value, 0)
-      const conversation = conversations.value.find(item => item.id === currentSessionId.value)
-      if (conversation) conversation.agent_id = null
-      await openSession(currentSessionId.value)
-    } catch (error) {
-      requestLogs.value.unshift({ method: 'PUT', path: `/api/sessions/${currentSessionId.value}/active-agent`, status: 'ERR', time: 0, body: error instanceof Error ? error.message : String(error) })
-    }
-  }
 }
 
 function applySelectedConfiguration() {
@@ -727,7 +892,7 @@ function applySelectedConfiguration() {
   const configuration = kind === 'team'
     ? teamItems.value.find(team => team.id === id)
     : expertItems.value.find(expert => expert.id === id)
-  if (configuration) void applyConfiguration(configuration)
+  if (configuration) previewConfiguration(configuration)
 }
 
 function chatModeLabel(mode: ChatMode) {
@@ -735,10 +900,16 @@ function chatModeLabel(mode: ChatMode) {
 }
 
 async function createMarketTeam() {
-  if (!teamForm.value.agent_id) return
+  if (!teamForm.value.agent_id || submitBusyKey.value) return
+  submitBusyKey.value = 'team-save'
   try {
     const { member_ids, ...teamPayload } = teamForm.value
-    const item = editingTeamId.value ? await updateTeam(editingTeamId.value, teamPayload) : await createTeam(teamPayload)
+    const editingTeam = editingTeamId.value
+      ? teamItems.value.find(t => t.id === editingTeamId.value)
+      : null
+    const item = editingTeamId.value
+      ? await updateTeam(editingTeamId.value, { ...teamPayload, expected_updated_at: editingTeam?.updated_at })
+      : await createTeam(teamPayload)
     if (editingTeamId.value) {
       const currentMembers = (await listTeamMembers(item.id)).items || []
       await Promise.all(currentMembers.filter(member => !member_ids.includes(member.member_agent_id)).map(member => removeTeamMember(item.id, member.id)))
@@ -749,27 +920,59 @@ async function createMarketTeam() {
       await Promise.all(member_ids.map(memberAgentId => addTeamMember(item.id, { member_agent_id: memberAgentId, role: 'worker', name: '' })))
       teamItems.value.unshift(item)
     }
-    editingTeamId.value = null
-    teamFormOpen.value = false
-    teamForm.value = { agent_id: agentId.value || expertItems.value[0]?.id || 0, strategy: 'star', decomposer_prompt: '', synthesizer_prompt: '', max_subtasks: 5, member_ids: [] }
+    closeTeamForm()
   } catch (error) {
-    requestLogs.value.unshift({ method: 'POST', path: '/api/user/teams', status: 'ERR', time: 0, body: error instanceof Error ? error.message : String(error) })
+    if (error instanceof ApiError && error.status === 409) {
+      connectionError.value = error.message || '该专家团已被修改，请刷新后重试'
+    } else {
+      requestLogs.value.unshift({ method: 'POST', path: '/api/user/teams', status: 'ERR', time: 0, body: error instanceof Error ? error.message : String(error) })
+    }
+  } finally {
+    submitBusyKey.value = ''
   }
 }
 
-async function editTeam(team: TeamInfo) {
+function openCreateTeamForm() {
+  editingTeamId.value = null
+  teamMembers.value = []
+  teamMemberForm.value = { member_agent_id: 0, role: 'worker', name: '' }
+  teamForm.value = { agent_id: agentId.value || expertItems.value[0]?.id || 0, strategy: 'star', decomposer_prompt: '', synthesizer_prompt: '', max_subtasks: 5, member_ids: [] }
+  teamFormOpen.value = true
+}
+
+function closeTeamForm() {
+  teamFormOpen.value = false
+  editingTeamId.value = null
+  teamMembers.value = []
+  teamMemberForm.value = { member_agent_id: 0, role: 'worker', name: '' }
+  teamForm.value = { agent_id: agentId.value || expertItems.value[0]?.id || 0, strategy: 'star', decomposer_prompt: '', synthesizer_prompt: '', max_subtasks: 5, member_ids: [] }
+}
+
+// 点专家团卡片 = 进编辑态：团的参数和成员名单在同一个弹窗里，不再是"编辑"和
+// "成员配置"两个各自弹出来的面板。成员拉失败要留痕，但不能挡住弹窗打开 ——
+// 否则又回到"点进去什么都没有"那个体验，只是这次连参数都看不到。
+async function openTeamForm(team: TeamInfo) {
   editingTeamId.value = team.id
+  teamMemberForm.value = { member_agent_id: 0, role: 'worker', name: '' }
+  teamMembers.value = []
+  teamForm.value = {
+    agent_id: team.agent_id,
+    strategy: team.strategy || 'star',
+    decomposer_prompt: team.decomposer_prompt || '',
+    synthesizer_prompt: team.synthesizer_prompt || '',
+    max_subtasks: team.max_subtasks || 5,
+    member_ids: []
+  }
+  teamFormOpen.value = true
   try {
     const members = (await listTeamMembers(team.id)).items || []
-    teamForm.value = {
-      agent_id: team.agent_id,
-      strategy: team.strategy || 'star',
-      decomposer_prompt: team.decomposer_prompt || '',
-      synthesizer_prompt: team.synthesizer_prompt || '',
-      max_subtasks: team.max_subtasks || 5,
-      member_ids: members.map(member => member.member_agent_id)
-    }
-    teamFormOpen.value = true
+    // 陈旧响应丢弃：同一个原因，见 editExpert 里的说明——这里更要紧，因为
+    // saveTeamMember/createMarketTeam 会拿 member_ids 跟旧绑定做 diff 去调
+    // addTeamMember/removeTeamMember，陈旧数据一旦被当成"这个团现在该有的
+    // 成员名单"，保存时会把别的团的成员错误地加/删到这个团上。
+    if (editingTeamId.value !== team.id) return
+    teamMembers.value = members
+    teamForm.value.member_ids = members.map(member => member.member_agent_id)
   } catch (error) {
     requestLogs.value.unshift({ method: 'GET', path: `/api/user/teams/${team.id}/members`, status: 'ERR', time: 0, body: error instanceof Error ? error.message : String(error) })
   }
@@ -777,17 +980,39 @@ async function editTeam(team: TeamInfo) {
 
 async function removeExpertTeam(team: TeamInfo) {
   if (!window.confirm(`删除专家团「${team.name || `#${team.id}`}」？成员专家不会被删除。`)) return
+  if (submitBusyKey.value) return
+  submitBusyKey.value = 'team-delete'
   try {
     await deleteTeam(team.id)
     teamItems.value = teamItems.value.filter(item => item.id !== team.id)
     if (selectedTeamId.value === team.id) selectedTeamId.value = null
+    if (editingTeamId.value === team.id) closeTeamForm()
   } catch (error) {
     requestLogs.value.unshift({ method: 'DELETE', path: `/api/user/teams/${team.id}`, status: 'ERR', time: 0, body: error instanceof Error ? error.message : String(error) })
+  } finally {
+    submitBusyKey.value = ''
   }
 }
 
+// 点知识库卡片——查看/编辑/传文档合并成一个弹窗，不再单独放一个"编辑"按钮：
+// 卡片本身就是入口，弹窗里同时能改参数、看文档、传新文档、测检索。
 async function openKnowledgeBase(item: KnowledgeBaseItem) {
   selectedKnowledgeBase.value = item
+  editingKnowledgeBaseId.value = item.id
+  knowledgeForm.value = {
+    name: item.name,
+    description: item.description || '',
+    visibility: item.visibility || 'private',
+    embedding_model: item.embedding_model || '',
+    reranker_model: item.reranker_model || '',
+    reranker_enabled: item.reranker_enabled ?? true,
+    vlm_model: item.vlm_model || '',
+    vlm_enabled: item.vlm_enabled ?? true,
+    multimodal: item.multimodal ?? false
+  }
+  knowledgeSearchQuery.value = ''
+  knowledgeSearchResults.value = []
+  knowledgeFormOpen.value = true
   try {
     const result = await listKnowledgeDocuments(item.id)
     knowledgeDocuments.value = result.documents || []
@@ -796,49 +1021,76 @@ async function openKnowledgeBase(item: KnowledgeBaseItem) {
   }
 }
 
-async function createMarketKnowledgeBase() {
-  if (!knowledgeForm.value.name.trim()) return
-  try {
-    const payload = { ...knowledgeForm.value, name: knowledgeForm.value.name.trim() }
-    if (editingKnowledgeBaseId.value) {
-      const item = await updateKnowledgeBase(editingKnowledgeBaseId.value, payload)
-      const index = knowledgeBases.value.findIndex(current => current.id === item.id)
-      if (index >= 0) knowledgeBases.value[index] = { ...knowledgeBases.value[index], ...item }
-      if (selectedKnowledgeBase.value?.id === item.id) selectedKnowledgeBase.value = { ...selectedKnowledgeBase.value, ...item }
-    } else {
-      const item = await createKnowledgeBase(payload)
-      knowledgeBases.value.unshift(item)
-    }
-    editingKnowledgeBaseId.value = null
-    knowledgeFormOpen.value = false
-    knowledgeForm.value = { name: '', description: '', visibility: 'private' }
-  } catch (error) {
-    requestLogs.value.unshift({ method: editingKnowledgeBaseId.value ? 'PUT' : 'POST', path: '/api/user/knowledge-bases', status: 'ERR', time: 0, body: error instanceof Error ? error.message : String(error) })
-  }
-}
-
-function editKnowledgeBase(item: KnowledgeBaseItem) {
-  editingKnowledgeBaseId.value = item.id
+// 工具栏"创建知识库"按钮的入口——跟点卡片走同一个弹窗，只是表单清空、没有
+// document_count 门槛，也没有文档区（还没有 kb_id，传不了文件）。
+function openCreateKnowledgeBaseForm() {
+  editingKnowledgeBaseId.value = null
+  selectedKnowledgeBase.value = null
+  knowledgeDocuments.value = []
+  knowledgeSearchQuery.value = ''
+  knowledgeSearchResults.value = []
   knowledgeForm.value = {
-    name: item.name,
-    description: item.description || '',
-    visibility: item.visibility || 'private'
+    name: '', description: '', visibility: 'private',
+    embedding_model: '', reranker_model: '', reranker_enabled: true,
+    vlm_model: '', vlm_enabled: true, multimodal: false
   }
   knowledgeFormOpen.value = true
 }
 
+// 关弹窗（保存成功、点取消、点遮罩/Esc 都走这里）——统一清掉编辑态，免得下次
+// 打开时残留上一个知识库的表单值或文档列表。
+function closeKnowledgeBaseForm() {
+  knowledgeFormOpen.value = false
+  editingKnowledgeBaseId.value = null
+  selectedKnowledgeBase.value = null
+  knowledgeDocuments.value = []
+  knowledgeSearchResults.value = []
+}
+
+async function createMarketKnowledgeBase() {
+  if (!knowledgeForm.value.name.trim() || submitBusyKey.value) return
+  submitBusyKey.value = 'kb-save'
+  try {
+    const { embedding_model, ...rest } = knowledgeForm.value
+    const payload: Record<string, unknown> = { ...rest, name: knowledgeForm.value.name.trim() }
+    // embedding_model 只在新建、或编辑一个还没有文档的库时带上——已有文档的库带
+    // 上这个字段会被后端显式 400（见 server_user_kb.py），不是"传了也没用"会被
+    // 静默忽略，所以这里干脆不传，别让用户点了保存才看见一条陌生的报错。
+    if (!editingKnowledgeBaseId.value || editingKnowledgeBaseDocCount.value === 0) {
+      payload.embedding_model = embedding_model
+    }
+    if (editingKnowledgeBaseId.value) {
+      const item = await updateKnowledgeBase(editingKnowledgeBaseId.value, { ...payload, expected_updated_at: selectedKnowledgeBase.value?.updated_at })
+      const index = knowledgeBases.value.findIndex(current => current.id === item.id)
+      if (index >= 0) knowledgeBases.value[index] = { ...knowledgeBases.value[index], ...item }
+    } else {
+      const item = await createKnowledgeBase(payload as Parameters<typeof createKnowledgeBase>[0])
+      knowledgeBases.value.unshift(item)
+    }
+    closeKnowledgeBaseForm()
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 409) {
+      connectionError.value = error.message || '该知识库已被修改，请刷新后重试'
+    } else {
+      requestLogs.value.unshift({ method: editingKnowledgeBaseId.value ? 'PUT' : 'POST', path: '/api/user/knowledge-bases', status: 'ERR', time: 0, body: error instanceof Error ? error.message : String(error) })
+    }
+  } finally {
+    submitBusyKey.value = ''
+  }
+}
+
 async function removeKnowledgeBase(item: KnowledgeBaseItem) {
   if (!window.confirm(`删除知识库「${item.name}」？其中的文档也会被移除。`)) return
+  if (submitBusyKey.value) return
+  submitBusyKey.value = 'kb-delete'
   try {
     await deleteKnowledgeBase(item.id)
     knowledgeBases.value = knowledgeBases.value.filter(current => current.id !== item.id)
-    if (selectedKnowledgeBase.value?.id === item.id) {
-      selectedKnowledgeBase.value = null
-      knowledgeDocuments.value = []
-      knowledgeSearchResults.value = []
-    }
+    if (selectedKnowledgeBase.value?.id === item.id) closeKnowledgeBaseForm()
   } catch (error) {
     requestLogs.value.unshift({ method: 'DELETE', path: `/api/user/knowledge-bases/${item.id}`, status: 'ERR', time: 0, body: error instanceof Error ? error.message : String(error) })
+  } finally {
+    submitBusyKey.value = ''
   }
 }
 
@@ -866,12 +1118,15 @@ async function uploadKnowledgeFile(options: { file: UploadFileInfo }) {
 }
 
 async function removeKnowledgeDocument(document: KnowledgeDocument) {
-  if (!selectedKnowledgeBase.value) return
+  if (!selectedKnowledgeBase.value || submitBusyKey.value) return
+  submitBusyKey.value = 'kb-document-delete'
   try {
     await deleteKnowledgeDocument(selectedKnowledgeBase.value.id, document.id)
     knowledgeDocuments.value = knowledgeDocuments.value.filter(item => item.id !== document.id)
   } catch (error) {
     requestLogs.value.unshift({ method: 'DELETE', path: `/api/user/knowledge-bases/${selectedKnowledgeBase.value.id}/documents/${document.id}`, status: 'ERR', time: 0, body: error instanceof Error ? error.message : String(error) })
+  } finally {
+    submitBusyKey.value = ''
   }
 }
 
@@ -909,9 +1164,33 @@ async function selectWorkspaceFile(file: AssetFile) {
   filePreviewLoading.value = true
   try {
     const { blob, contentType } = await downloadWorkspaceFile(currentSessionId.value, file.path)
+    // 陈旧响应丢弃：用户点了文件 A 又很快点了文件 B，两次下载同时在途，
+    // 网络顺序不保证跟点击顺序一致。不判断的话，后到达的响应会不管是谁的
+    // 直接覆盖 filePreviewUrl/Text/Kind——用户看着"当前选中 = B"（文件名/
+    // 路径都显示 B），预览区却是 A 的内容，会被当成"这就是 B 的内容"。
+    // 这个判断顺带堵住一处内存泄漏：原来的代码会用陈旧响应的 URL 覆盖掉
+    // 正确响应刚创建的 URL，被覆盖掉的那个引用就此丢失、永远没人 revoke——
+    // 现在陈旧响应在这里直接返回，根本碰不到 filePreviewUrl，不会覆盖。
+    if (selectedFile.value !== file) return
     if (contentType.startsWith('image/')) {
       filePreviewUrl.value = URL.createObjectURL(blob)
       filePreviewKind.value = 'image'
+    } else if (contentType === 'application/pdf' || /\.pdf$/i.test(file.name)) {
+      // PDF 甩给浏览器自带的查看器，不用装 pdf.js——Chrome/Edge/Firefox 都内置
+      // 了 PDF 渲染能力，iframe 指向一个 blob URL 就够，跟装专门的渲染库比
+      // 零依赖、零维护成本。
+      filePreviewUrl.value = URL.createObjectURL(blob)
+      filePreviewKind.value = 'pdf'
+    } else if (contentType === 'text/html' || /\.html?$/i.test(file.name)) {
+      // 同样甩给浏览器原生能力，但 HTML 不能像 PDF 那样直接扔 iframe src——
+      // sandbox 属性只在**同源 srcdoc 内容**上才生效为"完全隔离"（跨源资源
+      // iframe 即使不加 sandbox 也已经有一层同源隔离，但那不是我们能控制的
+      // 安全边界）。走 srcdoc + sandbox="allow-scripts" 而不给 allow-same-origin：
+      // 这样里面的脚本能跑（模型生成的 HTML demo 经常带交互脚本），但拿不到
+      // 这个页面的 cookie/localStorage/token，看到的是一个空的匿名源，
+      // 不会变成一个能读用户会话状态的通道。
+      filePreviewText.value = await blob.text()
+      filePreviewKind.value = 'html'
     } else if (contentType.startsWith('text/') || /\.(md|txt|json|csv|log|py|js|ts|vue)$/i.test(file.name)) {
       filePreviewText.value = await blob.text()
       filePreviewKind.value = 'text'
@@ -973,7 +1252,8 @@ async function syncMarketMcp(item: McpMarketItem) {
 }
 
 async function createMarketMcp() {
-  if (!mcpForm.value.name.trim() || !mcpForm.value.endpoint.trim()) return
+  if (!mcpForm.value.name.trim() || !mcpForm.value.endpoint.trim() || submitBusyKey.value) return
+  submitBusyKey.value = 'mcp-save'
   try {
     await createMcpServer({
       name: mcpForm.value.name.trim(),
@@ -991,6 +1271,8 @@ async function createMarketMcp() {
     requestLogs.value.unshift({ method: 'POST', path: '/api/user/mcp-servers/mine', status: 'ERR', time: 0, body: error instanceof Error ? error.message : String(error) })
     inspectorOpen.value = true
     inspectorTab.value = 'debug'
+  } finally {
+    submitBusyKey.value = ''
   }
 }
 
@@ -1015,7 +1297,8 @@ async function submitSkillUpload() {
 }
 
 async function createMarketTool() {
-  if (!toolForm.value.name.trim()) return
+  if (!toolForm.value.name.trim() || submitBusyKey.value) return
+  submitBusyKey.value = 'tool-save'
   try {
     await createTool({
       name: toolForm.value.name.trim(),
@@ -1033,6 +1316,8 @@ async function createMarketTool() {
     requestLogs.value.unshift({ method: 'POST', path: '/api/user/tools', status: 'ERR', time: 0, body: error instanceof Error ? error.message : String(error) })
     inspectorOpen.value = true
     inspectorTab.value = 'debug'
+  } finally {
+    submitBusyKey.value = ''
   }
 }
 
@@ -1090,7 +1375,8 @@ function editMarketItem(item: SkillMarketItem | McpMarketItem | ToolMarketItem) 
 }
 
 async function saveMarketEdit() {
-  if (!editingMarketKind.value || !editingMarketId.value) return
+  if (!editingMarketKind.value || !editingMarketId.value || submitBusyKey.value) return
+  submitBusyKey.value = 'market-item-save'
   try {
     if (editingMarketKind.value === 'skill') {
       await updateSkill(editingMarketId.value, {
@@ -1121,12 +1407,16 @@ async function saveMarketEdit() {
     await loadMarkets()
   } catch (error) {
     requestLogs.value.unshift({ method: 'PUT', path: `/api/user/${editingMarketKind.value}`, status: 'ERR', time: 0, body: error instanceof Error ? error.message : String(error) })
+  } finally {
+    submitBusyKey.value = ''
   }
 }
 
 async function removeMarketItem(item: SkillMarketItem | McpMarketItem | ToolMarketItem) {
   const kind = marketTab.value === 'skills' ? 'Skill' : marketTab.value === 'mcp' ? 'MCP 服务' : 'Tool'
   if (!window.confirm(`删除${kind}「${marketItemTitle(item)}」？`)) return
+  if (submitBusyKey.value) return
+  submitBusyKey.value = 'market-item-delete'
   try {
     if (marketTab.value === 'skills') await deleteSkill(item.id)
     else if (marketTab.value === 'mcp') await deleteMcpServer(item.id)
@@ -1136,6 +1426,8 @@ async function removeMarketItem(item: SkillMarketItem | McpMarketItem | ToolMark
     else marketItems.value.tools = marketItems.value.tools.filter(current => current.id !== item.id)
   } catch (error) {
     requestLogs.value.unshift({ method: 'DELETE', path: `/api/user/${marketTab.value}/${item.id}`, status: 'ERR', time: 0, body: error instanceof Error ? error.message : String(error) })
+  } finally {
+    submitBusyKey.value = ''
   }
 }
 
@@ -1238,6 +1530,18 @@ function referencesFromExtra(extra: unknown) {
   return normalizeReferences(source.references || source.citations)
 }
 
+// usageFromExtra 只覆盖历史重放——直播那条走的是 'usage' SSE 事件（applyChatEvent
+// 里单独处理），两条路径最终应该落到同一个 message.usage 字段上，来源不同但
+// 展示逻辑不用分叉。
+function usageFromExtra(extra: unknown): Message['usage'] {
+  const main = recordValue(recordValue(extra).usage).main
+  const record = recordValue(main)
+  const inputTokens = typeof record.inputTokens === 'number' ? record.inputTokens : 0
+  const outputTokens = typeof record.outputTokens === 'number' ? record.outputTokens : 0
+  if (!inputTokens && !outputTokens) return undefined
+  return { inputTokens, outputTokens }
+}
+
 const sessionReferences = computed(() => {
   const merged = new Map<string, ReferenceItem>()
   for (const message of messages.value) {
@@ -1322,6 +1626,30 @@ function sandboxFromEvent(data: Record<string, unknown>, previous?: ActivityItem
   }
 }
 
+// parseAskUserPayload 从工具调用的原始数据里把"问题文本"和"候选项"拆出来。
+//
+// 直接读 input.question / input.options——这是 AskUser 工具**自己的调用参数**，
+// 结构化的，Go 那边工具定义就是这么声明的（agentloop/tools/askuser），不是
+// 猜出来的格式。之前那版靠拿 result 字段里"已向用户提出问题,等待回复:...
+// (候选:A / B / C)"这句人类可读摘要去正则抠 —— 这句摘要只在**直播**的
+// tool_event.data.output 里长这个 {stream,text}[] 的形状，落库之后
+// （chat_messages.extra.tool_calls[].result）就是一整段**字符串**，同一个
+// 正则找不到"候选"就整卡退化成原始 JSON，表现正是"直播时有选项、刷新页面
+// 之后就没了"——查了库里存的真实结构才发现 input 字段从头到尾都是干净的
+// {question, options}，直播和历史重放两条路径的 tool_event.data.input /
+// tool_calls[].input 是同一份东西，没有这个"格式看直播还是重放而变"的问题。
+//
+// 返回 null 表示这不是 AskUser 的调用（没有 question 字段）——调用方据此
+// 决定要不要退回原来的"整段 JSON 原样打印"。
+function parseAskUserPayload(raw: unknown): { question: string; candidates: string[] } | null {
+  const record = recordValue(raw)
+  const input = recordValue(record.input)
+  const question = typeof input.question === 'string' ? input.question.trim() : ''
+  if (!question) return null
+  const candidates = Array.isArray(input.options) ? input.options.map(item => String(item)) : []
+  return { question, candidates }
+}
+
 function activitiesFromExtra(extra: unknown): ActivityItem[] {
   const source = recordValue(extra)
   const activities: ActivityItem[] = []
@@ -1333,7 +1661,15 @@ function activitiesFromExtra(extra: unknown): ActivityItem[] {
       activities.push({ id: `thinking-${activities.length}`, kind: 'thinking', title: '思考过程', detail: String(item.content || '') })
     } else if (item.kind === 'tool') {
       const tool = recordValue(tools[Number(item.index)])
-      activities.push({ id: String(tool.toolCallId || `tool-${activities.length}`), kind: 'tool', title: `工具 · ${tool.tool || '未知工具'}`, detail: pretty(tool), status: String(tool.status || 'completed') })
+      const askUser = parseAskUserPayload(tool)
+      activities.push({
+        id: String(tool.toolCallId || `tool-${activities.length}`),
+        kind: 'tool',
+        title: `工具 · ${tool.tool || '未知工具'}`,
+        detail: askUser ? undefined : pretty(tool),
+        status: String(tool.status || 'completed'),
+        askUser: askUser || undefined
+      })
     } else if (item.kind === 'sandbox') {
       const sandbox = recordValue(sandboxes[Number(item.index)])
       const detail = sandboxFromCall(sandbox)
@@ -1371,6 +1707,11 @@ async function loadSessionWorkspace(sessionId: string) {
   workspaceError.value = ''
   try {
     const workspace = await listWorkspaceFiles(sessionId, showHiddenFiles.value)
+    // 陈旧响应丢弃：sessionId 是调用时闭包捕获的，这次请求在途时用户完全
+    // 可能已经切到了别的会话——文件工作区面板展示的语义就是"当前打开的
+    // 这个会话"，不是"发起这次请求时是哪个会话"，用 currentSessionId 校验
+    // 足够，不需要像 openSession 那样另开一个世代计数器。
+    if (currentSessionId.value !== sessionId) return
     workspaceTruncated.value = workspace.truncated === true
     workspaceStore.value = workspace.store || ''
     files.value = (workspace.files || []).map(file => {
@@ -1529,7 +1870,11 @@ async function openSandboxArtifact(artifact: SandboxArtifact) {
 }
 
 async function openSession(sessionId: string) {
+  // 只在真的切到另一个会话时才 detach——重复点当前正打开的这个会话（比如
+  // 手滑点了两下侧栏），不能把自己正在看的这条流也一起断了。
+  if (currentSessionId.value && currentSessionId.value !== sessionId) detachCurrentStream()
   currentSessionId.value = sessionId
+  const generation = ++openSessionGeneration
   try {
     const conversation = conversations.value.find(item => item.id === sessionId)
     agentId.value = conversation?.agent_id || 0
@@ -1540,6 +1885,13 @@ async function openSession(sessionId: string) {
       : agentId.value ? `agent:${agentId.value}` : 'default'
     modelDraft.value = expertItems.value.find(item => item.id === agentId.value)?.model || 'qwen3-max'
     const result = await getMessages(sessionId)
+    // 陈旧响应丢弃：这一步之后还有好几步要写共享状态（消息列表、附件、
+    // 工作区文件，最后甚至会去接一条正在直播的 SSE 流），任何一步都可能
+    // 因为用户这期间又点了别的会话而变成"写错对象"。不是显示错乱那么
+    // 简单——resumeActiveRunIfAny 真的会把另一个会话正在直播的内容注入
+    // 到当前看着的这个会话里。这里检查一次就够，不合格直接放弃剩余全部
+    // 步骤，不留半程状态。
+    if (generation !== openSessionGeneration) return
     messages.value = result.messages.map(message => ({
       id: message.id,
       role: message.role,
@@ -1547,12 +1899,52 @@ async function openSession(sessionId: string) {
       text: message.content,
       status: 'done',
       activities: activitiesFromExtra(message.extra),
-      references: referencesFromExtra(message.extra)
+      references: referencesFromExtra(message.extra),
+      usage: usageFromExtra(message.extra)
     }))
     sessionAttachments.value = (await listSessionAttachments(sessionId)).attachments || []
+    if (generation !== openSessionGeneration) return
     await loadSessionWorkspace(sessionId)
+    if (generation !== openSessionGeneration) return
+    void scrollToBottom(true)
+    await resumeActiveRunIfAny(sessionId)
   } catch (error) {
     requestLogs.value.unshift({ method: 'GET', path: `/api/sessions/${sessionId}/messages`, status: 'ERR', time: 0, body: error instanceof Error ? error.message : String(error) })
+  }
+}
+
+// resumeActiveRunIfAny 补的是"刷新页面/重新打开会话时，后端其实还有一轮没跑完"
+// 这个洞。openSession 拉到的历史只有**已落库**的消息——正在跑的那一轮还没
+// 提交，压根不在这份历史里,界面上看起来就是"任务没了"。而后端并不知道前端
+// 刚刚经历了一次刷新,它那边的并发保护(session.ErrBusy/persistence.ErrActiveRun)
+// 仍然认为这个 session 有一轮在跑——用户这时候发新消息,只会撞上一句莫名其妙
+// 的"a turn is already running for this session"，看起来像是卡死了,其实
+// 是后端做了正确的事,前端没有把这件事reflect出来。
+//
+// `from` 传空串 = 从头补（resumeMessageStream 的既有约定，见它自己的注释）——
+// 刷新之后 lastEventId 这种内存态游标本来就丢了，没有更精确的续传点可用，
+// 只能整轮从头重放。
+async function resumeActiveRunIfAny(sessionId: string) {
+  let running = false
+  try {
+    running = (await getTurnStatus(sessionId)).running
+  } catch {
+    // 查不到就当没有在跑——这只是个"锦上添花"的检测，查询本身失败不该
+    // 阻塞正常打开会话，顶多是这次刷新没接上，用户手动重发一次也能恢复。
+    return
+  }
+  if (!running) return
+
+  messages.value.push({ id: Date.now(), role: 'assistant', author: 'LEA', text: '', status: 'running', activities: [] })
+  const assistant = messages.value[messages.value.length - 1]!
+  streamRunning.value = true
+  resumeAvailable.value = false
+  lastEventId = ''
+  resumeAttempts = 0
+  try {
+    stopCurrentStream = await resumeMessageStream(sessionId, '', event => applyChatEvent(assistant, event))
+  } catch (error) {
+    finishBrokenTurn(assistant, error instanceof Error ? error.message : String(error))
   }
 }
 
@@ -1564,21 +1956,24 @@ async function openSession(sessionId: string) {
 // 而用户看到的是"发消息失败"，完全对不上他刚才做的事。
 async function removeConversation(sessionId: string) {
   if (!window.confirm('删除这个会话？对话记录会一并删除，不能恢复。')) return
+  if (submitBusyKey.value) return
+  submitBusyKey.value = 'conversation-delete'
   try {
     await deleteSession(sessionId)
   } catch (error) {
     connectionError.value = error instanceof Error ? error.message : String(error)
     return
+  } finally {
+    submitBusyKey.value = ''
   }
   conversations.value = conversations.value.filter(item => item.id !== sessionId)
   if (currentSessionId.value === sessionId) {
+    detachCurrentStream()
     currentSessionId.value = ''
     selectedConversation.value = ''
     messages.value = []
     sessionAttachments.value = []
     attachmentIds.value = []
-    streamRunning.value = false
-    resumeAvailable.value = false
   }
 }
 
@@ -1597,15 +1992,60 @@ const mountOptions = computed(() => {
   return marketItems.value.tools.map(item => ({ id: item.id, name: marketItemTitle(item), description: marketItemDescription(item) }))
 })
 
-async function mountResource() {
+// addPendingAttachment 只是本地暂存,不打任何接口。挂到资源下拉的 @change 上——
+// 选中即算数,不需要额外一个"添加"按钮:下拉本身选中就是一次明确操作,不存在
+// "划过去看一眼"的悬停触发。选完之后重置下拉，方便连续选下一个。真正的挂载
+// 请求延到 sendChatMessage 里,跟这条消息一起提交,不需要先跑一次"挂载"再跑
+// 一次"发送"。
+function addPendingAttachment() {
   if (!mountSelection.value) return
+  const option = mountOptions.value.find(item => item.id === mountSelection.value)
+  if (!option) return
+  const already = pendingAttachments.value.some(item => item.kind === mountKind.value && item.ref_id === mountSelection.value)
+  if (!already) pendingAttachments.value.push({ kind: mountKind.value, ref_id: mountSelection.value, name: option.name })
+  mountSelection.value = 0
+}
+
+function removePendingAttachment(index: number) {
+  pendingAttachments.value.splice(index, 1)
+}
+
+// buildAttachmentsPayload 拼出发消息时要带的完整清单——已挂载的 + 这一轮刚选的。
+// 不调任何接口，纯本地拼装；真正的整体替换由后端在处理这条消息时原子完成
+// （lea-agent 的 applyRequestAttachments），不需要"先挂载再发送"两次请求。
+//
+// 每条消息都带上完整清单，不只在"这一轮有新增"时才带——判断"有没有真的变化"
+// 交给后端去跟当前状态比对（指纹一样直接跳过，不会拖慢日常消息），前端不用
+// 猜"这次要不要带这个字段"，永远带最新的完整状态就行，更不容易因为忘记合并
+// 已挂载项而把它们误当成"要清空"。
+function buildAttachmentsPayload(): { kind: SessionAttachment['kind']; ref_id: number }[] {
+  const merged = [
+    ...sessionAttachments.value.map(item => ({ kind: item.kind, ref_id: item.ref_id })),
+    ...pendingAttachments.value.map(item => ({ kind: item.kind, ref_id: item.ref_id }))
+  ]
+  const seen = new Set<string>()
+  const unique: { kind: SessionAttachment['kind']; ref_id: number }[] = []
+  for (const item of merged) {
+    const key = `${item.kind}:${item.ref_id}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    unique.push(item)
+  }
+  return unique
+}
+
+// commitPendingAttachments 在消息已经发出去之后，把本地暂存的选择转成"已确认"，
+// 并跟服务端再对一次账——此时后端的整体替换已经落库（跟消息同一个请求原子完成），
+// 这里只是让界面上的 chip 从"待发送时挂载"变成"已挂载"的普通样式，失败了也
+// 不影响消息本身（消息已经发出去了），只是下次列表刷新前 chip 状态可能滞后一下。
+async function commitPendingAttachments() {
+  if (!pendingAttachments.value.length) return
+  pendingAttachments.value = []
+  if (!currentSessionId.value) return
   try {
-    const sessionId = await ensureCurrentSession()
-    await attachSessionResource(sessionId, mountKind.value, mountSelection.value)
-    await loadSessionAttachments(sessionId)
-    mountSelection.value = 0
-  } catch (error) {
-    requestLogs.value.unshift({ method: 'POST', path: `/api/sessions/${currentSessionId.value}/attachments`, status: 'ERR', time: 0, body: error instanceof Error ? error.message : String(error) })
+    await loadSessionAttachments(currentSessionId.value)
+  } catch {
+    // 静默失败——见上面的说明，不影响已经发出去的消息。
   }
 }
 
@@ -1624,7 +2064,8 @@ async function unmountResource(resource: SessionAttachment) {
 }
 
 async function saveCurrentModel() {
-  if (!agentId.value || !modelDraft.value.trim()) return
+  if (!agentId.value || !modelDraft.value.trim() || submitBusyKey.value) return
+  submitBusyKey.value = 'model-save'
   try {
     const updated = await updateAgent(agentId.value, { model: modelDraft.value.trim() })
     const index = expertItems.value.findIndex(item => item.id === updated.id)
@@ -1635,6 +2076,8 @@ async function saveCurrentModel() {
     requestLogs.value.unshift({ method: 'PUT', path: `/api/user/agents/${agentId.value}`, status: 'ERR', time: 0, body: error instanceof Error ? error.message : String(error) })
     inspectorOpen.value = true
     inspectorTab.value = 'debug'
+  } finally {
+    submitBusyKey.value = ''
   }
 }
 
@@ -1643,6 +2086,7 @@ onMounted(() => {
   // 跟 loadWorkspace 并行、且不参与它的错误处理：模型列表读不到不该拖住
   // 整个工作区加载。
   void loadChatModels()
+  void loadRetrievalModels()
 })
 
 async function saveToken() {
@@ -1674,19 +2118,124 @@ async function connectTenant() {
   }
 }
 
+function selectedConfigurationName() {
+  if (selectedTeamId.value) {
+    return teamItems.value.find(item => item.id === selectedTeamId.value)?.name || '所选专家团'
+  }
+  return expertItems.value.find(item => item.id === agentId.value)?.name || '默认 Super Agent'
+}
+
+async function persistSelectedConfiguration() {
+  if (!currentSessionId.value) return
+  const conversation = conversations.value.find(item => item.id === currentSessionId.value)
+
+  // POST /sessions 只在内存中预建 session，首条消息才会把 chat_sessions 行写入 MySQL。
+  // 这种会话无需 PUT；下面那次 SSE 的 agent_id 会作为首次落库的 active_agent_id。
+  if (!conversation || conversation.meta === '正在同步…') return
+  if ((conversation.agent_id || 0) === agentId.value) return
+
+  try {
+    await setSessionActiveAgent(currentSessionId.value, agentId.value)
+    conversation.agent_id = agentId.value || null
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error)
+    const message = error instanceof ApiError && error.status === 404
+      ? detail === 'agent not found'
+        ? `无法启用「${selectedConfigurationName()}」：该专家已删除、停用或不属于当前租户。`
+        : `无法启用「${selectedConfigurationName()}」：当前会话已不存在或无权访问，请刷新后重试。`
+      : `无法启用「${selectedConfigurationName()}」：${detail}`
+    requestLogs.value.unshift({ method: 'PUT', path: `/api/sessions/${currentSessionId.value}/active-agent`, status: 'ERR', time: 0, body: detail })
+    throw new Error(message)
+  }
+}
+
+// messageListEl 是消息列表那个自己滚动的容器（见 styles.css 里 .message-list
+// 的说明：外层 .main-stage 不再整页滚动，改成这个容器内部滚动，输入框才能
+// 稳定贴底）。改成内部滚动之后必须自己维护"贴底"——原生页面滚动至少还会
+// 让新内容落在可见区域附近，容器滚动完全不会，新增内容会落在视口之外，
+// 表现就是"看起来卡住了，直到这一轮结束才一次性冒出来"（其实流一直在收，
+// 只是容器没跟着滚，见 issue 复盘）。
+const messageListEl = ref<HTMLElement | null>(null)
+
+// isNearBottom 判断要不要自动跟着滚——只在用户本来就在底部附近时才追着滚，
+// 免得用户往上翻看历史消息时，新来的流式内容把视图硬拽回底部。
+// 120px 是个宽松阈值，不是要求刚好贴底才追。
+function isNearBottom(): boolean {
+  const el = messageListEl.value
+  if (!el) return true
+  return el.scrollHeight - el.scrollTop - el.clientHeight < 120
+}
+
+async function scrollToBottom(force = false) {
+  if (!force && !isNearBottom()) return
+  await nextTick()
+  const el = messageListEl.value
+  if (el) el.scrollTop = el.scrollHeight
+}
+
+// answerAskUser 点一个候选项等于把它当成用户输入直接发出去——AskUser 没有
+// 独立的"应答"接口，它只是个普通工具，工具结果之后引擎等的就是**下一条消息**，
+// 跟用户自己在输入框打完这句话回车是同一条路径，走 sendChatMessage 而不是
+// 另开一个专门端点。
+//
+// answered 标一下这张卡片，纯本地状态，防止同一屏里对着已经点过的卡片再点
+// 一次候选发出重复消息。
+function answerAskUser(activity: ActivityItem, candidate: string) {
+  if (!activity.askUser || activity.askUser.answered || streamRunning.value) return
+  activity.askUser.answered = true
+  void sendChatMessage(candidate)
+}
+
 async function sendChatMessage(value: string, planAction = '') {
   if (!value.trim() || streamRunning.value) return
+  try {
+    await flushPendingLibraryImports()
+    await persistSelectedConfiguration()
+  } catch (error) {
+    messages.value.push({
+      id: Date.now(),
+      role: 'system',
+      author: 'LEA',
+      text: error instanceof Error ? error.message : String(error),
+      status: 'failed'
+    })
+    return
+  }
+  const attachmentsPayload = buildAttachmentsPayload()
   messages.value.push({ id: Date.now(), role: 'user', author: '你', text: value })
-  const assistant: Message = { id: Date.now() + 1, role: 'assistant', author: 'LEA', text: '', status: 'running', activities: [] }
-  messages.value.push(assistant)
+  messages.value.push({ id: Date.now() + 1, role: 'assistant', author: 'LEA', text: '', status: 'running', activities: [] })
+  // 必须用"通过数组下标读出来的这个引用"，不能留着上面字面量对象本身的引用去
+  // 改它的属性——Vue 的响应式转换发生在**读**的那一刻（reactive() 包一层代理），
+  // push 进去的原始对象不会自动变成响应式的。留着原始引用直接改 .text/.activities，
+  // 写是写进去了，但完全绕开了代理的 set 陷阱，Vue 的依赖追踪压根不知道发生了
+  // 写入——界面会一直卡在 push 那一刻的样子，直到某个**不相关**的响应式状态变化
+  // （比如 done 事件里的 streamRunning.value = false）顺带触发一次重渲染，才会
+  // 把这一轮攒下来的最终结果一次性显示出来。这正是"流一直在收、界面却卡在
+  // running 直到整轮结束才一次性冒出来"的真正原因，不是网络也不是滚动的问题。
+  const assistant = messages.value[messages.value.length - 1]!
+  void scrollToBottom(true)
   streamRunning.value = true
   // 新一轮，游标和重连计数都归零 —— 上一轮的 id 对这一轮没有意义。
   lastEventId = ''
   resumeAttempts = 0
   resumeAvailable.value = false
   try {
-    stopCurrentStream = await sendMessageStream({ session_id: currentSessionId.value || undefined, agent_id: agentId.value, project_id: selectedProjectId.value || undefined, message: value, attachment_ids: attachmentIds.value, plan_mode: planAction ? false : chatMode.value === 'plan', plan_action: planAction }, event => applyChatEvent(assistant, event))
+    stopCurrentStream = await sendMessageStream({ session_id: currentSessionId.value || undefined, agent_id: agentId.value, project_id: selectedProjectId.value || undefined, message: value, attachment_ids: attachmentIds.value, plan_mode: planAction ? false : chatMode.value === 'plan', plan_action: planAction, attachments: attachmentsPayload }, event => applyChatEvent(assistant, event))
+    // 挂载的整体替换是后端在处理这条消息时原子完成的（跟这次 fetch 是同一个
+    // 请求），走到这里说明已经落库——把暂存的转成已确认，跟服务端同步一次
+    // 用来刷新 chip 显示，不影响已经在跑的这一轮。
+    void commitPendingAttachments()
   } catch (error) {
+    // 该对话已被另一个标签页删除——不是这一轮回答失败，是这条会话本身没了。
+    // 引导回到列表/新对话，而不是让用户对着一句裸错误反复重试同一个已经
+    // 不存在的 session_id。
+    if (error instanceof ApiError && error.code === 'session_archived') {
+      assistant.status = 'failed'
+      assistant.text = '该对话已被删除，无法继续。请返回列表或新建对话。'
+      streamRunning.value = false
+      conversations.value = conversations.value.filter(item => item.id !== currentSessionId.value)
+      return
+    }
     assistant.status = 'failed'
     assistant.text = error instanceof Error ? error.message : String(error)
     streamRunning.value = false
@@ -1732,12 +2281,24 @@ function applyChatEvent(assistant: Message, event: ChatEvent) {
             status
           })
         } else {
+          // AskUser 的 started 事件带完整的 input.question/options，但后续
+          // completed 事件只带 output，不会重发 input——parseAskUserPayload(data)
+          // 对这次事件单独解析会解析不出来，如果不merge 上一次已经解析好的结果，
+          // Object.assign（addActivity 里）会用这次的 undefined 把 started 时
+          // 已经解析出来的 askUser 覆盖掉，表现是"直播时问题卡片一开始有候选
+          // 按钮，completed 一到候选就消失、退化成原始 JSON"。跟沙箱卡片的
+          // previous 合并是同一个模式（那边是 started 记代码、progress 才有
+          // 输出，这边是 started 记 input、completed 才有 output，都是"同一个
+          // toolUseID 分几次给不同字段，要并集不要覆盖"）。
+          const previousAskUser = assistant.activities?.find(item => item.id === activityId)?.askUser
+          const askUser = parseAskUserPayload(data) || previousAskUser
           addActivity(assistant, {
             id: activityId,
             kind,
             title: `工具 · ${toolName}`,
-            detail: pretty(data.input || data.output || data.summary || data),
-            status
+            detail: askUser ? undefined : pretty(data.input || data.output || data.summary || data),
+            status,
+            askUser
           })
         }
       } else if (event.type === 'chain_hop') {
@@ -1769,6 +2330,9 @@ function applyChatEvent(assistant: Message, event: ChatEvent) {
       } else if (event.type === 'error') {
         assistant.text = String(event.data || '对话失败')
         assistant.status = 'failed'
+      } else if (event.type === 'usage' && typeof event.data === 'object' && event.data) {
+        const data = event.data as { input_tokens?: number; output_tokens?: number }
+        assistant.usage = { inputTokens: Number(data.input_tokens) || 0, outputTokens: Number(data.output_tokens) || 0 }
       } else if (event.type === 'done') {
         assistant.status = assistant.status === 'failed' ? 'failed' : 'done'
         stopCurrentStream = null
@@ -1778,13 +2342,20 @@ function applyChatEvent(assistant: Message, event: ChatEvent) {
         if (currentSessionId.value) {
           void refreshSessionList()
           void loadSessionWorkspace(currentSessionId.value)
-          void openSession(currentSessionId.value)
+          // openSession 会用 getMessages 结果整体替换 messages.value。
+          // done 时 persistTurn 可能还未提交，这时拉到的是空数组，会清掉
+          // 流里已经渲染好的消息。流已经完整渲染，不必重新加载——只同步附件列表。
+          void loadSessionAttachments(currentSessionId.value)
         }
       } else if (event.type === STREAM_CLOSED) {
         // done 之后服务端也会关连接，所以这个事件**正常结束时同样会到**。
         // 只有还在 running 才说明是真断了。
         if (assistant.status === 'running') void handleStreamClosed(assistant)
       }
+  // 每个事件都可能带来新内容（delta/工具卡片/AskUser 问题……），容器是自己
+  // 滚动的（见 messageListEl 的说明），不追着滚新内容就会落在视口外——
+  // 只在用户本来就在底部附近时才追，别把正在往上翻历史的人拽回去。
+  void scrollToBottom()
 }
 
 // handleStreamClosed 决定断线之后该续传、该拉历史，还是该认输。
@@ -1868,25 +2439,38 @@ async function resolvePlan(message: Message, action: 'approve' | 'reject') {
   )
 }
 
-async function newConversation() {
-  try {
-    const result = await createSession(agentId.value, selectedProjectId.value || undefined)
-    currentSessionId.value = result.session_id
-    selectedConversation.value = result.session_id
-    upsertConversation(result.session_id)
-    activeNav.value = 'chat'
-    messages.value = []
-    sessionAttachments.value = []
-    files.value = []
-    selectedFile.value = undefined
-    clearFilePreview()
-  } catch (error) {
-    requestLogs.value.unshift({ method: 'POST', path: '/api/sessions', status: 'ERR', time: 0, body: error instanceof Error ? error.message : String(error) })
-  }
+// newConversation 只是切换到一个空白草稿状态,不碰后端。
+//
+// 以前这里会立刻调 POST /api/sessions——本意是"反正只在内存建会话,不落库,
+// 很便宜",但没量过到底多便宜:GetOrCreate 建一个新会话要串行打两次 lea-config
+// 的网络请求(LoadAgentConfig 拉底座配置 + mergeSessionAttachments 解析挂载),
+// 用户点一次"+"就要付 3~4 秒,侧栏还会挂着一条"新对话 · 正在同步…"晾在那里,
+// 直到发第一条消息才真正落库、状态才会更新——点个新建按钮却要等大半个
+// LLM 请求的延迟,不合理。
+//
+// 真正建会话推迟到发第一条消息的时候:sendChatMessage 发的请求里
+// session_id 传空,后端的 GetOrCreate 会顺手建一个,跟这里手动建是同一条
+// 后端逻辑,只是把这次不可避免的网络延迟挪到"用户已经在等模型回复"这个
+// 时间点上,而不是"用户只是想开始打字"这个时间点上。
+function newConversation() {
+  detachCurrentStream()
+  currentSessionId.value = ''
+  selectedConversation.value = ''
+  activeNav.value = 'chat'
+  messages.value = []
+  sessionAttachments.value = []
+  pendingAttachments.value = []
+  attachmentIds.value = []
+  attachmentFiles.value = []
+  pendingLibraryImports.value = []
+  files.value = []
+  selectedFile.value = undefined
+  clearFilePreview()
 }
 
 async function saveProject() {
-  if (!projectForm.value.name.trim()) return
+  if (!projectForm.value.name.trim() || submitBusyKey.value) return
+  submitBusyKey.value = 'project-save'
   try {
     const payload = { name: projectForm.value.name.trim(), description: projectForm.value.description.trim() }
     if (editingProjectId.value) {
@@ -1903,6 +2487,8 @@ async function saveProject() {
     projectFormOpen.value = false
   } catch (error) {
     requestLogs.value.unshift({ method: editingProjectId.value ? 'PUT' : 'POST', path: '/api/projects', status: 'ERR', time: 0, body: error instanceof Error ? error.message : String(error) })
+  } finally {
+    submitBusyKey.value = ''
   }
 }
 
@@ -1921,6 +2507,8 @@ function startCreateProject() {
 
 async function removeProject(project: ProjectItem) {
   if (!window.confirm(`删除项目「${project.name}」？会话会保留，但会解除项目归属。`)) return
+  if (submitBusyKey.value) return
+  submitBusyKey.value = 'project-delete'
   try {
     await deleteProject(project.id)
     projects.value = projects.value.filter(current => current.id !== project.id)
@@ -1928,6 +2516,8 @@ async function removeProject(project: ProjectItem) {
     if (selectedProjectId.value === project.id) selectedProjectId.value = null
   } catch (error) {
     requestLogs.value.unshift({ method: 'DELETE', path: `/api/projects/${project.id}`, status: 'ERR', time: 0, body: error instanceof Error ? error.message : String(error) })
+  } finally {
+    submitBusyKey.value = ''
   }
 }
 
@@ -1944,6 +2534,29 @@ async function archiveProjectItem(project: ProjectItem) {
 function openProject(project: ProjectItem) {
   selectedProjectId.value = project.id
   activeNav.value = 'projects'
+}
+
+// detachCurrentStream 在**离开**当前对话之前调用——切到另一个会话、新建对话、
+// 换专家开聊，都是"人还在，只是不看这个对话了"，跟用户主动点"停止"是两种
+//完全不同的意图，不能共用 stopStream：
+//
+//	stopStream        用户明确要求"别再生成了"——发 POST /chat/stop，
+//	                  服务端那一轮真的会被取消。
+//	detachCurrentStream 只是不再盯着这条本地连接看——服务端那一轮完全不受
+//	                  影响，继续在后台跑完、正常落库，用户回到这个对话时
+//	                  能看到完整结果（呼应 resumeActiveRunIfAny：刷新页面
+//	                  之后还能接回去，是同一条设计原则）。
+//
+// 不调用这个函数的后果：streamRunning 是全局的一个标志位，不是"这个会话在
+// 跑"而是"**某个**会话在跑"——切走之后旧会话如果还没跑完，这个标志位不会
+// 复位，新对话的输入框会一直被"生成中"锁住，直到旧会话那一轮不知道什么
+// 时候结束（可能是一个跑很久的任务）才解锁，期间用户会以为整个应用卡死了。
+// 本地这条 fetch 的读取循环也会在背景里空转，直到服务端关闭连接才停。
+function detachCurrentStream() {
+  stopCurrentStream?.()
+  stopCurrentStream = null
+  streamRunning.value = false
+  resumeAvailable.value = false
 }
 
 // stopStream 必须做**两件**事，顺序也不能反。
@@ -2083,13 +2696,30 @@ async function switchLibraryKind(kind: '' | 'upload' | 'artifact') {
   await loadUserLibrary()
 }
 
-// importLibraryFile 把库里的文件搬进当前会话，并**把返回的 attachment_id 排进下一条
-// 消息**。后面那半步不能省：光物化字节模型是不知道有这个文件的，注入只认 attachment_ids。
-async function importLibraryFile(file: UserFile) {
-  if (!file.can_import || libraryBusyKey.value) return
-  libraryBusyKey.value = libraryKey(file)
-  try {
-    const sessionId = await ensureCurrentSession()
+// importLibraryFile 只是本地暂存，不打任何接口——选中这一步不需要碰后端，
+// 见 pendingLibraryImports 的说明。真正的导入延到 flushPendingLibraryImports，
+// 跟着下一次发送一起做。
+function importLibraryFile(file: UserFile) {
+  if (!file.can_import) return
+  const already = pendingLibraryImports.value.some(item => libraryKey(item) === libraryKey(file))
+  if (!already) pendingLibraryImports.value.push(file)
+  // 切回"文件"页让用户看见它已经排进本轮附件了 —— 否则选中之后界面毫无变化，
+  // 分不清是选上了还是没反应。
+  inspectorTab.value = 'files'
+}
+
+function removePendingLibraryImport(file: UserFile) {
+  pendingLibraryImports.value = pendingLibraryImports.value.filter(item => libraryKey(item) !== libraryKey(file))
+}
+
+// flushPendingLibraryImports 在发送消息之前把暂存的库文件真正导入进会话。
+// ensureCurrentSession 保证这时候一定有 session_id 可用——这一步不能再往后
+// 推了：attachment_id 是导入这个动作的产物，发消息请求本身要带着它，没法
+// 像 skill/tool 那样让后端在处理消息的同一个请求里顺带做掉。
+async function flushPendingLibraryImports(): Promise<void> {
+  if (!pendingLibraryImports.value.length) return
+  const sessionId = await ensureCurrentSession()
+  for (const file of pendingLibraryImports.value) {
     const imported = await importFileToSession(sessionId, file.kind, file.id)
     attachmentIds.value.push(imported.attachment_id)
     attachmentFiles.value.unshift({
@@ -2098,14 +2728,8 @@ async function importLibraryFile(file: UserFile) {
       size: formatBytes(imported.file_size),
       downloadable: true
     })
-    // 切回"文件"页让用户看见它已经排进本轮附件了 —— 否则导入完界面毫无变化，
-    // 分不清是成功了还是没反应。
-    inspectorTab.value = 'files'
-  } catch (error) {
-    libraryError.value = error instanceof Error ? error.message : String(error)
-  } finally {
-    libraryBusyKey.value = ''
   }
+  pendingLibraryImports.value = []
 }
 
 async function removeLibraryFile(file: UserFile) {
@@ -2127,6 +2751,59 @@ async function removeLibraryFile(file: UserFile) {
 
 function pretty(value: unknown) {
   return typeof value === 'string' ? value : JSON.stringify(value || {}, null, 2)
+}
+
+// renderMarkdown 把消息正文过一遍 markdown-it 再交给 v-html。
+//
+// html: false（默认值，这里显式写出来不是多余——防止以后有人"顺手"加个
+// html: true 就把 XSS 打开了）：模型生成的文本里可能包含看起来像标签的
+// 字符串（用户复制粘贴、或者模型在解释代码时写了 <script> 这种词），
+// 关掉之后这些原样转义成文本显示，不会被当成真 HTML 解析执行。
+// linkify + breaks 是聊天场景该有的默认行为：裸链接自动可点，单个换行
+// 当真换行——纯文本消息不会因为没有markdown空行就挤成一段。
+const md = new MarkdownIt({ html: false, linkify: true, breaks: true })
+
+function renderMarkdown(text: string): string {
+  return md.render(text || '')
+}
+
+// 用 highlight.js 的 core 版本手动注册几种语言，而不是引入全量包——
+// 工作区文件预览常见的类型就这几种，没必要为了"以后可能用得上"的语言
+// 把首屏 JS 体积再堆上去（这个应用已经因为 naive-ui 报过一次 500KB 警告）。
+hljs.registerLanguage('javascript', javascript)
+hljs.registerLanguage('typescript', typescript)
+hljs.registerLanguage('python', python)
+hljs.registerLanguage('json', json)
+hljs.registerLanguage('xml', xml)
+hljs.registerLanguage('css', css)
+hljs.registerLanguage('bash', bash)
+
+const EXT_TO_LANG: Record<string, string> = {
+  js: 'javascript', mjs: 'javascript', jsx: 'javascript', vue: 'xml',
+  ts: 'typescript', tsx: 'typescript',
+  py: 'python', json: 'json', css: 'css', sh: 'bash', bash: 'bash'
+}
+
+// highlightPreviewText 给文本预览做语法高亮，猜不出语言（比如 .md/.txt/.log/.csv）
+// 就原样转义显示——hljs 认不出的语言硬塞给它会直接抛错，不是退化成无高亮，
+// 所以必须先自己判断一遍，不能无差别调用 highlightAuto（那个开销也更大，
+// 对预览这种一次性的小文本没必要）。
+function highlightPreviewText(text: string, filename: string): string {
+  const ext = filename.split('.').pop()?.toLowerCase() || ''
+  const lang = EXT_TO_LANG[ext]
+  if (!lang) return escapeHtml(text)
+  try {
+    return hljs.highlight(text, { language: lang }).value
+  } catch {
+    return escapeHtml(text)
+  }
+}
+
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
 }
 </script>
 
@@ -2194,7 +2871,7 @@ function pretty(value: unknown) {
           >
             <span>{{ conversation.title }}</span>
             <small>{{ conversation.meta }}</small>
-            <button class="conversation-delete" title="删除会话" @click.stop="removeConversation(conversation.id)">×</button>
+            <button class="conversation-delete" title="删除会话" :disabled="submitBusyKey === 'conversation-delete'" @click.stop="removeConversation(conversation.id)">×</button>
           </div>
           <small v-if="!conversations.length" class="sidebar-empty">暂无会话，点击上方加号开始</small>
         </section>
@@ -2228,28 +2905,44 @@ function pretty(value: unknown) {
             </n-tag>
           </div>
 
-          <div class="message-list">
+          <div class="message-list" ref="messageListEl">
             <article v-for="message in messages" :key="message.id" class="message" :class="message.role">
               <div class="avatar">{{ message.author.slice(0, 1) }}</div>
               <div class="bubble">
                 <header>
                   <strong>{{ message.author }}</strong>
-                  <n-tag
-                    v-if="message.status"
-                    size="small"
-                    :type="message.status === 'failed' ? 'error' : message.status === 'running' ? 'warning' : 'success'"
-                  >
-                    {{ message.status }}
-                  </n-tag>
+                  <div class="bubble-header-right">
+                    <n-tag
+                      v-if="message.status"
+                      size="small"
+                      :type="message.status === 'failed' ? 'error' : message.status === 'running' ? 'warning' : 'success'"
+                    >
+                      {{ message.status }}
+                    </n-tag>
+                    <!-- 跑完立刻显示（usage SSE 事件），不是逐轮实时更新——引擎没有
+                         "一轮完成"的回调，做不到那个程度，见后端 usageSnapshot 的说明。 -->
+                    <small v-if="message.usage" class="token-usage">输入 {{ message.usage.inputTokens }} · 输出 {{ message.usage.outputTokens }} tokens</small>
+                  </div>
                 </header>
-                <p>{{ message.text }}</p>
+                <!-- markdown-it 渲染，见 renderMarkdown 的说明——html 关着，
+                     模型/用户输入里的尖括号原样转义显示，不会被当成真标签解析。 -->
+                <div class="markdown-body" v-html="renderMarkdown(message.text)" />
                 <div v-if="message.activities?.length" class="activity-timeline">
                   <div v-for="activity in message.activities" :key="activity.id" class="activity-item" :class="`activity-${activity.kind}`">
-                    <div class="activity-heading">
+                    <!-- 只有"通用原始输出"这一种值得收起——沙箱的代码/输出、AskUser
+                         的问题都是用户马上要看/要回答的内容，收起反而添乱，见下面
+                         各分支自己决定要不要认 expandedActivities。点击标题切换，
+                         光标只在真的有内容可展开时才显示"能点"。 -->
+                    <div
+                      class="activity-heading"
+                      :class="{ clickable: !!activity.detail && !activity.sandbox && !activity.askUser }"
+                      @click="activity.detail && !activity.sandbox && !activity.askUser && toggleActivity(activity.id)"
+                    >
                       <span class="activity-dot" />
                       <strong>{{ activity.title }}</strong>
                       <n-tag size="tiny" :type="activity.status === 'failed' || activity.status === 'error' ? 'error' : activity.status === 'running' || activity.status === 'started' ? 'warning' : 'success'">{{ activity.status || '已完成' }}</n-tag>
                       <small v-if="activity.sandbox?.durationMs">{{ activity.sandbox.durationMs }} ms</small>
+                      <small v-if="activity.detail && !activity.sandbox && !activity.askUser" class="activity-toggle-hint">{{ expandedActivities.has(activity.id) ? '收起 ▲' : '展开 ▼' }}</small>
                     </div>
                     <!-- 沙箱走结构化渲染：代码 / stdout / stderr / 产物各自成块。
                          stderr 单独标红是最要紧的一处 —— 代码跑挂时 traceback 就在
@@ -2267,7 +2960,17 @@ function pretty(value: unknown) {
                         </button>
                       </div>
                     </template>
-                    <pre v-else-if="activity.detail" class="activity-detail">{{ activity.detail }}</pre>
+                    <template v-else-if="activity.askUser">
+                      <div class="activity-detail ask-user-question markdown-body" v-html="renderMarkdown(activity.askUser.question)" />
+                      <div v-if="activity.askUser.candidates.length" class="ask-user-candidates">
+                        <n-button
+                          v-for="candidate in activity.askUser.candidates" :key="candidate"
+                          size="small" secondary :disabled="activity.askUser.answered || streamRunning"
+                          @click="answerAskUser(activity, candidate)"
+                        >{{ candidate }}</n-button>
+                      </div>
+                    </template>
+                    <pre v-else-if="activity.detail && expandedActivities.has(activity.id)" class="activity-detail">{{ activity.detail }}</pre>
                   </div>
                 </div>
                 <div v-if="message.planApproval" class="plan-approval-card">
@@ -2292,9 +2995,17 @@ function pretty(value: unknown) {
           </div>
 
           <div class="composer">
-            <div v-if="sessionAttachments.length" class="attachment-chips composer-chips">
+            <div v-if="sessionAttachments.length || pendingAttachments.length" class="attachment-chips composer-chips">
               <n-tag v-for="resource in sessionAttachments" :key="`${resource.kind}-${resource.ref_id}`" size="small" closable @close="unmountResource(resource)">
                 {{ resource.display_name || resource.name || `${resource.kind} #${resource.ref_id}` }}
+              </n-tag>
+              <!-- 待挂载：只是本地暂存，还没打过任何接口，点发送才会真正生效。
+                   type="warning" 跟上面已挂载的区分开，免得用户以为选完就已经生效了。 -->
+              <n-tag
+                v-for="(item, index) in pendingAttachments" :key="`pending-${item.kind}-${item.ref_id}`"
+                size="small" type="warning" closable @close="removePendingAttachment(index)"
+              >
+                {{ item.name }}（待发送时挂载）
               </n-tag>
             </div>
             <div v-if="configurationPanelOpen" class="session-config-panel composer-panel">
@@ -2306,10 +3017,9 @@ function pretty(value: unknown) {
               </select>
               <small v-if="chatMode === 'plan'" class="sidebar-empty">Plan 会让当前对话先产出计划；批准后再进入执行阶段。</small>
               <template v-if="chatMode === 'expert' || chatMode === 'team'">
-              <select v-model="configurationSelection" aria-label="加载专家配置">
+              <select v-model="configurationSelection" aria-label="选择专家配置" @change="applySelectedConfiguration">
                 <option v-for="configuration in modeConfigurations" :key="configuration.value" :value="configuration.value">{{ configuration.label }}</option>
               </select>
-              <n-button type="primary" @click="applySelectedConfiguration">加载到当前对话</n-button>
               </template>
             </div>
             <div v-if="modelPanelOpen" class="session-config-panel composer-panel">
@@ -2319,21 +3029,21 @@ function pretty(value: unknown) {
                 v-model:value="modelDraft" :options="modelOptions" filterable tag
                 placeholder="选择或输入模型名称" style="min-width: 240px"
               />
-              <n-button type="primary" @click="saveCurrentModel">保存模型</n-button>
+              <n-button type="primary" :loading="submitBusyKey === 'model-save'" :disabled="!!submitBusyKey" @click="saveCurrentModel">保存模型</n-button>
               <small v-if="!chatModels.length" class="toolbar-label">没读到可选模型列表，可直接输入名称。</small>
             </div>
             <div v-if="mountPanelOpen" class="session-config-panel mount-panel composer-panel">
               <select v-model="mountKind" @change="mountSelection = 0"><option value="skill">Skill</option><option value="mcp_server">MCP</option><option value="tool">Tool</option></select>
-              <select v-model.number="mountSelection"><option :value="0">选择要挂载的资源</option><option v-for="option in mountOptions" :key="option.id" :value="option.id">{{ option.name }}</option></select>
-              <n-button type="primary" :disabled="!mountSelection" @click="mountResource">挂载到当前会话</n-button>
+              <select v-model.number="mountSelection" @change="addPendingAttachment"><option :value="0">选择要挂载的资源</option><option v-for="option in mountOptions" :key="option.id" :value="option.id">{{ option.name }}</option></select>
               <small v-if="!mountOptions.length" class="sidebar-empty">当前类型暂无可用资源，请先在市场配置。</small>
+              <small class="sidebar-empty">选中即加入下方列表，不会立刻生效，跟随下一次发送一起挂载。</small>
             </div>
             <n-input
               v-model:value="prompt"
               type="textarea"
-              placeholder="向当前专家、专家团或项目提问..."
+              placeholder="向当前专家、专家团或项目提问...（Enter 发送，Shift+Enter 换行）"
               :autosize="{ minRows: 2, maxRows: 6 }"
-              @keydown.ctrl.enter.prevent="addMessage"
+              @keydown.enter.exact.prevent="addMessage"
             />
             <div class="composer-actions">
               <n-button quaternary circle title="临时挂载 Skill、MCP 或 Tool" @click="mountPanelOpen = !mountPanelOpen; modelPanelOpen = false">
@@ -2363,43 +3073,10 @@ function pretty(value: unknown) {
           <div class="segmented">
             <button :class="{ active: expertTab === 'experts' }" @click="expertTab = 'experts'">专家</button>
             <button :class="{ active: expertTab === 'teams' }" @click="expertTab = 'teams'">专家团</button>
-            <n-button type="primary" @click="expertTab === 'teams' ? (teamFormOpen = !teamFormOpen) : (expertFormOpen = !expertFormOpen)">
+            <n-button type="primary" @click="expertTab === 'teams' ? openCreateTeamForm() : openCreateExpertForm()">
               <template #icon><n-icon :component="Add" /></template>
-              {{ (expertTab === 'teams' ? teamFormOpen : expertFormOpen) ? '收起创建' : '创建' }}
+              创建
             </n-button>
-          </div>
-          <div v-if="expertFormOpen && expertTab === 'experts'" class="tool-create-form">
-            <div class="form-grid">
-              <n-input v-model:value="expertForm.name" placeholder="专家名称" />
-              <select v-model="expertForm.category" aria-label="专家分类">
-                <option value="">选择分类</option><option value="general">通用</option><option value="writing">写作</option><option value="data">数据</option><option value="research">研究</option><option value="development">开发</option>
-              </select>
-              <n-select v-model:value="expertForm.model" :options="modelOptions" filterable tag placeholder="选择或输入模型" />
-            </div>
-            <n-input v-model:value="expertForm.description" placeholder="专家描述" />
-            <n-input v-model:value="expertForm.soul_prompt" type="textarea" placeholder="系统提示词" :autosize="{ minRows: 4, maxRows: 8 }" />
-            <label class="config-field"><span>绑定 Skill</span><select v-model="expertForm.skill_ids" multiple><option v-for="skill in marketItems.skills" :key="skill.id" :value="skill.id">{{ skill.display_name || skill.name }}</option></select></label>
-            <label class="config-field"><span>绑定 MCP 服务</span><select v-model="expertForm.mcp_ids" multiple><option v-for="mcp in marketItems.mcp" :key="mcp.id" :value="mcp.id">{{ mcp.name }}</option></select></label>
-            <label class="config-field"><span>绑定工具</span><select v-model="expertForm.tool_ids" multiple><option v-for="tool in marketItems.tools" :key="tool.id" :value="tool.id">{{ tool.display_name || tool.name }}</option></select></label>
-            <label class="config-field"><span>绑定知识库</span><select v-model="expertForm.kb_ids" multiple><option v-for="kb in knowledgeBases" :key="kb.id" :value="kb.id">{{ kb.name }}</option></select></label>
-            <n-button type="primary" @click="createMarketExpert">保存专家</n-button>
-          </div>
-          <div v-if="teamFormOpen && expertTab === 'teams'" class="tool-create-form">
-            <div class="form-grid">
-              <select v-model.number="teamForm.agent_id">
-                <option :value="0">选择主专家</option>
-                <option v-for="expert in expertItems" :key="expert.id" :value="expert.id">{{ expert.name }}</option>
-              </select>
-              <select v-model="teamForm.strategy" aria-label="专家团协作模式">
-                <option value="star">星型协作</option>
-                <option value="handoff">接力协作</option>
-              </select>
-            </div>
-            <n-input v-model:value="teamForm.decomposer_prompt" placeholder="拆解提示词" />
-            <n-input v-model:value="teamForm.synthesizer_prompt" placeholder="汇总提示词" />
-            <n-input-number v-model:value="teamForm.max_subtasks" :min="1" :max="20" />
-            <label class="config-field"><span>团队成员专家</span><select v-model="teamForm.member_ids" multiple><option v-for="expert in expertItems.filter(expert => expert.id !== teamForm.agent_id)" :key="expert.id" :value="expert.id">{{ expert.name }}</option></select></label>
-            <n-button type="primary" @click="createMarketTeam">保存专家团</n-button>
           </div>
           <div class="asset-grid">
             <article v-if="expertTab === 'teams' && !teamItems.length" class="asset-card empty-card">
@@ -2407,25 +3084,33 @@ function pretty(value: unknown) {
               <h3>暂无专家团</h3>
               <p>主专家负责主持和调度；成员专家参与分析与执行。</p>
             </article>
-            <article v-for="team in (expertTab === 'teams' ? teamItems : [])" :key="team.id" class="asset-card">
+            <article v-for="team in (expertTab === 'teams' ? teamItems : [])" :key="team.id" class="asset-card clickable-card" @click="openTeamForm(team)">
               <n-icon :component="PeopleOutline" />
               <h3>专家团 · {{ team.name || `#${team.id}` }}</h3>
               <p>主专家：{{ expertItems.find(expert => expert.id === team.agent_id)?.name || `#${team.agent_id}` }} · {{ team.strategy === 'handoff' ? '接力协作' : '星型协作' }}</p>
               <div class="tag-row"><n-tag size="small">最多 {{ team.max_subtasks || 5 }} 个子任务
               </n-tag></div>
-              <div class="card-actions">
-                <n-button size="small" secondary @click="openTeamMembers(team)">成员配置</n-button>
-                <n-button v-if="expertItems.find(expert => expert.id === team.agent_id)?.is_mine" size="small" secondary @click="editTeam(team)">编辑</n-button>
-                <n-button v-if="expertItems.find(expert => expert.id === team.agent_id)?.is_mine" size="small" quaternary @click="removeExpertTeam(team)">删除</n-button>
+              <!-- 卡片本体就是"配置"入口（点开弹窗改参数 + 管成员），所以这里不再
+                   单独放"成员配置"和"编辑"两个按钮，跟知识库卡片保持一致。 -->
+              <div class="card-actions" @click.stop>
                 <n-button size="small" type="primary" @click="useTeam(team)">用于新对话</n-button>
+                <n-button size="small" secondary @click="openTeamForm(team)">配置</n-button>
+                <n-button v-if="expertItems.find(expert => expert.id === team.agent_id)?.is_mine" size="small" quaternary :loading="submitBusyKey === 'team-delete'" :disabled="!!submitBusyKey" @click="removeExpertTeam(team)">删除</n-button>
               </div>
             </article>
-            <article v-for="expert in (expertTab === 'experts' ? expertItems : [])" :key="expert.id" class="asset-card">
+            <!-- 只有自己建的专家点卡片才进编辑弹窗。别人的/平台预置的（is_mine=false，
+                 种子数据 created_by 为空）后端 _require_mine 一律 403，让它能点开一个
+                 改不了的表单只会让人以为"改了没保存上"。 -->
+            <article
+              v-for="expert in (expertTab === 'experts' ? expertItems : [])" :key="expert.id" class="asset-card"
+              :class="{ 'clickable-card': expert.is_mine }"
+              @click="expert.is_mine && editExpert(expert)"
+            >
               <n-icon :component="AlbumsOutline" />
               <h3>{{ expert.name }}</h3>
               <p>{{ expert.description || '暂无描述' }}</p>
-              <div class="tag-row"><n-tag size="small">{{ expert.category || '通用' }}</n-tag><n-tag v-if="expert.model" size="small">{{ expert.model }}</n-tag></div>
-              <div class="card-actions"><n-button size="small" type="primary" @click="useExpert(expert)">用于新对话</n-button><n-button v-if="expert.is_mine" size="small" secondary @click="editExpert(expert)">编辑</n-button><n-button v-if="expert.is_mine" size="small" quaternary @click="openSharePanel(expert)">共享</n-button><n-button v-if="expert.is_mine" size="small" quaternary @click="removeExpert(expert)">删除</n-button></div>
+              <div class="tag-row"><n-tag size="small">{{ expert.category || '通用' }}</n-tag><n-tag v-if="expert.model" size="small">{{ expert.model }}</n-tag><n-tag v-if="!expert.is_mine" size="small" type="warning">只读</n-tag></div>
+              <div class="card-actions" @click.stop><n-button size="small" type="primary" @click="useExpert(expert)">用于新对话</n-button><n-button v-if="expert.is_mine" size="small" secondary @click="editExpert(expert)">配置</n-button><n-button v-if="expert.is_mine" size="small" quaternary @click="openSharePanel(expert)">共享</n-button><n-button v-if="expert.is_mine" size="small" quaternary :loading="submitBusyKey === 'expert-delete'" :disabled="!!submitBusyKey" @click="removeExpert(expert)">删除</n-button></div>
             </article>
           </div>
 
@@ -2463,23 +3148,90 @@ function pretty(value: unknown) {
           <div v-for="warning in shareWarnings" :key="`sw-${warning.kind}-${warning.id}`" class="share-warning">
             <strong>{{ warning.name }}</strong> — {{ warning.reason }}
           </div>
-          <div v-if="selectedTeamId" class="tool-create-form team-member-panel">
-            <div class="preview-header"><strong>专家团 #{{ selectedTeamId }} · 成员</strong><n-button size="small" quaternary @click="selectedTeamId = null">关闭</n-button></div>
-            <div v-if="teamMembers.length" class="member-list">
-              <div v-for="member in teamMembers" :key="member.id" class="document-row">
-                <span>{{ member.name || expertItems.find(expert => expert.id === member.member_agent_id)?.name || `专家 #${member.member_agent_id}` }}</span>
-                <n-tag size="small">{{ member.role || 'worker' }}</n-tag>
-                <n-button size="small" quaternary @click="deleteTeamMember(member)">移除</n-button>
+          <!-- 专家：创建和编辑一个弹窗。关闭统一走 closeExpertForm()（保存成功/取消/
+               遮罩/Esc），跟知识库弹窗同一个套路。 -->
+          <n-modal
+            :show="expertFormOpen"
+            preset="card"
+            :title="editingExpertId ? '配置专家' : '创建专家'"
+            style="width: min(720px, calc(100vw - 32px)); max-height: 85vh; overflow-y: auto;"
+            @update:show="value => { if (!value) closeExpertForm() }"
+          >
+            <div class="tool-create-form">
+              <div class="form-grid">
+                <n-input v-model:value="expertForm.name" placeholder="专家名称" />
+                <select v-model="expertForm.category" aria-label="专家分类">
+                  <option value="">选择分类</option><option value="general">通用</option><option value="writing">写作</option><option value="data">数据</option><option value="research">研究</option><option value="development">开发</option>
+                </select>
+                <n-select v-model:value="expertForm.model" :options="modelOptions" filterable tag placeholder="选择或输入模型" />
+              </div>
+              <n-input v-model:value="expertForm.description" placeholder="专家描述" />
+              <n-input v-model:value="expertForm.soul_prompt" type="textarea" placeholder="系统提示词" :autosize="{ minRows: 4, maxRows: 8 }" />
+              <label class="config-field"><span>绑定 Skill</span><select v-model="expertForm.skill_ids" multiple><option v-for="skill in marketItems.skills" :key="skill.id" :value="skill.id">{{ skill.display_name || skill.name }}</option></select></label>
+              <label class="config-field"><span>绑定 MCP 服务</span><select v-model="expertForm.mcp_ids" multiple><option v-for="mcp in marketItems.mcp" :key="mcp.id" :value="mcp.id">{{ mcp.name }}</option></select></label>
+              <label class="config-field"><span>绑定工具</span><select v-model="expertForm.tool_ids" multiple><option v-for="tool in marketItems.tools" :key="tool.id" :value="tool.id">{{ tool.display_name || tool.name }}</option></select></label>
+              <label class="config-field"><span>绑定知识库</span><select v-model="expertForm.kb_ids" multiple><option v-for="kb in knowledgeBases" :key="kb.id" :value="kb.id">{{ kb.name }}</option></select></label>
+              <div class="card-actions">
+                <n-button type="primary" :loading="submitBusyKey === 'expert-save'" :disabled="!!submitBusyKey" @click="createMarketExpert">保存</n-button>
+                <n-button quaternary @click="closeExpertForm">取消</n-button>
               </div>
             </div>
-            <p v-else>还没有成员。</p>
-            <div class="form-grid">
-              <select v-model.number="teamMemberForm.member_agent_id"><option :value="0">选择成员专家</option><option v-for="expert in expertItems" :key="expert.id" :value="expert.id">{{ expert.name }}</option></select>
-              <select v-model="teamMemberForm.role"><option value="entry">入口</option><option value="worker">执行</option><option value="exit">出口</option></select>
-              <n-input v-model:value="teamMemberForm.name" placeholder="成员显示名（可选）" />
+          </n-modal>
+
+          <!-- 专家团：团参数 + 成员名单合到一个弹窗。以前"编辑"和"成员配置"是两个
+               各自弹出的面板，成员那块还跟聊天选中的团共用一个 selectedTeamId。 -->
+          <n-modal
+            :show="teamFormOpen"
+            preset="card"
+            :title="editingTeamId ? '配置专家团' : '创建专家团'"
+            style="width: min(720px, calc(100vw - 32px)); max-height: 85vh; overflow-y: auto;"
+            @update:show="value => { if (!value) closeTeamForm() }"
+          >
+            <div class="tool-create-form">
+              <div class="form-grid">
+                <select v-model.number="teamForm.agent_id">
+                  <option :value="0">选择主专家</option>
+                  <option v-for="expert in expertItems" :key="expert.id" :value="expert.id">{{ expert.name }}</option>
+                </select>
+                <select v-model="teamForm.strategy" aria-label="专家团协作模式">
+                  <option value="star">星型协作</option>
+                  <option value="handoff">接力协作</option>
+                </select>
+              </div>
+              <n-input v-model:value="teamForm.decomposer_prompt" placeholder="拆解提示词" />
+              <n-input v-model:value="teamForm.synthesizer_prompt" placeholder="汇总提示词" />
+              <n-input-number v-model:value="teamForm.max_subtasks" :min="1" :max="20" />
+              <div class="card-actions">
+                <n-button type="primary" :loading="submitBusyKey === 'team-save'" :disabled="!!submitBusyKey" @click="createMarketTeam">保存</n-button>
+                <n-button quaternary @click="closeTeamForm">取消</n-button>
+              </div>
+
+              <n-divider />
+              <!-- 新建时还没有 team_id，加不了成员（addTeamMember 要真 id），所以这里
+                   退化成一个多选，等团建出来再一次性挂上去；编辑态才给逐条增删 + 角色。 -->
+              <template v-if="editingTeamId">
+                <div class="preview-header"><strong>成员</strong></div>
+                <div v-if="teamMembers.length" class="member-list">
+                  <div v-for="member in teamMembers" :key="member.id" class="document-row">
+                    <span>{{ member.name || expertItems.find(expert => expert.id === member.member_agent_id)?.name || `专家 #${member.member_agent_id}` }}</span>
+                    <n-tag size="small">{{ member.role || 'worker' }}</n-tag>
+                    <n-button size="small" quaternary :loading="submitBusyKey === 'team-member-delete'" :disabled="!!submitBusyKey" @click="deleteTeamMember(member)">移除</n-button>
+                  </div>
+                </div>
+                <p v-else>还没有成员。</p>
+                <div class="form-grid">
+                  <select v-model.number="teamMemberForm.member_agent_id"><option :value="0">选择成员专家</option><option v-for="expert in expertItems.filter(expert => expert.id !== teamForm.agent_id)" :key="expert.id" :value="expert.id">{{ expert.name }}</option></select>
+                  <select v-model="teamMemberForm.role"><option value="entry">入口</option><option value="worker">执行</option><option value="exit">出口</option></select>
+                  <n-input v-model:value="teamMemberForm.name" placeholder="成员显示名（可选）" />
+                </div>
+                <n-button secondary :disabled="!teamMemberForm.member_agent_id || !!submitBusyKey" :loading="submitBusyKey === 'team-member-add'" @click="saveTeamMember">添加成员</n-button>
+              </template>
+              <label v-else class="config-field">
+                <span>团队成员专家</span>
+                <select v-model="teamForm.member_ids" multiple><option v-for="expert in expertItems.filter(expert => expert.id !== teamForm.agent_id)" :key="expert.id" :value="expert.id">{{ expert.name }}</option></select>
+              </label>
             </div>
-            <n-button type="primary" @click="saveTeamMember">添加成员</n-button>
-          </div>
+          </n-modal>
         </section>
 
         <section v-else-if="activeNav === 'market'" class="content-board">
@@ -2545,7 +3297,7 @@ function pretty(value: unknown) {
             <n-input v-model:value="toolForm.endpoint" placeholder="Endpoint（API 类型填写）" />
             <n-input v-model:value="toolForm.description" placeholder="工具描述" />
             <n-input v-model:value="toolForm.schema_json" type="textarea" placeholder="JSON Schema" :autosize="{ minRows: 5, maxRows: 10 }" />
-            <n-button type="primary" @click="createMarketTool">保存 Tool</n-button>
+            <n-button type="primary" :loading="submitBusyKey === 'tool-save'" :disabled="!!submitBusyKey" @click="createMarketTool">保存 Tool</n-button>
           </div>
           <div v-if="marketTab === 'mcp' && mcpFormOpen" class="tool-create-form">
             <div class="form-grid">
@@ -2556,7 +3308,7 @@ function pretty(value: unknown) {
             <n-input v-model:value="mcpForm.description" placeholder="用途说明" />
             <n-input v-model:value="mcpForm.bearerToken" type="password" show-password-on="click" placeholder="Bearer Token（可选，仅保存到私有 MCP）" />
             <n-input v-model:value="mcpForm.toolFilter" placeholder="允许的工具，逗号分隔（留空表示全部）" />
-            <n-button type="primary" @click="createMarketMcp">保存并添加</n-button>
+            <n-button type="primary" :loading="submitBusyKey === 'mcp-save'" :disabled="!!submitBusyKey" @click="createMarketMcp">保存并添加</n-button>
           </div>
           <div class="market-list">
             <article v-for="item in visibleMarketItems" :key="item.id">
@@ -2573,7 +3325,7 @@ function pretty(value: unknown) {
               <n-button v-if="marketTab === 'mcp'" quaternary @click="syncMarketMcp(item as McpMarketItem)">同步
               </n-button>
               <n-button v-if="marketCanEdit(item)" size="small" secondary @click="editMarketItem(item)">编辑</n-button>
-              <n-button v-if="marketCanEdit(item)" size="small" quaternary @click="removeMarketItem(item)">删除</n-button>
+              <n-button v-if="marketCanEdit(item)" size="small" quaternary :loading="submitBusyKey === 'market-item-delete'" :disabled="!!submitBusyKey" @click="removeMarketItem(item)">删除</n-button>
               <n-button v-if="marketTab === 'skills' && (item as SkillMarketItem).can_edit && !(item as SkillMarketItem).pending_publish" size="small" quaternary @click="openSkillPublish(item as SkillMarketItem)">发布</n-button>
             </article>
           </div>
@@ -2582,43 +3334,80 @@ function pretty(value: unknown) {
         <section v-else-if="activeNav === 'knowledge'" class="content-board">
           <div class="segmented">
             <h2>知识库</h2>
-            <n-button type="primary" @click="knowledgeFormOpen = !knowledgeFormOpen">{{ knowledgeFormOpen ? '收起创建' : '创建知识库' }}
-            </n-button>
-          </div>
-          <div v-if="knowledgeFormOpen" class="tool-create-form">
-            <n-input v-model:value="knowledgeForm.name" placeholder="知识库名称" />
-            <n-input v-model:value="knowledgeForm.description" placeholder="知识库描述" />
-            <select v-model="knowledgeForm.visibility"><option value="private">私有</option><option value="public">公开</option></select>
-            <n-button type="primary" @click="createMarketKnowledgeBase">保存知识库
-            </n-button>
+            <n-button type="primary" @click="openCreateKnowledgeBaseForm">创建知识库</n-button>
           </div>
           <div class="asset-grid">
-            <article v-for="knowledgeBase in knowledgeBases" :key="knowledgeBase.id" class="asset-card" @click="openKnowledgeBase(knowledgeBase)">
+            <article v-for="knowledgeBase in knowledgeBases" :key="knowledgeBase.id" class="asset-card clickable-card" @click="openKnowledgeBase(knowledgeBase)">
               <n-icon :component="LibraryOutline" />
               <h3>{{ knowledgeBase.name }}</h3>
               <p>{{ knowledgeBase.description || '暂无描述' }}</p>
               <div class="tag-row"><n-tag size="small">{{ knowledgeBase.document_count || 0 }} 个文档</n-tag><n-tag size="small">{{ knowledgeBase.visibility || 'private' }}</n-tag></div>
               <div class="card-actions" @click.stop>
-                <n-button size="small" secondary @click="editKnowledgeBase(knowledgeBase)">编辑</n-button>
-                <n-button size="small" quaternary @click="removeKnowledgeBase(knowledgeBase)">删除</n-button>
+                <n-button size="small" quaternary :loading="submitBusyKey === 'kb-delete'" :disabled="!!submitBusyKey" @click="removeKnowledgeBase(knowledgeBase)">删除</n-button>
               </div>
             </article>
           </div>
-          <div v-if="selectedKnowledgeBase" class="tool-create-form">
-            <div class="preview-header"><strong>{{ selectedKnowledgeBase.name }} · 文档与检索</strong><n-upload :custom-request="uploadKnowledgeFile" :show-file-list="false"><n-button secondary>上传文档</n-button></n-upload></div>
-            <div class="knowledge-search-row">
-              <n-input v-model:value="knowledgeSearchQuery" placeholder="输入问题测试检索" @keydown.enter="searchSelectedKnowledgeBase" />
-              <n-button type="primary" :loading="knowledgeSearchLoading" :disabled="!knowledgeSearchQuery.trim()" @click="searchSelectedKnowledgeBase">检索</n-button>
-            </div>
-            <div v-if="knowledgeSearchResults.length" class="knowledge-search-results">
-              <div v-for="(hit, index) in knowledgeSearchResults" :key="`${hit.document_id || 'hit'}-${index}`" class="knowledge-hit">
-                <div><n-tag size="tiny">{{ hit.source_filename || '文档片段' }}</n-tag><small>相似度 {{ Number(hit.score || 0).toFixed(3) }}</small></div>
-                <p>{{ hit.content }}</p>
+
+          <!-- 创建和编辑合成一个弹窗：点卡片直接进编辑态、同时能看/传文档，不再单独
+               放一个"编辑"按钮。关闭方式（保存成功/点取消/点遮罩/Esc）统一走
+               closeKnowledgeBaseForm()，跟下面"发布 Skill"弹窗一个套路。 -->
+          <n-modal
+            :show="knowledgeFormOpen"
+            preset="card"
+            :title="editingKnowledgeBaseId ? '编辑知识库' : '创建知识库'"
+            style="width: min(720px, calc(100vw - 32px)); max-height: 85vh; overflow-y: auto;"
+            @update:show="value => { if (!value) closeKnowledgeBaseForm() }"
+          >
+            <div class="tool-create-form">
+              <n-input v-model:value="knowledgeForm.name" placeholder="知识库名称" />
+              <n-input v-model:value="knowledgeForm.description" placeholder="知识库描述" />
+              <select v-model="knowledgeForm.visibility"><option value="private">私有</option><option value="shared">同租户共享</option><option value="public">公开</option></select>
+              <!-- embedding_model 只在新建、或编辑一个还没有文档的库时可改——换模型
+                   意味着老向量全部失效，见 server_user_kb.py 里对应的显式 400。 -->
+              <n-select
+                v-model:value="knowledgeForm.embedding_model" :options="embeddingModelOptions" filterable tag
+                :disabled="!!editingKnowledgeBaseId && editingKnowledgeBaseDocCount > 0"
+                placeholder="选择或输入 embedding 模型（默认 bge-m3）" style="min-width: 220px"
+              />
+              <small v-if="!!editingKnowledgeBaseId && editingKnowledgeBaseDocCount > 0" class="toolbar-label">该知识库已有文档，embedding 模型不可更改，需新建知识库重新导入。</small>
+              <small v-else-if="!embeddingModelOptions.length" class="toolbar-label">没读到可选 embedding 模型列表，可直接输入名称。</small>
+              <n-select
+                v-model:value="knowledgeForm.reranker_model" :options="rerankerModelOptions" filterable tag clearable
+                placeholder="选择或输入 rerank 模型（可留空）" style="min-width: 220px"
+              />
+              <n-select
+                v-model:value="knowledgeForm.vlm_model" :options="vlmModelOptions" filterable tag clearable
+                placeholder="选择或输入 VLM 模型（可留空，用于图片/多模态解析）" style="min-width: 220px"
+              />
+              <div class="tag-row">
+                <span class="toolbar-label">启用 rerank</span><n-switch v-model:value="knowledgeForm.reranker_enabled" size="small" />
+                <span class="toolbar-label">启用 VLM 解析</span><n-switch v-model:value="knowledgeForm.vlm_enabled" size="small" />
+                <span class="toolbar-label">多模态检索</span><n-switch v-model:value="knowledgeForm.multimodal" size="small" />
               </div>
+              <div class="card-actions">
+                <n-button type="primary" :loading="submitBusyKey === 'kb-save'" :disabled="!!submitBusyKey" @click="createMarketKnowledgeBase">保存</n-button>
+                <n-button quaternary @click="closeKnowledgeBaseForm">取消</n-button>
+              </div>
+
+              <!-- 文档管理只在编辑态显示——新建时还没有 kb_id，传不了文件。 -->
+              <template v-if="editingKnowledgeBaseId">
+                <n-divider />
+                <div class="preview-header"><strong>文档与检索</strong><n-upload :custom-request="uploadKnowledgeFile" :show-file-list="false"><n-button secondary>上传文档</n-button></n-upload></div>
+                <div class="knowledge-search-row">
+                  <n-input v-model:value="knowledgeSearchQuery" placeholder="输入问题测试检索" @keydown.enter="searchSelectedKnowledgeBase" />
+                  <n-button type="primary" :loading="knowledgeSearchLoading" :disabled="!knowledgeSearchQuery.trim()" @click="searchSelectedKnowledgeBase">检索</n-button>
+                </div>
+                <div v-if="knowledgeSearchResults.length" class="knowledge-search-results">
+                  <div v-for="(hit, index) in knowledgeSearchResults" :key="`${hit.document_id || 'hit'}-${index}`" class="knowledge-hit">
+                    <div><n-tag size="tiny">{{ hit.source_filename || '文档片段' }}</n-tag><small>相似度 {{ Number(hit.score || 0).toFixed(3) }}</small></div>
+                    <p>{{ hit.content }}</p>
+                  </div>
+                </div>
+                <p v-if="!knowledgeDocuments.length">还没有文档。</p>
+                <div v-for="document in knowledgeDocuments" :key="document.id" class="document-row"><span>{{ document.filename }}</span><n-tag size="small">{{ document.status || 'processing' }}</n-tag><n-button size="small" quaternary :loading="submitBusyKey === 'kb-document-delete'" :disabled="!!submitBusyKey" @click="removeKnowledgeDocument(document)">删除</n-button></div>
+              </template>
             </div>
-            <p v-if="!knowledgeDocuments.length">还没有文档。</p>
-            <div v-for="document in knowledgeDocuments" :key="document.id" class="document-row"><span>{{ document.filename }}</span><n-tag size="small">{{ document.status || 'processing' }}</n-tag><n-button size="small" quaternary @click="removeKnowledgeDocument(document)">删除</n-button></div>
-          </div>
+          </n-modal>
         </section>
 
         <section v-else-if="activeNav === 'projects'" class="content-board">
@@ -2626,14 +3415,14 @@ function pretty(value: unknown) {
           <div v-if="projectFormOpen" class="tool-create-form">
             <n-input v-model:value="projectForm.name" placeholder="项目名称" />
             <n-input v-model:value="projectForm.description" placeholder="项目描述（可选）" />
-            <div class="card-actions"><n-button type="primary" @click="saveProject">{{ editingProjectId ? '保存修改' : '保存项目' }}</n-button><n-button quaternary @click="projectFormOpen = false; editingProjectId = null">取消</n-button></div>
+            <div class="card-actions"><n-button type="primary" :loading="submitBusyKey === 'project-save'" :disabled="!!submitBusyKey" @click="saveProject">{{ editingProjectId ? '保存修改' : '保存项目' }}</n-button><n-button quaternary @click="projectFormOpen = false; editingProjectId = null">取消</n-button></div>
           </div>
           <div class="asset-grid">
             <article v-for="project in projects" :key="project.id" class="asset-card" :class="{ 'muted-card': project.is_archived }" @click="openProject(project)">
               <h3>{{ project.name }}</h3>
               <p>{{ project.description || '暂无描述' }}</p>
               <div class="tag-row"><n-tag size="small">{{ project.session_count || 0 }} 个会话</n-tag><n-tag v-if="project.is_archived" size="small" type="warning">已归档</n-tag></div>
-              <div class="card-actions" @click.stop><n-button size="small" secondary @click="editProject(project)">编辑</n-button><n-button size="small" quaternary :disabled="project.is_archived" @click="archiveProjectItem(project)">归档</n-button><n-button size="small" quaternary @click="removeProject(project)">删除</n-button></div>
+              <div class="card-actions" @click.stop><n-button size="small" secondary @click="editProject(project)">编辑</n-button><n-button size="small" quaternary :disabled="project.is_archived" @click="archiveProjectItem(project)">归档</n-button><n-button size="small" quaternary :loading="submitBusyKey === 'project-delete'" :disabled="!!submitBusyKey" @click="removeProject(project)">删除</n-button></div>
             </article>
           </div>
           <div v-if="selectedProjectId" class="project-session-list">
@@ -2693,6 +3482,15 @@ function pretty(value: unknown) {
                 <n-button v-if="attachment.downloadable" size="small" quaternary @click="downloadUploadedAttachment(attachment)">下载</n-button>
               </div>
             </div>
+            <!-- 待导入：点了"导入"但还没发消息,本地暂存,还没真正调导入接口，
+                 见 pendingLibraryImports 的说明。 -->
+            <div v-if="pendingLibraryImports.length" class="attachment-list">
+              <strong>待发送时导入</strong>
+              <div v-for="file in pendingLibraryImports" :key="libraryKey(file)" class="document-row">
+                <span>{{ file.filename }} · {{ formatBytes(file.size) }}</span>
+                <n-button size="small" quaternary @click="removePendingLibraryImport(file)">取消</n-button>
+              </div>
+            </div>
             <p v-if="workspaceError" class="library-error">读取 Session 沙箱失败：{{ workspaceError }}</p>
             <p v-else-if="workspaceLoading && !files.length" class="empty-state">正在读取 Session 沙箱...</p>
             <p v-else-if="!currentSessionId" class="empty-state">当前还没有 Session。发送第一条消息后，这里会显示沙箱工作区。</p>
@@ -2741,8 +3539,14 @@ function pretty(value: unknown) {
               </div>
               <p v-if="filePreviewLoading">正在读取工作区文件...</p>
               <img v-else-if="filePreviewKind === 'image'" :src="filePreviewUrl" :alt="selectedFile?.name" class="image-preview" />
-              <pre v-else-if="filePreviewKind === 'text'" class="text-preview">{{ filePreviewText }}</pre>
-              <p v-else>该文件可下载；图片与文本文件可直接在此预览。</p>
+              <!-- PDF/HTML 都甩给浏览器原生能力（PDF viewer / iframe），不装专门的
+                   渲染库——见 selectWorkspaceFile 的说明。HTML 用 sandbox 隔离，
+                   allow-scripts 不带 allow-same-origin，跑得了脚本拿不到本页的
+                   会话状态。 -->
+              <iframe v-else-if="filePreviewKind === 'pdf'" :src="filePreviewUrl" class="file-preview-frame" title="PDF 预览" />
+              <iframe v-else-if="filePreviewKind === 'html'" :srcdoc="filePreviewText" sandbox="allow-scripts" class="file-preview-frame" title="HTML 预览" />
+              <pre v-else-if="filePreviewKind === 'text'" class="text-preview"><code v-html="highlightPreviewText(filePreviewText, selectedFile?.name || '')" /></pre>
+              <p v-else>该文件可下载；PDF/HTML/图片/文本文件可直接在此预览，Office 文档暂不支持预览。</p>
             </div>
           </section>
 
@@ -2792,10 +3596,9 @@ function pretty(value: unknown) {
                   <n-button
                     size="tiny"
                     secondary
-                    :disabled="!file.can_import || !!libraryBusyKey"
-                    :loading="libraryBusyKey === libraryKey(file)"
+                    :disabled="!file.can_import || pendingLibraryImports.some(item => libraryKey(item) === libraryKey(file))"
                     @click="importLibraryFile(file)"
-                  >导入会话</n-button>
+                  >{{ pendingLibraryImports.some(item => libraryKey(item) === libraryKey(file)) ? '已选中·待发送' : '导入会话' }}</n-button>
                   <n-button size="tiny" quaternary :disabled="!!libraryBusyKey" @click="removeLibraryFile(file)">删除</n-button>
                 </div>
               </div>
@@ -2837,8 +3640,10 @@ function pretty(value: unknown) {
                 </div>
                 <p v-if="filePreviewLoading">正在读取工作区文件...</p>
                 <img v-else-if="filePreviewKind === 'image'" :src="filePreviewUrl" :alt="selectedFile?.name" class="image-preview" />
-                <pre v-else-if="filePreviewKind === 'text'" class="text-preview">{{ filePreviewText }}</pre>
-                <p v-else>该文件可下载；图片与文本文件可直接在此预览。</p>
+                <iframe v-else-if="filePreviewKind === 'pdf'" :src="filePreviewUrl" class="file-preview-frame" title="PDF 预览" />
+                <iframe v-else-if="filePreviewKind === 'html'" :srcdoc="filePreviewText" sandbox="allow-scripts" class="file-preview-frame" title="HTML 预览" />
+                <pre v-else-if="filePreviewKind === 'text'" class="text-preview"><code v-html="highlightPreviewText(filePreviewText, selectedFile?.name || '')" /></pre>
+                <p v-else>该文件可下载；PDF/HTML/图片/文本文件可直接在此预览，Office 文档暂不支持预览。</p>
               </div>
             </template>
           </section>
@@ -2914,7 +3719,7 @@ function pretty(value: unknown) {
         <n-input v-if="editingMarketKind === 'tool'" v-model:value="marketEditForm.endpoint" placeholder="Endpoint" />
         <n-input v-if="editingMarketKind === 'tool'" v-model:value="marketEditForm.schema_json" type="textarea" :autosize="{ minRows: 5, maxRows: 10 }" placeholder="JSON Schema" />
         <n-input v-if="editingMarketKind === 'skill'" v-model:value="marketEditForm.system_prompt" type="textarea" :autosize="{ minRows: 4, maxRows: 8 }" placeholder="核心提示词（如果后端允许修改）" />
-        <div class="card-actions"><n-button type="primary" @click="saveMarketEdit">保存修改</n-button><n-button quaternary @click="marketEditOpen = false">取消</n-button></div>
+        <div class="card-actions"><n-button type="primary" :loading="submitBusyKey === 'market-item-save'" :disabled="!!submitBusyKey" @click="saveMarketEdit">保存修改</n-button><n-button quaternary @click="marketEditOpen = false">取消</n-button></div>
       </div>
     </n-modal>
     <n-modal :show="publishSkillId !== null" preset="card" title="发布 Skill" style="width: min(480px, calc(100vw - 32px))" @update:show="value => { if (!value) publishSkillId = null }">

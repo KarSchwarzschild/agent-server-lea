@@ -16,11 +16,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/control"
+	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/eventlog"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/middleware"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/persistence"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/router"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/runtime"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/session"
+	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/temporalrun"
 )
 
 // drainTimeout 是收到 SIGTERM 后等在跑的 turn 收尾的上限。
@@ -91,6 +93,9 @@ func main() {
 
 	// 初始化缓存（Redis 失败时传 nil，缓存层会降级）
 	runtime.InitCache(redisClient)
+	// 子轮快照。server 进程自己跑 turn 时也要写 —— 一个 HTTP 轮的 turn 被取消或
+	// 进程挂掉之后，接手方（可能是另一个 pod）读的是同一把 key。
+	persistence.SetInflightStore(redisClient)
 
 	// 初始化消息缓存
 	if db, err := persistence.DB(); err == nil && db != nil {
@@ -102,6 +107,20 @@ func main() {
 	}
 
 	mgr := session.NewManager()
+	var coordinator *temporalrun.Coordinator
+	var runCoordinator router.RunCoordinator
+	if temporalrun.Enabled() {
+		if !eventlog.Shared().Enabled() {
+			log.Fatal("LEA_AGENT_EXECUTION_MODE=temporal requires a reachable REDIS_URL")
+		}
+		var err error
+		coordinator, err = temporalrun.Dial()
+		if err != nil {
+			log.Fatalf("temporal init failed: %v", err)
+		}
+		runCoordinator = coordinator
+		log.Printf("temporal execution enabled task_queue=%s", coordinator.TaskQueue())
+	}
 
 	r := gin.Default()
 	r.Use(middleware.Metrics()) // 记录所有 HTTP 请求指标
@@ -109,6 +128,25 @@ func main() {
 
 	api := r.Group("/api")
 	api.Use(middleware.JWTAuth())
+
+	// 中性资源路径是新契约；角色和对象归属由 lea-config 决定。
+	configResourceProxy := router.ResourceConfigProxy()
+	for _, resource := range []string{"agents", "teams", "skills", "tools", "mcp-servers"} {
+		api.Any("/"+resource, configResourceProxy)
+		api.Any("/"+resource+"/*path", configResourceProxy)
+	}
+	api.Any("/publication-requests", configResourceProxy)
+	api.Any("/publication-requests/*path", configResourceProxy)
+	api.Any("/audit-events", configResourceProxy)
+	api.Any("/audit-events/*path", configResourceProxy)
+	api.Any("/publications", configResourceProxy)
+	api.Any("/publications/*path", configResourceProxy)
+	api.Any("/resources/*path", configResourceProxy)
+	api.Any("/providers", configResourceProxy)
+	api.Any("/providers/*path", configResourceProxy)
+	api.Any("/retrieval/models", configResourceProxy)
+	api.Any("/retrieval/models/*path", configResourceProxy)
+	api.Any("/console-context", configResourceProxy)
 
 	// /api/user/agents/* → lea-config:8500/agents/* （用户视角 Agent CRUD）
 	api.Any("/user/agents", router.UserAgentsProxy())
@@ -134,7 +172,7 @@ func main() {
 	// 不映射整个 /admin/ 前缀 —— 见 UserMCPActionsProxy 的说明。
 	api.Any("/user/mcp-actions/*path", router.UserMCPActionsProxy())
 
-	router.RegisterRoutes(api, mgr)
+	router.RegisterRoutesWithCoordinator(api, mgr, runCoordinator)
 	router.RegisterDebugRoutes(api)
 
 	// draining 一旦置位，健康检查就开始返 503，让 k8s 把本 pod 从 Service
@@ -154,6 +192,9 @@ func main() {
 	// SIGTERM 就能强杀，不用干等 drainTimeout。
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if coordinator != nil {
+		go coordinator.RunDispatcher(ctx)
+	}
 
 	go func() {
 		log.Printf("lea-agent starting on :%s", port)
@@ -165,6 +206,9 @@ func main() {
 	<-ctx.Done()
 	stop()
 	drain(srv, mgr, &draining)
+	if coordinator != nil {
+		coordinator.Close()
+	}
 }
 
 // healthHandler 是探针和监控的入口。

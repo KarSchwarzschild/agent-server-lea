@@ -2,6 +2,7 @@ packages:
   - 'frontend-admin'
   - 'frontend-user'
   - 'frontend-lab'
+  - 'frontend-console'
 allowBuilds:
   '@parcel/watcher': set this to true or false
   esbuild: set this to true or false

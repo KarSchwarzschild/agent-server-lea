@@ -41,7 +41,7 @@ func handleSetActiveAgent(mgr *session.Manager) gin.HandlerFunc {
 			return
 		}
 
-		db, ok := sessionOwnerGuard(c)
+		db, ok := sessionOwnerGuard(c, mgr)
 		if !ok {
 			return
 		}

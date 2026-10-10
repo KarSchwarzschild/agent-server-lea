@@ -118,6 +118,90 @@ func TestUserToolsProxy_RewritesToConfigTools(t *testing.T) {
 	}
 }
 
+func TestResourceConfigProxy_RewritesCanonicalAndLegacyPaths(t *testing.T) {
+	var gotPath string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(upstream.Close)
+	t.Setenv("LEA_CONFIG_URL", upstream.URL)
+	t.Setenv("LEA_INTERNAL_TOKEN", "tok")
+
+	r := gin.New()
+	proxy := ResourceConfigProxy()
+	r.Any("/api/agents/*path", proxy)
+	r.Any("/api/user/agents/*path", proxy)
+	front := httptest.NewServer(r)
+	t.Cleanup(front.Close)
+
+	for _, path := range []string{"/api/agents/7/bindings", "/api/user/agents/7/bindings"} {
+		gotPath = ""
+		resp, err := http.Get(front.URL + path)
+		if err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s: status=%d", path, resp.StatusCode)
+		}
+		if gotPath != "/agents/7/bindings" {
+			t.Errorf("%s -> %s, want /agents/7/bindings", path, gotPath)
+		}
+	}
+}
+
+func TestResourceConfigProxy_RewritesPublicationRequestPath(t *testing.T) {
+	var gotPath string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(upstream.Close)
+	t.Setenv("LEA_CONFIG_URL", upstream.URL)
+
+	r := gin.New()
+	r.Any("/api/publication-requests/*path", ResourceConfigProxy())
+	front := httptest.NewServer(r)
+	t.Cleanup(front.Close)
+
+	resp, err := http.Post(front.URL+"/api/publication-requests/8/review", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+	if gotPath != "/publication-requests/8/review" {
+		t.Fatalf("got path %s", gotPath)
+	}
+}
+
+func TestResourceConfigProxy_RewritesAuditEventsPath(t *testing.T) {
+	var gotPath string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(upstream.Close)
+	t.Setenv("LEA_CONFIG_URL", upstream.URL)
+
+	r := gin.New()
+	r.Any("/api/audit-events", ResourceConfigProxy())
+	front := httptest.NewServer(r)
+	t.Cleanup(front.Close)
+
+	resp, err := http.Get(front.URL + "/api/audit-events")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || gotPath != "/audit-events" {
+		t.Fatalf("status=%d path=%s", resp.StatusCode, gotPath)
+	}
+}
+
 func TestUserAgentsProxy_SendsInternalToken(t *testing.T) {
 	got := callProxy(t, "s3cret", nil)
 	if v := got.Get(runtime.InternalTokenHeader); v != "s3cret" {

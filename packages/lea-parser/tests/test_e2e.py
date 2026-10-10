@@ -31,8 +31,18 @@ USER_TOKEN = jwt.encode(
 USER_HEADERS = {"Authorization": f"Bearer {USER_TOKEN}"}
 
 
+def console_headers(role="admin"):
+    return {
+        "X-Internal-Token": "parser-internal-test",
+        "X-User-ID": "console-user",
+        "X-Tenant-ID": "t1",
+        "X-User-Role": role,
+    }
+
+
 @pytest.fixture(autouse=True)
-def setup_db():
+def setup_db(monkeypatch):
+    monkeypatch.setenv("LEA_INTERNAL_TOKEN", "parser-internal-test")
     import lea_parser.models  # noqa
     Base.metadata.create_all(bind=engine)
     yield
@@ -164,6 +174,52 @@ def test_usage(client):
     r = client.get("/usage?days=1", headers=HEADERS)
     assert r.status_code == 200
     assert r.json()["total_calls"] >= 1
+
+
+def test_console_quota_contract_uses_trusted_gateway_identity(client, monkeypatch):
+    audit_calls = []
+    monkeypatch.setenv("LEA_CONFIG_URL", "http://config.test")
+    monkeypatch.setattr(
+        "lea_parser.api.console.httpx.post",
+        lambda *args, **kwargs: (
+            audit_calls.append(kwargs["json"])
+            or type("Response", (), {"raise_for_status": lambda self: None})()
+        ),
+    )
+    denied = client.get("/quotas", headers=console_headers("user"))
+    assert denied.status_code == 403
+
+    updated = client.put(
+        "/quotas/tenant",
+        json={
+            "max_calls_per_hour": 900,
+            "max_file_size_mb": 250,
+            "max_monthly_calls": 90000,
+            "max_monthly_size_mb": 18000,
+            "reason": "load test capacity",
+        },
+        headers=console_headers(),
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["tenant"]["max_calls_per_hour"] == 900
+
+    fetched = client.get("/quotas", headers=console_headers())
+    assert fetched.status_code == 200
+    assert fetched.json()["tenant"]["max_calls_per_hour"] == 900
+    assert audit_calls[0]["action"] == "quota.tenant.update"
+    assert audit_calls[0]["reason"] == "load test capacity"
+
+
+def test_console_contract_rejects_forged_identity_without_internal_token(client):
+    forged = console_headers()
+    forged.pop("X-Internal-Token")
+    assert client.get("/usage", headers=forged).status_code == 401
+
+
+def test_console_usage_contract_uses_trusted_gateway_identity(client):
+    response = client.get("/usage?days=1", headers=console_headers())
+    assert response.status_code == 200, response.text
+    assert response.json()["tenant_id"] == "t1"
 
 
 def test_unsupported_format(client):

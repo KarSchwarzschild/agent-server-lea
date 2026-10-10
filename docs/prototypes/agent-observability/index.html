@@ -1,0 +1,620 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LEA Agent 观测台原型</title>
+  <style>
+    :root {
+      --ink: #18201d;
+      --muted: #66716c;
+      --soft: #f4f6f4;
+      --panel: #ffffff;
+      --line: #dfe5e1;
+      --line-dark: #c9d2cc;
+      --green: #167a55;
+      --green-soft: #e8f5ee;
+      --mint: #a8e6c7;
+      --yellow: #f0b429;
+      --yellow-soft: #fff5d9;
+      --red: #c7473d;
+      --red-soft: #fff0ee;
+      --blue: #2f6f91;
+      --blue-soft: #eaf3f8;
+      --black: #101714;
+      --shadow: 0 8px 24px rgba(20, 40, 30, 0.08);
+      --sidebar: 232px;
+    }
+
+    * { box-sizing: border-box; }
+    html { background: var(--soft); }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        linear-gradient(rgba(24, 32, 29, 0.025) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(24, 32, 29, 0.025) 1px, transparent 1px),
+        var(--soft);
+      background-size: 24px 24px;
+      font-family: "MiSans", "HarmonyOS Sans SC", "Microsoft YaHei", sans-serif;
+      letter-spacing: 0;
+    }
+
+    button, select, input { font: inherit; letter-spacing: 0; }
+    button { cursor: pointer; }
+
+    .shell { min-height: 100vh; display: grid; grid-template-columns: var(--sidebar) 1fr; }
+    .sidebar {
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      background: var(--black);
+      color: #eef4f0;
+      padding: 20px 14px;
+      display: flex;
+      flex-direction: column;
+      border-right: 1px solid #28352f;
+      z-index: 10;
+    }
+    .brand { display: flex; align-items: center; gap: 10px; padding: 2px 8px 22px; }
+    .brand-mark {
+      width: 34px; height: 34px; display: grid; place-items: center;
+      background: var(--mint); color: var(--black); font-weight: 900; font-size: 16px;
+      border-radius: 7px;
+    }
+    .brand-name { font-weight: 800; font-size: 15px; }
+    .brand-sub { color: #8fa198; font-size: 11px; margin-top: 2px; }
+    .nav-label { color: #71827a; font-size: 10px; font-weight: 800; padding: 8px 10px; text-transform: uppercase; }
+    .nav { display: grid; gap: 4px; }
+    .nav-button {
+      border: 0; background: transparent; color: #aebdb5; min-height: 42px;
+      display: flex; align-items: center; gap: 11px; padding: 0 11px; border-radius: 6px;
+      text-align: left; transition: 160ms ease;
+    }
+    .nav-button:hover { background: #1d2823; color: white; }
+    .nav-button.active { background: #233b31; color: #c7f6dd; box-shadow: inset 3px 0 var(--mint); }
+    .nav-button svg { width: 18px; height: 18px; flex: none; }
+    .sidebar-foot { margin-top: auto; padding: 14px 9px 2px; border-top: 1px solid #28352f; }
+    .prototype-chip { display: inline-flex; border: 1px solid #416253; color: #b9cec3; font-size: 10px; padding: 4px 7px; border-radius: 4px; }
+    .sidebar-foot p { color: #73847b; font-size: 11px; line-height: 1.55; margin: 9px 0 0; }
+
+    .main { min-width: 0; }
+    .topbar {
+      position: sticky; top: 0; z-index: 8; height: 64px; background: rgba(255,255,255,.94);
+      backdrop-filter: blur(14px); border-bottom: 1px solid var(--line);
+      display: flex; align-items: center; justify-content: space-between; padding: 0 24px;
+    }
+    .context { display: flex; align-items: center; gap: 9px; min-width: 0; }
+    .agent-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 4px var(--green-soft); }
+    .context strong { font-size: 14px; white-space: nowrap; }
+    .context-sep { color: #a7b1ab; }
+    .context-version { color: var(--muted); font-size: 12px; }
+    .top-actions { display: flex; gap: 8px; }
+    .icon-button, .button {
+      border: 1px solid var(--line-dark); background: white; color: var(--ink); min-height: 34px;
+      border-radius: 6px; display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+      padding: 0 12px; font-weight: 700; font-size: 12px;
+    }
+    .icon-button { width: 34px; padding: 0; }
+    .icon-button svg, .button svg { width: 16px; height: 16px; }
+    .button:hover, .icon-button:hover { border-color: #92a299; background: #f8faf8; }
+    .button.primary { color: white; background: var(--green); border-color: var(--green); }
+    .button.primary:hover { background: #116746; }
+    .button.danger { color: var(--red); border-color: #ecc0bc; }
+
+    .content { padding: 22px 24px 42px; max-width: 1540px; margin: 0 auto; }
+    .page-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 24px; margin-bottom: 18px; }
+    .eyebrow { color: var(--green); font-size: 10px; font-weight: 900; text-transform: uppercase; margin-bottom: 6px; }
+    h1 { font-size: 24px; line-height: 1.2; margin: 0; letter-spacing: 0; }
+    .page-head p { margin: 6px 0 0; color: var(--muted); font-size: 12px; }
+    .filters { display: flex; gap: 7px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+    select, .search-input {
+      min-height: 34px; border: 1px solid var(--line-dark); border-radius: 6px; background: white;
+      color: var(--ink); padding: 0 30px 0 10px; outline: none; font-size: 12px;
+    }
+    select:focus, .search-input:focus { border-color: var(--green); box-shadow: 0 0 0 3px var(--green-soft); }
+    .segments { display: inline-flex; border: 1px solid var(--line-dark); background: white; border-radius: 6px; padding: 2px; }
+    .segments button { border: 0; background: transparent; color: var(--muted); padding: 6px 9px; border-radius: 4px; font-size: 11px; }
+    .segments button.active { color: var(--ink); background: var(--soft); font-weight: 800; }
+
+    .view { display: none; animation: enter 260ms ease both; }
+    .view.active { display: block; }
+    @keyframes enter { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
+
+    .notice {
+      display: flex; align-items: center; justify-content: space-between; gap: 18px;
+      border: 1px solid #d8c277; background: #fff9e8; padding: 11px 13px; border-radius: 6px; margin-bottom: 14px;
+      font-size: 12px;
+    }
+    .notice-main { display: flex; align-items: center; gap: 9px; }
+    .notice svg { width: 17px; color: #99730b; flex: none; }
+    .notice strong { color: #6e5208; }
+    .notice button { border: 0; background: transparent; color: #7c5a00; font-weight: 800; }
+
+    .kpi-grid { display: grid; grid-template-columns: repeat(5, minmax(150px, 1fr)); border: 1px solid var(--line); background: white; border-radius: 7px; overflow: hidden; }
+    .kpi { padding: 15px 16px 13px; min-width: 0; border-right: 1px solid var(--line); }
+    .kpi:last-child { border-right: 0; }
+    .kpi-label { display: flex; align-items: center; justify-content: space-between; color: var(--muted); font-size: 11px; }
+    .kpi-value { font-size: 24px; font-weight: 850; margin-top: 8px; font-variant-numeric: tabular-nums; }
+    .kpi-meta { display: flex; align-items: center; gap: 6px; color: var(--muted); margin-top: 7px; font-size: 10px; }
+    .delta { font-weight: 800; }
+    .delta.good { color: var(--green); }
+    .delta.bad { color: var(--red); }
+    .confidence { width: 5px; height: 5px; border-radius: 50%; background: var(--green); }
+
+    .band { margin-top: 14px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); background: rgba(255,255,255,.72); }
+    .grid-7-5 { display: grid; grid-template-columns: minmax(0, 7fr) minmax(300px, 5fr); }
+    .grid-8-4 { display: grid; grid-template-columns: minmax(0, 8fr) minmax(280px, 4fr); }
+    .section { padding: 18px; min-width: 0; }
+    .section + .section { border-left: 1px solid var(--line); }
+    .section-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+    .section-title { font-size: 13px; font-weight: 850; }
+    .section-sub { color: var(--muted); font-size: 10px; margin-top: 3px; }
+    .text-button { border: 0; background: transparent; color: var(--green); font-size: 11px; font-weight: 800; padding: 4px; }
+
+    .chart-wrap { height: 240px; position: relative; }
+    .chart-wrap svg { width: 100%; height: 100%; overflow: visible; }
+    .grid-line { stroke: #e7ebe8; stroke-width: 1; }
+    .chart-label { fill: #819089; font-size: 10px; font-family: inherit; }
+    .line-primary { fill: none; stroke: var(--green); stroke-width: 2.5; }
+    .line-secondary { fill: none; stroke: var(--blue); stroke-width: 2; stroke-dasharray: 5 4; }
+    .area-primary { fill: rgba(22, 122, 85, .08); }
+    .point { fill: white; stroke: var(--green); stroke-width: 2; }
+    .legend { display: flex; gap: 14px; font-size: 10px; color: var(--muted); }
+    .legend span { display: flex; align-items: center; gap: 5px; }
+    .legend i { width: 16px; height: 2px; background: var(--green); }
+    .legend .secondary { background: var(--blue); }
+
+    .recommend-list { display: grid; gap: 9px; }
+    .recommendation {
+      width: 100%; border: 1px solid var(--line); border-radius: 6px; background: white; padding: 11px;
+      display: grid; grid-template-columns: 28px 1fr auto; gap: 10px; align-items: start; text-align: left;
+      transition: 150ms ease;
+    }
+    .recommendation:hover { transform: translateX(2px); border-color: #9bb5a8; box-shadow: var(--shadow); }
+    .recommend-icon { width: 28px; height: 28px; display: grid; place-items: center; border-radius: 5px; }
+    .recommend-icon.warn { color: #865f00; background: var(--yellow-soft); }
+    .recommend-icon.info { color: var(--blue); background: var(--blue-soft); }
+    .recommend-icon.bad { color: var(--red); background: var(--red-soft); }
+    .recommend-icon svg { width: 15px; }
+    .recommendation strong { display: block; font-size: 11px; margin-bottom: 4px; }
+    .recommendation p { margin: 0; color: var(--muted); font-size: 10px; line-height: 1.5; }
+    .impact { color: var(--green); font-size: 10px; font-weight: 850; white-space: nowrap; }
+
+    .table-shell { margin-top: 14px; border: 1px solid var(--line); background: white; border-radius: 7px; overflow: hidden; }
+    .table-toolbar { padding: 12px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--line); }
+    .toolbar-left, .toolbar-right { display: flex; gap: 7px; align-items: center; flex-wrap: wrap; }
+    .search-wrap { position: relative; }
+    .search-wrap svg { position: absolute; left: 9px; top: 9px; width: 15px; color: #85928c; }
+    .search-input { padding-left: 31px; width: 240px; }
+    .table-scroll { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 11px; }
+    th { color: var(--muted); background: #fafbfa; font-weight: 750; text-align: left; padding: 10px 12px; white-space: nowrap; border-bottom: 1px solid var(--line); }
+    td { padding: 11px 12px; border-bottom: 1px solid #edf0ee; white-space: nowrap; }
+    tbody tr { transition: 120ms ease; }
+    tbody tr:hover { background: #f7faf8; }
+    tbody tr:last-child td { border-bottom: 0; }
+    .run-link { border: 0; background: transparent; color: var(--green); font-family: "JetBrains Mono", Consolas, monospace; font-size: 10px; padding: 0; }
+    .status { display: inline-flex; align-items: center; gap: 5px; border-radius: 4px; padding: 4px 7px; font-size: 10px; font-weight: 800; }
+    .status::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+    .status.success { color: var(--green); background: var(--green-soft); }
+    .status.failed { color: var(--red); background: var(--red-soft); }
+    .status.warning { color: #8b6500; background: var(--yellow-soft); }
+    .tag { display: inline-block; border: 1px solid var(--line); background: #f9faf9; border-radius: 4px; padding: 3px 6px; color: #52605a; font-size: 10px; }
+    .mono { font-family: "JetBrains Mono", Consolas, monospace; font-variant-numeric: tabular-nums; }
+
+    .expert-layout { display: grid; grid-template-columns: minmax(0, 8fr) minmax(320px, 4fr); gap: 14px; }
+    .surface { border: 1px solid var(--line); background: white; border-radius: 7px; overflow: hidden; }
+    .surface-head { padding: 14px 15px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--line); }
+    .surface-body { padding: 15px; }
+    .matrix { position: relative; height: 390px; border-left: 1px solid var(--line-dark); border-bottom: 1px solid var(--line-dark); margin: 20px 20px 34px 48px; background: repeating-linear-gradient(0deg, transparent 0, transparent 77px, #edf0ee 78px), repeating-linear-gradient(90deg, transparent 0, transparent 108px, #edf0ee 109px); }
+    .axis-y, .axis-x { position: absolute; color: var(--muted); font-size: 10px; font-weight: 750; }
+    .axis-y { left: -45px; top: 45%; transform: rotate(-90deg); }
+    .axis-x { left: 43%; bottom: -28px; }
+    .bubble { position: absolute; border: 2px solid white; box-shadow: 0 3px 12px rgba(20,40,30,.16); border-radius: 50%; display: grid; place-items: center; color: white; font-weight: 900; font-size: 11px; transition: 180ms ease; cursor: pointer; }
+    .bubble:hover, .bubble.selected { transform: scale(1.12); outline: 3px solid rgba(22,122,85,.15); }
+    .bubble.green { background: var(--green); }
+    .bubble.blue { background: var(--blue); }
+    .bubble.yellow { background: #c28a10; }
+    .bubble.red { background: var(--red); }
+    .expert-detail h3 { font-size: 17px; margin: 0; }
+    .expert-detail .role { color: var(--muted); font-size: 11px; margin-top: 4px; }
+    .mini-stats { display: grid; grid-template-columns: repeat(2, 1fr); margin: 16px 0; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+    .mini-stat { padding: 11px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+    .mini-stat:nth-child(2n) { border-right: 0; }
+    .mini-stat:nth-last-child(-n+2) { border-bottom: 0; }
+    .mini-stat small { color: var(--muted); display: block; font-size: 9px; }
+    .mini-stat strong { font-size: 17px; display: block; margin-top: 4px; }
+    .bar-list { display: grid; gap: 11px; }
+    .bar-row { display: grid; grid-template-columns: 76px 1fr 42px; align-items: center; gap: 8px; font-size: 10px; }
+    .bar-track { height: 7px; border-radius: 2px; background: #e9eeeb; overflow: hidden; }
+    .bar-fill { height: 100%; background: var(--green); border-radius: 2px; }
+
+    .rag-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+    .metric-tile { border: 1px solid var(--line); background: white; border-radius: 6px; padding: 13px; min-height: 116px; }
+    .metric-tile .top { display: flex; justify-content: space-between; color: var(--muted); font-size: 10px; }
+    .metric-tile .score { font-size: 22px; font-weight: 850; margin-top: 14px; }
+    .metric-tile .meter { height: 5px; background: #edf0ee; margin-top: 11px; overflow: hidden; }
+    .metric-tile .meter span { display: block; height: 100%; background: var(--green); }
+    .metric-tile .foot { color: var(--muted); font-size: 9px; margin-top: 8px; }
+    .failure-bars { display: grid; gap: 12px; }
+    .failure-row { display: grid; grid-template-columns: 118px 1fr 52px; gap: 10px; align-items: center; font-size: 10px; }
+    .failure-track { height: 18px; background: #eef1ef; position: relative; }
+    .failure-track span { height: 100%; display: block; background: #e5a69e; }
+    .failure-track em { position: absolute; left: 6px; top: 2px; font-style: normal; color: #58352f; font-size: 9px; }
+
+    .experiment-header { display: flex; justify-content: space-between; gap: 16px; align-items: center; margin-bottom: 14px; }
+    .experiment-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .variant { border: 1px solid var(--line); background: white; border-radius: 7px; overflow: hidden; }
+    .variant.candidate { border-color: #8eb9a4; box-shadow: inset 0 3px var(--green); }
+    .variant-head { padding: 14px; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; align-items: center; }
+    .variant-title { font-weight: 850; font-size: 13px; }
+    .variant-desc { color: var(--muted); font-size: 10px; margin-top: 3px; }
+    .variant-body { padding: 14px; }
+    .comparison-row { display: grid; grid-template-columns: 125px 1fr 64px; gap: 10px; align-items: center; padding: 10px 0; border-bottom: 1px solid #edf0ee; font-size: 10px; }
+    .comparison-row:last-child { border-bottom: 0; }
+    .comparison-row strong { font-size: 12px; text-align: right; }
+    .gate-list { margin-top: 14px; border: 1px solid var(--line); background: white; border-radius: 7px; }
+    .gate { display: grid; grid-template-columns: 26px 1fr auto; gap: 10px; align-items: center; padding: 11px 13px; border-bottom: 1px solid var(--line); font-size: 11px; }
+    .gate:last-child { border-bottom: 0; }
+    .gate-icon { width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center; }
+    .gate-icon.pass { color: var(--green); background: var(--green-soft); }
+    .gate-icon.hold { color: #8b6500; background: var(--yellow-soft); }
+    .gate-icon svg { width: 13px; }
+
+    .drawer-backdrop { position: fixed; inset: 0; background: rgba(8, 16, 12, .25); opacity: 0; pointer-events: none; transition: 180ms ease; z-index: 20; }
+    .drawer-backdrop.open { opacity: 1; pointer-events: auto; }
+    .drawer { position: fixed; right: 0; top: 0; bottom: 0; width: min(720px, 94vw); background: white; box-shadow: -18px 0 48px rgba(8,20,14,.18); transform: translateX(100%); transition: 220ms ease; z-index: 21; display: flex; flex-direction: column; }
+    .drawer.open { transform: translateX(0); }
+    .drawer-head { height: 64px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; padding: 0 18px; }
+    .drawer-title { font-size: 14px; font-weight: 850; }
+    .drawer-sub { color: var(--muted); font-size: 10px; margin-top: 3px; }
+    .drawer-body { overflow: auto; padding: 18px; }
+    .trace-summary { display: grid; grid-template-columns: repeat(4, 1fr); border: 1px solid var(--line); border-radius: 6px; overflow: hidden; margin-bottom: 16px; }
+    .trace-summary div { padding: 10px; border-right: 1px solid var(--line); }
+    .trace-summary div:last-child { border-right: 0; }
+    .trace-summary small { color: var(--muted); display: block; font-size: 9px; }
+    .trace-summary strong { display: block; font-size: 13px; margin-top: 4px; }
+    .trace { display: grid; gap: 7px; }
+    .trace-row { display: grid; grid-template-columns: 95px 1fr 64px; gap: 8px; align-items: center; min-height: 38px; font-size: 10px; }
+    .trace-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .trace-track { height: 24px; position: relative; background: #f2f5f3; overflow: hidden; border-radius: 3px; }
+    .trace-bar { position: absolute; height: 100%; display: flex; align-items: center; padding-left: 7px; color: white; font-size: 9px; border-radius: 3px; min-width: 3px; }
+    .trace-bar.agent { background: var(--green); }
+    .trace-bar.llm { background: var(--blue); }
+    .trace-bar.tool { background: #9a7015; }
+    .trace-bar.rag { background: #8a5e86; }
+    .trace-bar.fail { background: var(--red); }
+    .drawer-note { margin-top: 18px; border-left: 3px solid var(--yellow); background: var(--yellow-soft); padding: 10px 12px; font-size: 10px; line-height: 1.6; }
+
+    .empty-note { color: var(--muted); font-size: 11px; text-align: center; padding: 24px; }
+
+    @media (max-width: 1120px) {
+      :root { --sidebar: 74px; }
+      .brand-name, .brand-sub, .nav-button span, .nav-label, .sidebar-foot p, .prototype-chip { display: none; }
+      .brand { justify-content: center; padding-left: 0; padding-right: 0; }
+      .nav-button { justify-content: center; padding: 0; }
+      .grid-7-5, .grid-8-4, .expert-layout { grid-template-columns: 1fr; }
+      .section + .section { border-left: 0; border-top: 1px solid var(--line); }
+      .kpi-grid { grid-template-columns: repeat(3, 1fr); }
+      .kpi:nth-child(3) { border-right: 0; }
+      .kpi:nth-child(n+4) { border-top: 1px solid var(--line); }
+      .rag-grid { grid-template-columns: repeat(2, 1fr); }
+    }
+
+    @media (max-width: 720px) {
+      .shell { grid-template-columns: 1fr; padding-bottom: 58px; }
+      .sidebar { position: fixed; left: 0; right: 0; top: auto; bottom: 0; width: 100%; height: 58px; padding: 6px; flex-direction: row; border-right: 0; border-top: 1px solid #28352f; }
+      .brand, .nav-label, .sidebar-foot { display: none; }
+      .nav { width: 100%; grid-template-columns: repeat(5, 1fr); gap: 3px; }
+      .nav-button { min-height: 46px; }
+      .nav-button.active { box-shadow: inset 0 -3px var(--mint); }
+      .topbar { height: 54px; padding: 0 12px; }
+      .context-version, .top-actions .button { display: none; }
+      .content { padding: 15px 12px 28px; }
+      .page-head { display: block; }
+      .filters { justify-content: flex-start; margin-top: 14px; }
+      .kpi-grid { grid-template-columns: repeat(2, 1fr); }
+      .kpi:nth-child(2n) { border-right: 0; }
+      .kpi:nth-child(3) { border-right: 1px solid var(--line); }
+      .kpi:nth-child(n+3) { border-top: 1px solid var(--line); }
+      .kpi:last-child { grid-column: 1 / -1; }
+      .notice { align-items: flex-start; }
+      .notice button { display: none; }
+      .section { padding: 14px 12px; }
+      .chart-wrap { height: 210px; }
+      .table-toolbar { align-items: stretch; flex-direction: column; }
+      .search-input { width: 100%; }
+      .toolbar-left, .search-wrap { width: 100%; }
+      .rag-grid, .experiment-grid { grid-template-columns: 1fr; }
+      .experiment-header { align-items: flex-start; flex-direction: column; }
+      .trace-summary { grid-template-columns: repeat(2, 1fr); }
+      .trace-summary div:nth-child(2) { border-right: 0; }
+      .trace-summary div:nth-child(-n+2) { border-bottom: 1px solid var(--line); }
+      .trace-row { grid-template-columns: 72px 1fr 50px; }
+      .matrix { margin-left: 40px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">L</div>
+        <div><div class="brand-name">LEA Observe</div><div class="brand-sub">Agent 创建者工作台</div></div>
+      </div>
+      <div class="nav-label">工作区</div>
+      <nav class="nav" aria-label="主要导航">
+        <button class="nav-button active" data-view="overview" title="健康概览"><i data-lucide="activity"></i><span>健康概览</span></button>
+        <button class="nav-button" data-view="runs" title="执行追踪"><i data-lucide="route"></i><span>执行追踪</span></button>
+        <button class="nav-button" data-view="experts" title="专家分析"><i data-lucide="users"></i><span>专家分析</span></button>
+        <button class="nav-button" data-view="rag" title="RAG 质量"><i data-lucide="database-zap"></i><span>RAG 质量</span></button>
+        <button class="nav-button" data-view="experiments" title="版本实验"><i data-lucide="flask-conical"></i><span>版本实验</span></button>
+      </nav>
+      <div class="sidebar-foot">
+        <span class="prototype-chip">INTERACTIVE PROTOTYPE</span>
+        <p>模拟数据仅用于验证信息架构与操作路径。</p>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div class="context">
+          <span class="agent-dot"></span>
+          <strong>课程研究助理</strong>
+          <span class="context-sep">/</span>
+          <span class="context-version">生产版本 v12 · 运行中</span>
+        </div>
+        <div class="top-actions">
+          <button class="icon-button" title="刷新数据" id="refreshButton"><i data-lucide="refresh-cw"></i></button>
+          <button class="button"><i data-lucide="settings-2"></i>配置快照</button>
+          <button class="button primary" data-view-jump="experiments"><i data-lucide="git-compare-arrows"></i>创建实验</button>
+        </div>
+      </header>
+
+      <div class="content">
+        <div class="page-head">
+          <div>
+            <div class="eyebrow" id="viewEyebrow">Agent health</div>
+            <h1 id="viewTitle">健康概览</h1>
+            <p id="viewDescription">质量、可靠性、速度和成本的统一视图</p>
+          </div>
+          <div class="filters">
+            <select aria-label="Agent"><option>课程研究助理</option><option>论文综述专家</option><option>教学设计团队</option></select>
+            <select aria-label="版本"><option>生产 v12</option><option>候选 v13</option><option>历史 v11</option></select>
+            <select aria-label="环境"><option>生产环境</option><option>灰度环境</option><option>评测环境</option></select>
+            <div class="segments" aria-label="时间范围">
+              <button>24h</button><button class="active">7天</button><button>30天</button>
+            </div>
+          </div>
+        </div>
+
+        <section class="view active" id="view-overview">
+          <div class="notice">
+            <div class="notice-main"><i data-lucide="triangle-alert"></i><span><strong>有 3 项值得关注</strong>：检索无结果率升高，数据分析专家 P95 耗时异常，12 次运行耗尽最大轮数。</span></div>
+            <button data-view-jump="runs">查看异常运行 →</button>
+          </div>
+
+          <div class="kpi-grid">
+            <div class="kpi"><div class="kpi-label"><span>任务成功率</span><i data-lucide="circle-check-big" style="width:15px;color:var(--green)"></i></div><div class="kpi-value">92.4%</div><div class="kpi-meta"><span class="delta good">+2.1%</span><span>较前 7 天 · 1,284 次</span></div></div>
+            <div class="kpi"><div class="kpi-label"><span>质量通过率</span><span class="tag">覆盖 18%</span></div><div class="kpi-value">86.7%</div><div class="kpi-meta"><span class="delta bad">-1.3%</span><span>232 个抽样</span></div></div>
+            <div class="kpi"><div class="kpi-label"><span>用户满意率</span><i data-lucide="thumbs-up" style="width:15px;color:var(--blue)"></i></div><div class="kpi-value">89.1%</div><div class="kpi-meta"><span class="delta good">+4.8%</span><span>反馈覆盖 12%</span></div></div>
+            <div class="kpi"><div class="kpi-label"><span>P95 总耗时</span><span class="tag">目标 &lt; 45s</span></div><div class="kpi-value">38.6s</div><div class="kpi-meta"><span class="delta good">-6.2s</span><span>首 Token 1.8s</span></div></div>
+            <div class="kpi"><div class="kpi-label"><span>单次成功成本</span><span class="tag">估算</span></div><div class="kpi-value">¥0.84</div><div class="kpi-meta"><span class="delta bad">+¥0.09</span><span>缓存数据缺失</span></div></div>
+          </div>
+
+          <div class="band grid-7-5">
+            <div class="section">
+              <div class="section-head">
+                <div><div class="section-title">质量与成功率趋势</div><div class="section-sub">每日完成 Run，虚线为评测覆盖样本</div></div>
+                <div class="legend"><span><i></i>成功率</span><span><i class="secondary"></i>质量分</span></div>
+              </div>
+              <div class="chart-wrap">
+                <svg viewBox="0 0 680 240" role="img" aria-label="质量与成功率趋势图">
+                  <line class="grid-line" x1="36" y1="25" x2="660" y2="25"/><line class="grid-line" x1="36" y1="80" x2="660" y2="80"/><line class="grid-line" x1="36" y1="135" x2="660" y2="135"/><line class="grid-line" x1="36" y1="190" x2="660" y2="190"/>
+                  <text class="chart-label" x="3" y="29">100%</text><text class="chart-label" x="9" y="84">90%</text><text class="chart-label" x="9" y="139">80%</text><text class="chart-label" x="9" y="194">70%</text>
+                  <path class="area-primary" d="M42 91 L142 84 L242 97 L342 73 L442 79 L542 59 L642 67 L642 190 L42 190 Z"/>
+                  <polyline class="line-primary" points="42,91 142,84 242,97 342,73 442,79 542,59 642,67"/>
+                  <polyline class="line-secondary" points="42,116 142,103 242,111 342,97 442,91 542,100 642,104"/>
+                  <circle class="point" cx="42" cy="91" r="3"/><circle class="point" cx="142" cy="84" r="3"/><circle class="point" cx="242" cy="97" r="3"/><circle class="point" cx="342" cy="73" r="3"/><circle class="point" cx="442" cy="79" r="3"/><circle class="point" cx="542" cy="59" r="3"/><circle class="point" cx="642" cy="67" r="3"/>
+                  <text class="chart-label" x="33" y="224">09-22</text><text class="chart-label" x="133" y="224">09-23</text><text class="chart-label" x="233" y="224">09-24</text><text class="chart-label" x="333" y="224">09-25</text><text class="chart-label" x="433" y="224">09-26</text><text class="chart-label" x="533" y="224">09-27</text><text class="chart-label" x="633" y="224">今天</text>
+                </svg>
+              </div>
+            </div>
+            <div class="section">
+              <div class="section-head"><div><div class="section-title">优化建议</div><div class="section-sub">基于最近 7 天证据生成，应用前需评测</div></div><button class="text-button">全部建议</button></div>
+              <div class="recommend-list">
+                <button class="recommendation" data-recommendation="检索无结果率从 4.1% 上升到 7.8%，集中在“课程政策”和“评分规则”问题。建议补充 18 个高频问题的数据或扩大政策库检索范围。"><span class="recommend-icon bad"><i data-lucide="search-x"></i></span><span><strong>补齐课程政策检索盲区</strong><p>41 个失败样本集中在 2 个主题，影响 3.2% Run。</p></span><span class="impact">预计 +2.4%</span></button>
+                <button class="recommendation" data-recommendation="数据分析专家平均输入 Token 是团队中位数的 2.8 倍，其中 61% 来自重复传入的数据表摘要。建议将摘要缓存到会话附件索引，只向专家传递引用。"><span class="recommend-icon warn"><i data-lucide="timer-reset"></i></span><span><strong>缩短数据分析专家上下文</strong><p>重复上下文导致 P95 增加 11.2 秒。</p></span><span class="impact">预计 -18% 成本</span></button>
+                <button class="recommendation" data-recommendation="12 次运行达到最大迭代轮数，其中 9 次重复调用 web_search。建议增加相同查询去重，并把达到 3 次重复调用作为中止条件。"><span class="recommend-icon info"><i data-lucide="repeat-2"></i></span><span><strong>阻止重复工具调用</strong><p>相同搜索参数在单次 Run 中重复出现。</p></span><span class="impact">减少 12 次失败</span></button>
+              </div>
+            </div>
+          </div>
+
+          <div class="table-shell">
+            <div class="table-toolbar"><div><div class="section-title">最近异常运行</div><div class="section-sub">失败、质量告警或成本异常</div></div><button class="text-button" data-view-jump="runs">进入执行追踪 →</button></div>
+            <div class="table-scroll"><table><thead><tr><th>Run ID</th><th>状态</th><th>异常阶段</th><th>总耗时</th><th>Token</th><th>质量分</th><th>开始时间</th></tr></thead><tbody>
+              <tr><td><button class="run-link" data-run="run_8f2a91">run_8f2a91</button></td><td><span class="status failed">失败</span></td><td>数据分析专家 · Python 沙箱</td><td>72.4s</td><td>186.2K</td><td>-</td><td>今天 14:32</td></tr>
+              <tr><td><button class="run-link" data-run="run_79c44b">run_79c44b</button></td><td><span class="status warning">质量告警</span></td><td>知识库检索 · 无命中</td><td>24.1s</td><td>31.7K</td><td>54</td><td>今天 13:18</td></tr>
+              <tr><td><button class="run-link" data-run="run_61bd30">run_61bd30</button></td><td><span class="status warning">高成本</span></td><td>研究专家 · 18 轮迭代</td><td>138.9s</td><td>412.4K</td><td>82</td><td>今天 11:46</td></tr>
+            </tbody></table></div>
+          </div>
+        </section>
+
+        <section class="view" id="view-runs">
+          <div class="kpi-grid">
+            <div class="kpi"><div class="kpi-label">总运行</div><div class="kpi-value">1,284</div><div class="kpi-meta">最近 7 天</div></div>
+            <div class="kpi"><div class="kpi-label">失败</div><div class="kpi-value" style="color:var(--red)">63</div><div class="kpi-meta"><span class="delta good">-18</span><span>失败率 4.9%</span></div></div>
+            <div class="kpi"><div class="kpi-label">主动停止</div><div class="kpi-value">28</div><div class="kpi-meta">2.2% Run</div></div>
+            <div class="kpi"><div class="kpi-label">发生重试</div><div class="kpi-value">91</div><div class="kpi-meta">其中 83 次恢复</div></div>
+            <div class="kpi"><div class="kpi-label">Trace 覆盖率</div><div class="kpi-value">99.3%</div><div class="kpi-meta"><span class="confidence"></span>9 次写入降级</div></div>
+          </div>
+          <div class="table-shell">
+            <div class="table-toolbar">
+              <div class="toolbar-left">
+                <div class="search-wrap"><i data-lucide="search"></i><input id="runSearch" class="search-input" placeholder="搜索 Run ID、用户或错误" /></div>
+                <select id="runStatus"><option value="all">全部状态</option><option value="success">成功</option><option value="warning">告警</option><option value="failed">失败</option></select>
+                <select><option>全部专家</option><option>研究规划师</option><option>资料检索专家</option><option>数据分析专家</option></select>
+              </div>
+              <div class="toolbar-right"><button class="icon-button" title="导出"><i data-lucide="download"></i></button><button class="icon-button" title="列设置"><i data-lucide="columns-3"></i></button></div>
+            </div>
+            <div class="table-scroll"><table><thead><tr><th>Run ID</th><th>状态</th><th>用户问题</th><th>专家数</th><th>工具</th><th>总耗时</th><th>Token</th><th>成本</th><th>质量</th><th>时间</th></tr></thead><tbody id="runRows">
+              <tr data-status="failed"><td><button class="run-link" data-run="run_8f2a91">run_8f2a91</button></td><td><span class="status failed">失败</span></td><td>分析 2024 秋季课程通过率并生成图表</td><td>3</td><td>6 / 1 失败</td><td>72.4s</td><td>186.2K</td><td>¥1.74</td><td>-</td><td>14:32</td></tr>
+              <tr data-status="warning"><td><button class="run-link" data-run="run_79c44b">run_79c44b</button></td><td><span class="status warning">质量告警</span></td><td>课程重修的评分规则是什么？</td><td>2</td><td>3</td><td>24.1s</td><td>31.7K</td><td>¥0.31</td><td>54</td><td>13:18</td></tr>
+              <tr data-status="success"><td><button class="run-link" data-run="run_11e8dc">run_11e8dc</button></td><td><span class="status success">成功</span></td><td>设计一份项目式学习的课程方案</td><td>4</td><td>8</td><td>41.8s</td><td>78.1K</td><td>¥0.81</td><td>91</td><td>12:54</td></tr>
+              <tr data-status="warning"><td><button class="run-link" data-run="run_61bd30">run_61bd30</button></td><td><span class="status warning">高成本</span></td><td>调研生成式 AI 在开放教育中的应用</td><td>5</td><td>19</td><td>138.9s</td><td>412.4K</td><td>¥3.96</td><td>82</td><td>11:46</td></tr>
+              <tr data-status="success"><td><button class="run-link" data-run="run_07ef21">run_07ef21</button></td><td><span class="status success">成功</span></td><td>比较两种教学评价方法</td><td>3</td><td>5</td><td>29.3s</td><td>42.8K</td><td>¥0.46</td><td>88</td><td>10:21</td></tr>
+            </tbody></table></div>
+          </div>
+        </section>
+
+        <section class="view" id="view-experts">
+          <div class="expert-layout">
+            <div class="surface">
+              <div class="surface-head"><div><div class="section-title">专家效率矩阵</div><div class="section-sub">横轴为平均单次成本，纵轴为质量贡献，气泡大小为调用量</div></div><span class="tag">样本 1,284 Run</span></div>
+              <div class="surface-body">
+                <div class="matrix">
+                  <span class="axis-y">质量贡献 →</span><span class="axis-x">单次成本 →</span>
+                  <button class="bubble green selected" data-expert="研究规划师" style="width:62px;height:62px;left:16%;top:19%">规划</button>
+                  <button class="bubble blue" data-expert="资料检索专家" style="width:76px;height:76px;left:38%;top:28%">检索</button>
+                  <button class="bubble yellow" data-expert="数据分析专家" style="width:55px;height:55px;left:72%;top:43%">分析</button>
+                  <button class="bubble green" data-expert="教学设计专家" style="width:69px;height:69px;left:31%;top:7%">教学</button>
+                  <button class="bubble red" data-expert="引用核查专家" style="width:43px;height:43px;left:56%;top:68%">核查</button>
+                </div>
+              </div>
+            </div>
+            <aside class="surface expert-detail">
+              <div class="surface-head"><div><h3 id="expertName">研究规划师</h3><div class="role">负责拆解任务、规划研究路径和最终收敛</div></div><span class="status success">健康</span></div>
+              <div class="surface-body">
+                <div class="mini-stats"><div class="mini-stat"><small>调用次数</small><strong>942</strong></div><div class="mini-stat"><small>完成率</small><strong>96.8%</strong></div><div class="mini-stat"><small>P95 耗时</small><strong>18.4s</strong></div><div class="mini-stat"><small>平均 Token</small><strong>22.1K</strong></div></div>
+                <div class="section-title" style="margin-bottom:12px">执行行为</div>
+                <div class="bar-list"><div class="bar-row"><span>直接完成</span><div class="bar-track"><div class="bar-fill" style="width:42%"></div></div><strong>42%</strong></div><div class="bar-row"><span>转交专家</span><div class="bar-track"><div class="bar-fill" style="width:51%"></div></div><strong>51%</strong></div><div class="bar-row"><span>请求追问</span><div class="bar-track"><div class="bar-fill" style="width:7%"></div></div><strong>7%</strong></div><div class="bar-row"><span>兜底退出</span><div class="bar-track"><div class="bar-fill" style="width:2%;background:var(--red)"></div></div><strong>2%</strong></div></div>
+                <div class="drawer-note"><strong>观察：</strong>“综合调研”类任务中规划师平均拆出 6.8 个子任务，比团队中位数高 42%。其中 23% 最终未被执行，建议收紧规划 Prompt。</div>
+              </div>
+            </aside>
+          </div>
+          <div class="table-shell"><div class="table-toolbar"><div><div class="section-title">专家明细</div><div class="section-sub">按质量、可靠性和成本比较</div></div></div><div class="table-scroll"><table><thead><tr><th>专家</th><th>调用</th><th>完成率</th><th>质量贡献</th><th>P95</th><th>平均 Token</th><th>工具失败</th><th>轮数耗尽</th><th>趋势</th></tr></thead><tbody><tr><td>研究规划师</td><td>942</td><td>96.8%</td><td><span class="delta good">+8.4</span></td><td>18.4s</td><td>22.1K</td><td>1.2%</td><td>0.8%</td><td><span class="delta good">改善</span></td></tr><tr><td>资料检索专家</td><td>781</td><td>93.1%</td><td><span class="delta good">+11.2</span></td><td>22.7s</td><td>31.6K</td><td>3.7%</td><td>1.4%</td><td>稳定</td></tr><tr><td>数据分析专家</td><td>226</td><td>84.5%</td><td><span class="delta good">+6.1</span></td><td><span class="delta bad">47.9s</span></td><td>68.3K</td><td><span class="delta bad">8.9%</span></td><td>4.9%</td><td><span class="delta bad">恶化</span></td></tr><tr><td>引用核查专家</td><td>118</td><td>88.1%</td><td><span class="delta bad">-0.7</span></td><td>14.2s</td><td>18.7K</td><td>0.5%</td><td>0%</td><td>待观察</td></tr></tbody></table></div></div>
+        </section>
+
+        <section class="view" id="view-rag">
+          <div class="notice"><div class="notice-main"><i data-lucide="database-zap"></i><span><strong>评测覆盖说明</strong>：离线回归集 320 条，线上 Shadow 采样 232 条；当前 Judge 为 ragas-judge-v3。</span></div><button>查看评测配置 →</button></div>
+          <div class="rag-grid">
+            <div class="metric-tile"><div class="top"><span>Context Recall</span><span class="tag">离线</span></div><div class="score">84.2%</div><div class="meter"><span style="width:84.2%"></span></div><div class="foot">目标 88% · 较 v11 +3.6%</div></div>
+            <div class="metric-tile"><div class="top"><span>Context Precision</span><span class="tag">离线</span></div><div class="score">79.6%</div><div class="meter"><span style="width:79.6%;background:var(--yellow)"></span></div><div class="foot">目标 82% · 噪声主要来自政策库</div></div>
+            <div class="metric-tile"><div class="top"><span>Faithfulness</span><span class="tag">线上抽样</span></div><div class="score">91.3%</div><div class="meter"><span style="width:91.3%"></span></div><div class="foot">覆盖 18% · 95% CI ±2.8%</div></div>
+            <div class="metric-tile"><div class="top"><span>引用正确率</span><span class="tag">线上抽样</span></div><div class="score">87.9%</div><div class="meter"><span style="width:87.9%"></span></div><div class="foot">16 个声明引用不匹配</div></div>
+          </div>
+          <div class="band grid-7-5">
+            <div class="section">
+              <div class="section-head"><div><div class="section-title">失败类型</div><div class="section-sub">最近一次评测中 74 个低分样本的首要原因</div></div><button class="text-button">查看失败样本</button></div>
+              <div class="failure-bars"><div class="failure-row"><span>关键事实未召回</span><div class="failure-track"><span style="width:68%"></span><em>28 个样本</em></div><strong>37.8%</strong></div><div class="failure-row"><span>上下文噪声过多</span><div class="failure-track"><span style="width:51%;background:#ecc48d"></span><em>19 个样本</em></div><strong>25.7%</strong></div><div class="failure-row"><span>引用与声明不匹配</span><div class="failure-track"><span style="width:34%;background:#b9cde0"></span><em>13 个样本</em></div><strong>17.6%</strong></div><div class="failure-row"><span>答案过度推断</span><div class="failure-track"><span style="width:27%;background:#cdb2ca"></span><em>9 个样本</em></div><strong>12.2%</strong></div><div class="failure-row"><span>无检索结果</span><div class="failure-track"><span style="width:17%;background:#bfc9c3"></span><em>5 个样本</em></div><strong>6.7%</strong></div></div>
+            </div>
+            <div class="section">
+              <div class="section-head"><div><div class="section-title">检索漏斗</div><div class="section-sub">线上 1,284 次知识库查询</div></div></div>
+              <div class="bar-list"><div class="bar-row"><span>发起查询</span><div class="bar-track"><div class="bar-fill" style="width:100%"></div></div><strong>1,284</strong></div><div class="bar-row"><span>有候选</span><div class="bar-track"><div class="bar-fill" style="width:92%"></div></div><strong>1,184</strong></div><div class="bar-row"><span>通过重排</span><div class="bar-track"><div class="bar-fill" style="width:81%"></div></div><strong>1,041</strong></div><div class="bar-row"><span>生成引用</span><div class="bar-track"><div class="bar-fill" style="width:72%"></div></div><strong>923</strong></div><div class="bar-row"><span>引用被打开</span><div class="bar-track"><div class="bar-fill" style="width:18%;background:var(--blue)"></div></div><strong>229</strong></div></div>
+            </div>
+          </div>
+          <div class="table-shell"><div class="table-toolbar"><div><div class="section-title">知识库切片</div><div class="section-sub">定位问题来源，而不是只看总体平均</div></div><select><option>按知识库</option><option>按文档类型</option><option>按问题主题</option></select></div><div class="table-scroll"><table><thead><tr><th>知识库</th><th>查询</th><th>无命中</th><th>Recall</th><th>Precision</th><th>Faithfulness</th><th>P95 检索</th><th>主要问题</th></tr></thead><tbody><tr><td>课程政策库</td><td>438</td><td><span class="delta bad">11.4%</span></td><td>72.8%</td><td>68.1%</td><td>88.4%</td><td>842ms</td><td><span class="tag">版本内容缺失</span></td></tr><tr><td>教学案例库</td><td>369</td><td>3.1%</td><td>89.6%</td><td>84.2%</td><td>94.1%</td><td>691ms</td><td><span class="tag">重复 chunk</span></td></tr><tr><td>研究论文库</td><td>311</td><td>5.8%</td><td>86.3%</td><td>77.9%</td><td>91.7%</td><td><span class="delta bad">1.42s</span></td><td><span class="tag">重排偏慢</span></td></tr><tr><td>校内 FAQ</td><td>166</td><td>1.9%</td><td>94.4%</td><td>91.2%</td><td>96.3%</td><td>318ms</td><td>-</td></tr></tbody></table></div></div>
+        </section>
+
+        <section class="view" id="view-experiments">
+          <div class="experiment-header"><div><div class="section-title">实验：课程政策检索优化</div><div class="section-sub">基线 v12 与候选 v13 · 离线评测完成 · 灰度尚未开始</div></div><div style="display:flex;gap:8px"><button class="button"><i data-lucide="play"></i>重跑评测</button><button class="button primary"><i data-lucide="rocket"></i>开始 10% 灰度</button></div></div>
+          <div class="experiment-grid">
+            <article class="variant"><div class="variant-head"><div><div class="variant-title">基线 v12</div><div class="variant-desc">当前生产版本 · 2026-09-21 发布</div></div><span class="tag">CONTROL</span></div><div class="variant-body"><div class="comparison-row"><span>Context Recall</span><div class="bar-track"><div class="bar-fill" style="width:80.6%;background:#809089"></div></div><strong>80.6%</strong></div><div class="comparison-row"><span>Faithfulness</span><div class="bar-track"><div class="bar-fill" style="width:91.9%;background:#809089"></div></div><strong>91.9%</strong></div><div class="comparison-row"><span>质量总分</span><div class="bar-track"><div class="bar-fill" style="width:84.1%;background:#809089"></div></div><strong>84.1</strong></div><div class="comparison-row"><span>P95 总耗时</span><div></div><strong>38.6s</strong></div><div class="comparison-row"><span>平均成本</span><div></div><strong>¥0.84</strong></div></div></article>
+            <article class="variant candidate"><div class="variant-head"><div><div class="variant-title">候选 v13</div><div class="variant-desc">top-k 8→12 · reranker 阈值 0.42→0.37</div></div><span class="status success">推荐</span></div><div class="variant-body"><div class="comparison-row"><span>Context Recall</span><div class="bar-track"><div class="bar-fill" style="width:87.8%"></div></div><strong class="delta good">87.8%</strong></div><div class="comparison-row"><span>Faithfulness</span><div class="bar-track"><div class="bar-fill" style="width:91.4%"></div></div><strong>91.4%</strong></div><div class="comparison-row"><span>质量总分</span><div class="bar-track"><div class="bar-fill" style="width:88.2%"></div></div><strong class="delta good">88.2</strong></div><div class="comparison-row"><span>P95 总耗时</span><div></div><strong class="delta bad">42.1s</strong></div><div class="comparison-row"><span>平均成本</span><div></div><strong class="delta bad">¥0.91</strong></div></div></article>
+          </div>
+          <div class="gate-list"><div class="gate"><span class="gate-icon pass"><i data-lucide="check"></i></span><span><strong>质量门禁通过</strong> · 总分提升 4.1，Context Recall 提升 7.2%</span><span class="status success">通过</span></div><div class="gate"><span class="gate-icon pass"><i data-lucide="check"></i></span><span><strong>忠实度门禁通过</strong> · Faithfulness 下降 0.5%，低于 1% 容忍线</span><span class="status success">通过</span></div><div class="gate"><span class="gate-icon hold"><i data-lucide="pause"></i></span><span><strong>延迟需要灰度验证</strong> · 离线 P95 增加 9.1%，尚未达到 15% 阻断线</span><span class="status warning">待验证</span></div><div class="gate"><span class="gate-icon pass"><i data-lucide="check"></i></span><span><strong>安全回归通过</strong> · 42 个注入和越权样本无新增失败</span><span class="status success">通过</span></div></div>
+          <div class="surface" style="margin-top:14px"><div class="surface-head"><div><div class="section-title">变更说明与证据</div><div class="section-sub">所有结论均可回到具体评测样本</div></div><button class="text-button">查看 320 条结果</button></div><div class="surface-body" style="font-size:11px;line-height:1.8;color:var(--muted)">候选版本主要改善“课程政策”和“评分规则”类问题，28 个原先缺少关键事实的样本中有 21 个恢复。新增上下文使平均输入 Token 增加 8.7%，但没有显著降低 Faithfulness。建议先进行 10% 灰度，并重点观察 P95 检索延迟、单次成功成本和政策类问题满意率。</div></div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <div class="drawer-backdrop" id="drawerBackdrop"></div>
+  <aside class="drawer" id="traceDrawer" aria-hidden="true">
+    <div class="drawer-head"><div><div class="drawer-title">执行追踪 · <span id="drawerRunId">run_8f2a91</span></div><div class="drawer-sub">完整链路由 Run、Span 和配置快照还原</div></div><button class="icon-button" id="closeDrawer" title="关闭"><i data-lucide="x"></i></button></div>
+    <div class="drawer-body">
+      <div class="trace-summary"><div><small>状态</small><strong style="color:var(--red)">失败</strong></div><div><small>总耗时</small><strong>72.4s</strong></div><div><small>Token</small><strong>186.2K</strong></div><div><small>估算成本</small><strong>¥1.74</strong></div></div>
+      <div class="section-head"><div><div class="section-title">执行瀑布</div><div class="section-sub">横轴为相对运行时间，点击 Span 可继续查看输入输出摘要</div></div><span class="tag">trace_02f9ac</span></div>
+      <div class="trace">
+        <div class="trace-row"><span class="trace-label">主 Agent</span><div class="trace-track"><span class="trace-bar agent" style="left:0;width:100%">72.4s</span></div><span>72.4s</span></div>
+        <div class="trace-row"><span class="trace-label">意图识别</span><div class="trace-track"><span class="trace-bar llm" style="left:1%;width:5%"></span></div><span>1.8s</span></div>
+        <div class="trace-row"><span class="trace-label">研究规划师</span><div class="trace-track"><span class="trace-bar agent" style="left:7%;width:17%">规划</span></div><span>11.9s</span></div>
+        <div class="trace-row"><span class="trace-label">知识库检索</span><div class="trace-track"><span class="trace-bar rag" style="left:11%;width:7%"></span></div><span>4.7s</span></div>
+        <div class="trace-row"><span class="trace-label">数据分析专家</span><div class="trace-track"><span class="trace-bar agent" style="left:26%;width:68%">分析与生成图表</span></div><span>49.1s</span></div>
+        <div class="trace-row"><span class="trace-label">读取 CSV</span><div class="trace-track"><span class="trace-bar tool" style="left:30%;width:10%">read_file</span></div><span>7.2s</span></div>
+        <div class="trace-row"><span class="trace-label">Python 沙箱</span><div class="trace-track"><span class="trace-bar fail" style="left:42%;width:43%">Memory limit exceeded</span></div><span>31.4s</span></div>
+        <div class="trace-row"><span class="trace-label">失败恢复</span><div class="trace-track"><span class="trace-bar llm" style="left:86%;width:8%"></span></div><span>5.3s</span></div>
+      </div>
+      <div class="drawer-note"><strong>根因：</strong>CSV 在进入专家前已被展开成 46MB 文本，随后再次写入沙箱，触发 512MB 内存限制。建议传递文件引用并在沙箱内分块读取。相似失败在最近 7 天出现 6 次。</div>
+      <div style="display:flex;gap:8px;margin-top:16px"><button class="button primary"><i data-lucide="flask-conical"></i>加入回归数据集</button><button class="button"><i data-lucide="wrench"></i>创建修复实验</button></div>
+    </div>
+  </aside>
+
+  <aside class="drawer" id="recommendDrawer" aria-hidden="true">
+    <div class="drawer-head"><div><div class="drawer-title">优化建议详情</div><div class="drawer-sub">建议不会直接修改生产配置</div></div><button class="icon-button" id="closeRecommend" title="关闭"><i data-lucide="x"></i></button></div>
+    <div class="drawer-body"><div class="notice"><div class="notice-main"><i data-lucide="lightbulb"></i><span><strong>证据驱动建议</strong> · 基于 7 天线上 Trace 和评测样本</span></div></div><p id="recommendText" style="font-size:13px;line-height:1.8;color:var(--muted)"></p><div class="mini-stats"><div class="mini-stat"><small>影响 Run</small><strong>41</strong></div><div class="mini-stat"><small>证据置信度</small><strong>高</strong></div><div class="mini-stat"><small>预估质量收益</small><strong>+2.4%</strong></div><div class="mini-stat"><small>风险</small><strong>低</strong></div></div><div class="drawer-note"><strong>建议流程：</strong>先生成候选配置，在固定数据集上回放；通过质量、成本与延迟门禁后，再进入 10% 灰度。</div><div style="display:flex;gap:8px;margin-top:16px"><button class="button primary" data-view-jump="experiments"><i data-lucide="flask-conical"></i>创建候选实验</button><button class="button"><i data-lucide="bookmark"></i>稍后处理</button></div></div>
+  </aside>
+
+  <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
+  <script>
+    const meta = {
+      overview: ['Agent health', '健康概览', '质量、可靠性、速度和成本的统一视图'],
+      runs: ['Execution traces', '执行追踪', '从异常指标下钻到一次完整运行'],
+      experts: ['Expert performance', '专家分析', '比较专家贡献、成本、耗时和协作行为'],
+      rag: ['Retrieval quality', 'RAG 质量', '定位知识库、检索和引用链路的问题'],
+      experiments: ['Version experiments', '版本实验', '用评测和灰度证据决定是否发布']
+    };
+
+    function selectView(view) {
+      document.querySelectorAll('.view').forEach(el => el.classList.toggle('active', el.id === `view-${view}`));
+      document.querySelectorAll('.nav-button').forEach(el => el.classList.toggle('active', el.dataset.view === view));
+      const [eyebrow, title, description] = meta[view];
+      document.getElementById('viewEyebrow').textContent = eyebrow;
+      document.getElementById('viewTitle').textContent = title;
+      document.getElementById('viewDescription').textContent = description;
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+
+    document.querySelectorAll('[data-view]').forEach(button => button.addEventListener('click', () => selectView(button.dataset.view)));
+    document.querySelectorAll('[data-view-jump]').forEach(button => button.addEventListener('click', () => { closeAllDrawers(); selectView(button.dataset.viewJump); }));
+    document.querySelectorAll('.segments button').forEach(button => button.addEventListener('click', () => { button.parentElement.querySelectorAll('button').forEach(item => item.classList.remove('active')); button.classList.add('active'); }));
+
+    const backdrop = document.getElementById('drawerBackdrop');
+    const traceDrawer = document.getElementById('traceDrawer');
+    const recommendDrawer = document.getElementById('recommendDrawer');
+    function openDrawer(drawer) { closeAllDrawers(); backdrop.classList.add('open'); drawer.classList.add('open'); drawer.setAttribute('aria-hidden', 'false'); }
+    function closeAllDrawers() { backdrop.classList.remove('open'); [traceDrawer, recommendDrawer].forEach(drawer => { drawer.classList.remove('open'); drawer.setAttribute('aria-hidden', 'true'); }); }
+    backdrop.addEventListener('click', closeAllDrawers);
+    document.getElementById('closeDrawer').addEventListener('click', closeAllDrawers);
+    document.getElementById('closeRecommend').addEventListener('click', closeAllDrawers);
+    document.querySelectorAll('[data-run]').forEach(button => button.addEventListener('click', () => { document.getElementById('drawerRunId').textContent = button.dataset.run; openDrawer(traceDrawer); }));
+    document.querySelectorAll('[data-recommendation]').forEach(button => button.addEventListener('click', () => { document.getElementById('recommendText').textContent = button.dataset.recommendation; openDrawer(recommendDrawer); }));
+
+    document.querySelectorAll('.bubble').forEach(button => button.addEventListener('click', () => { document.querySelectorAll('.bubble').forEach(item => item.classList.remove('selected')); button.classList.add('selected'); document.getElementById('expertName').textContent = button.dataset.expert; }));
+
+    const runSearch = document.getElementById('runSearch');
+    const runStatus = document.getElementById('runStatus');
+    function filterRuns() {
+      const query = runSearch.value.trim().toLowerCase();
+      document.querySelectorAll('#runRows tr').forEach(row => {
+        const statusMatch = runStatus.value === 'all' || row.dataset.status === runStatus.value;
+        const textMatch = !query || row.textContent.toLowerCase().includes(query);
+        row.style.display = statusMatch && textMatch ? '' : 'none';
+      });
+    }
+    runSearch.addEventListener('input', filterRuns);
+    runStatus.addEventListener('change', filterRuns);
+
+    document.getElementById('refreshButton').addEventListener('click', event => {
+      const icon = event.currentTarget.querySelector('svg');
+      icon.style.transition = 'transform 400ms ease';
+      icon.style.transform = 'rotate(360deg)';
+      setTimeout(() => { icon.style.transition = ''; icon.style.transform = ''; }, 430);
+    });
+
+    document.addEventListener('keydown', event => { if (event.key === 'Escape') closeAllDrawers(); });
+    if (window.lucide) window.lucide.createIcons({ attrs: { 'stroke-width': 1.8 } });
+  </script>
+</body>
+</html>

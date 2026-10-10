@@ -48,6 +48,7 @@
 #     lea-agent ─────────> lea-tools:8400
 #     lea-agent ─────────> lea-rag:8300
 #     lea-agent ─────────> lea-config:8500
+#     lea-agent-worker ──> lea-tools / lea-rag / lea-config
 #     lea-tools ─────────> lea-rag:8300      ← 容易漏的一条，见下
 #
 # 全部策略只在**同一个 namespace 内**生效（podSelector 默认限本 namespace）。
@@ -73,6 +74,8 @@ spec:
         - podSelector:
             matchLabels: {app: lea-agent}
         - podSelector:
+            matchLabels: {app: lea-agent-worker}
+        - podSelector:
             matchLabels: {app: lea-tools}
         - podSelector:
             matchLabels: {app: lea-gateway}
@@ -96,6 +99,8 @@ spec:
     - from:
         - podSelector:
             matchLabels: {app: lea-agent}
+        - podSelector:
+            matchLabels: {app: lea-agent-worker}
       ports:
         - {protocol: TCP, port: 8400}
 
@@ -113,6 +118,8 @@ spec:
     - from:
         - podSelector:
             matchLabels: {app: lea-agent}
+        - podSelector:
+            matchLabels: {app: lea-agent-worker}
         - podSelector:
             matchLabels: {app: lea-gateway}
       ports:

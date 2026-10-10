@@ -81,6 +81,16 @@ func (c *messageCollector) setMainUsage(in, out, peak, iterations int, rounds []
 	c.mu.Unlock()
 }
 
+// usageSnapshot 读一下当前累计的主会话用量，给"跑完立刻广播一次"用
+// （agent_session.go 在发 done 之前调）。跟落库那份走的是同一份数据
+// （mainInputTokens/mainOutputTokens），只是提前在关闭连接之前吐一次给
+// 前端，省得用户必须刷新页面才能看到这轮花了多少 token。
+func (c *messageCollector) usageSnapshot() (in, out int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.mainInputTokens, c.mainOutputTokens
+}
+
 // setChainUsage 记一条 handoff 链的形状：轮数和 leg 的峰值，**不记 token**。
 //
 // 因为 handoff 下没有"主会话"这个东西。星型有：团长自己跑若干轮、读专家的报告、

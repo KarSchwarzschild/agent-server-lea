@@ -36,7 +36,6 @@ import io
 import os
 import re
 import zipfile
-from datetime import datetime
 from functools import lru_cache
 from typing import Optional
 
@@ -55,16 +54,26 @@ from lea_config.database import (
     get_db,
 )
 from lea_config.models.skill import Skill, SkillVersion
-from lea_config.models.skill_publish import (
-    PUBLISH_APPROVED,
-    PUBLISH_PENDING,
-    PUBLISH_REJECTED,
-    PUBLISH_TARGET_GLOBAL,
-    PUBLISH_TARGET_TENANT,
-    PUBLISH_TARGETS,
-    SkillPublishRequest,
+from lea_config.models.binding import AgentSkillBinding
+from lea_config.models.publication import (
+    PUBLICATION_APPROVED as PUBLISH_APPROVED,
+    PUBLICATION_PENDING as PUBLISH_PENDING,
+    PUBLICATION_REJECTED as PUBLISH_REJECTED,
+    PUBLICATION_TARGET_TENANT as PUBLISH_TARGET_TENANT,
+    PUBLICATION_TARGETS as PUBLISH_TARGETS,
+    PublicationRequest,
 )
 from lea_config.models.tool import Tool
+from lea_config.services.publication import (
+    RESOURCE_SKILL,
+    cancel_pending_for_resource,
+    cancel_request,
+    publication_request_dict,
+    record_audit_event,
+    review_request,
+    scoped_requests,
+    submit_skill_request,
+)
 
 router = APIRouter(prefix="/skills", tags=["skills"])
 
@@ -120,6 +129,10 @@ class PublishRequestBody(BaseModel):
 
 class ReviewBody(BaseModel):
     approve: bool
+    note: str = ""
+
+
+class SkillPublicationCancelBody(BaseModel):
     note: str = ""
 
 
@@ -194,6 +207,21 @@ def _can_edit(skill: Skill, actor: Actor) -> bool:
 
 
 def _skill_to_dict(skill: Skill, actor: Actor, pending: str | None = None) -> dict:
+    can_edit = _can_edit(skill, actor)
+    publication_status = (
+        "pending"
+        if pending
+        else (
+            "draft"
+            if skill.owner_scope == OWNER_SCOPE_USER
+            else ("active" if skill.enabled else "suspended")
+        )
+    )
+    allowed_actions = ["read"]
+    if can_edit:
+        allowed_actions.extend(["update", "delete"])
+    if skill.owner_scope == OWNER_SCOPE_USER and can_edit and not pending:
+        allowed_actions.append("submit_publication")
     return {
         "id": skill.id,
         "name": skill.name,
@@ -208,11 +236,13 @@ def _skill_to_dict(skill: Skill, actor: Actor, pending: str | None = None) -> di
         "is_builtin": bool(skill.is_builtin),
         "has_bundle": bool(skill.bundle_uri),
         "is_own": bool(actor.user_id and skill.created_by == actor.user_id),
-        "can_edit": _can_edit(skill, actor),
+        "can_edit": can_edit,
         # 有在审的申请时带出目标层，前端据此把「申请上架」按钮变成「审核中」。
         # None = 没有在审的。
         "pending_publish": pending,
         "system_prompt": skill.system_prompt or "",
+        "publication_status": publication_status,
+        "allowed_actions": allowed_actions,
     }
 
 
@@ -268,8 +298,21 @@ def _skill_version_view(skill: Skill, actor: Actor, version: SkillVersion,
     return data
 
 
-def _row_to_dict(obj) -> dict:
-    return {c.name: getattr(obj, c.name) for c in obj.__table__.columns}
+def _legacy_publish_request_dict(request: PublicationRequest) -> dict:
+    data = publication_request_dict(request)
+    return {
+        "id": data["id"],
+        "skill_id": int(data["resource_id"]),
+        "tenant_id": data["tenant_id"],
+        "requested_by": data["requested_by"],
+        "target_scope": data["target_scope"],
+        "status": data["status"],
+        "review_note": data["review_note"] or data["request_note"],
+        "reviewed_by": data["reviewed_by"],
+        "reviewed_at": data["reviewed_at"],
+        "created_at": data["created_at"],
+        "updated_at": data["updated_at"],
+    }
 
 
 def _pending_map(db: Session, skill_ids: list[int]) -> dict[int, str]:
@@ -277,14 +320,15 @@ def _pending_map(db: Session, skill_ids: list[int]) -> dict[int, str]:
     if not skill_ids:
         return {}
     rows = (
-        db.query(SkillPublishRequest.skill_id, SkillPublishRequest.target_scope)
+        db.query(PublicationRequest.resource_id, PublicationRequest.target_scope)
         .filter(
-            SkillPublishRequest.skill_id.in_(skill_ids),
-            SkillPublishRequest.status == PUBLISH_PENDING,
+            PublicationRequest.resource_type == RESOURCE_SKILL,
+            PublicationRequest.resource_id.in_([str(skill_id) for skill_id in skill_ids]),
+            PublicationRequest.status == PUBLISH_PENDING,
         )
         .all()
     )
-    return {sid: target for sid, target in rows}
+    return {int(resource_id): target for resource_id, target in rows}
 
 
 # ── SKILL.md Parser ───────────────────────────────────────
@@ -368,36 +412,32 @@ def list_publish_requests(
 
     普通用户看自己提的（用来查「我的申请被驳回了没、理由是什么」）。
     """
-    q = db.query(SkillPublishRequest).filter(SkillPublishRequest.status == status)
-
-    if actor.is_platform_admin:
-        # 平台管理员审的是「上架到所有人可见」那一档
-        q = q.filter(SkillPublishRequest.target_scope == PUBLISH_TARGET_GLOBAL)
-    elif actor.is_tenant_admin:
-        q = q.filter(
-            SkillPublishRequest.tenant_id == actor.tenant_id,
-            SkillPublishRequest.target_scope == PUBLISH_TARGET_TENANT,
+    rows = (
+        scoped_requests(db, actor)
+        .filter(
+            PublicationRequest.resource_type == RESOURCE_SKILL,
+            PublicationRequest.status == status,
         )
-    else:
-        q = q.filter(
-            SkillPublishRequest.tenant_id == actor.tenant_id,
-            SkillPublishRequest.requested_by == actor.user_id,
-        )
-
-    rows = q.order_by(SkillPublishRequest.created_at.desc()).limit(200).all()
+        .order_by(PublicationRequest.created_at.desc(), PublicationRequest.id.desc())
+        .limit(200)
+        .all()
+    )
 
     # 带上 skill 名字，否则待审列表只有一串 id
     names = dict(
         db.query(Skill.id, Skill.name)
-        .filter(Skill.id.in_([r.skill_id for r in rows]))
+        .filter(Skill.id.in_([int(r.resource_id) for r in rows]))
         .all()
     ) if rows else {}
 
     return {
         "requests": [
             {
-                **_row_to_dict(r),
-                "skill_name": names.get(r.skill_id, "(已删除)"),
+                **_legacy_publish_request_dict(r),
+                "skill_name": names.get(
+                    int(r.resource_id),
+                    (r.resource_snapshot or {}).get("name", "(已删除)"),
+                ),
             }
             for r in rows
         ]
@@ -422,56 +462,17 @@ def review_publish_request(
     「所有租户可见」在这套编码里就是住进全局租户。搬走之后原租户管理员也改不了它了
     （_can_edit 里 tenant_id 不匹配直接 false），只有平台管理员能。
     """
-    req = db.query(SkillPublishRequest).filter(
-        SkillPublishRequest.id == request_id
-    ).first()
-    if req is None:
-        raise HTTPException(404, "申请不存在")
-    if req.status != PUBLISH_PENDING:
-        raise HTTPException(409, f"这份申请已经是 {req.status}，不能重复处理")
-
-    # 审核权按目标层分，不看谁提的
-    if req.target_scope == PUBLISH_TARGET_GLOBAL:
-        if not actor.is_platform_admin:
-            raise HTTPException(403, "上架到全平台需要平台管理员审核")
-    else:
-        if not (actor.is_tenant_admin or actor.is_platform_admin):
-            raise HTTPException(403, "需要租户管理员审核")
-        if not actor.is_platform_admin and req.tenant_id != actor.tenant_id:
-            raise HTTPException(404, "申请不存在")
-
-    skill = db.query(Skill).filter(Skill.id == req.skill_id).first()
-    if skill is None:
-        # 申请还在但 skill 没了。外键是 CASCADE，所以正常不会走到这里；
-        # 真走到了说明有人绕过 ORM 删了行。
-        raise HTTPException(410, "对应的 Skill 已被删除")
-
-    req.reviewed_by = actor.user_id
-    req.reviewed_at = datetime.now()
-    req.review_note = body.note or None
+    req = review_request(
+        db,
+        actor,
+        request_id,
+        PUBLISH_APPROVED if body.approve else PUBLISH_REJECTED,
+        body.note,
+    )
+    skill = db.query(Skill).filter(Skill.id == int(req.resource_id)).first()
 
     if not body.approve:
-        req.status = PUBLISH_REJECTED
-        db.commit()
-        return {"status": PUBLISH_REJECTED, "skill_id": skill.id}
-
-    req.status = PUBLISH_APPROVED
-    skill.owner_scope = OWNER_SCOPE_PLATFORM
-    skill.owner_user_id = None
-    if req.target_scope == PUBLISH_TARGET_GLOBAL:
-        skill.tenant_id = DEFAULT_TENANT_ID
-
-    try:
-        db.commit()
-    except IntegrityError:
-        db.rollback()
-        # UNIQUE(tenant_id, name) —— 目标租户里已经有同名 skill 了。
-        # global 档尤其容易撞：不同租户各有一个叫 pptx 的，第二个上架就撞。
-        raise HTTPException(
-            409,
-            f"目标空间里已经有一个叫 {skill.name!r} 的 Skill，无法上架。"
-            f"请先改名再申请。",
-        )
+        return {"status": PUBLISH_REJECTED, "skill_id": int(req.resource_id)}
 
     return {
         "status": PUBLISH_APPROVED,
@@ -644,6 +645,15 @@ def update_skill(
     if skill.is_builtin and not actor.is_platform_admin:
         raise HTTPException(403, "内置 Skill 不可修改")
 
+    binding_count = (
+        db.query(AgentSkillBinding)
+        .filter(AgentSkillBinding.skill_id == skill.id, AgentSkillBinding.enabled.is_(True))
+        .count()
+    )
+    before = {
+        "enabled": bool(skill.enabled),
+        "version": skill.version or "1.0.0",
+    }
     data = body.model_dump(exclude_none=True)
     if "allowed_tools" in data:
         data["required_tools"] = data.pop("allowed_tools")
@@ -652,9 +662,38 @@ def update_skill(
 
     for k, v in data.items():
         setattr(skill, k, v)
+    pending_invalidated = False
+    if data:
+        pending_invalidated = bool(
+            cancel_pending_for_resource(
+                db,
+                actor,
+                RESOURCE_SKILL,
+                str(skill.id),
+                "resource changed; resubmit publication request",
+            )
+        )
+    record_audit_event(
+        db,
+        actor,
+        resource_type=RESOURCE_SKILL,
+        resource_id=str(skill.id),
+        tenant_id=skill.tenant_id,
+        action="resource.updated",
+        result="success",
+        before=before,
+        after={"enabled": bool(skill.enabled), "version": skill.version or "1.0.0"},
+        reason="publication request invalidated" if pending_invalidated else None,
+    )
     db.commit()
     db.refresh(skill)
-    return _skill_to_dict(skill, actor)
+    result = _skill_to_dict(skill, actor)
+    result["impact"] = {
+        "active_agent_bindings": binding_count,
+        "enabled_changed": before["enabled"] != bool(skill.enabled),
+        "publication_request_invalidated": pending_invalidated,
+    }
+    return result
 
 
 @router.delete("/{skill_id}")
@@ -669,21 +708,46 @@ def delete_skill(
     if skill.is_builtin and not actor.is_platform_admin:
         raise HTTPException(403, "内置 Skill 不可删除")
 
-    # 在审的申请由外键 CASCADE 跟着删。
+    binding_count = (
+        db.query(AgentSkillBinding)
+        .filter(AgentSkillBinding.skill_id == skill.id, AgentSkillBinding.enabled.is_(True))
+        .count()
+    )
+    pending_count = cancel_pending_for_resource(
+        db, actor, RESOURCE_SKILL, str(skill.id), "resource deleted"
+    )
+    record_audit_event(
+        db,
+        actor,
+        resource_type=RESOURCE_SKILL,
+        resource_id=str(skill.id),
+        tenant_id=skill.tenant_id,
+        action="resource.deleted",
+        result="success",
+        before={"enabled": bool(skill.enabled), "active_agent_bindings": binding_count},
+        after={"deleted": True},
+        reason="resource deleted",
+    )
+    # 通用申请没有资源外键；删除时结束 pending，但保留脱敏快照和审核历史。
     db.delete(skill)
     db.commit()
-    return {"message": "已删除"}
+    return {
+        "message": "已删除",
+        "impact": {
+            "active_agent_bindings": binding_count,
+            "pending_publication_requests": pending_count,
+        },
+    }
 
 
 # ── 上架申请 ───────────────────────────────────────────────
 
-@router.post("/{skill_id}/publish", status_code=201)
-def request_publish(
+def _submit_publish_request(
     skill_id: int,
     body: PublishRequestBody,
-    db: Session = Depends(get_db),
-    actor: Actor = Depends(require_actor),
-):
+    db: Session,
+    actor: Actor,
+) -> PublicationRequest:
     """申请把自己的 skill 上架到更高一层。
 
     只有**创建者本人**能提（管理员想直接搬用 review 那条路，不用先假装申请一次）。
@@ -704,31 +768,51 @@ def request_publish(
     if current == VIS_TENANT and body.target_scope == PUBLISH_TARGET_TENANT:
         raise HTTPException(409, "已经是租户内可见")
 
-    # 「同一个 skill 同时只能有一个在审」—— MySQL 没有部分唯一索引，所以在这里挡。
-    # 不挡的话待审列表里会出现同一个 skill 的多份申请，审了一份另一份还悬着。
-    dup = (
-        db.query(SkillPublishRequest.id)
-        .filter(
-            SkillPublishRequest.skill_id == skill.id,
-            SkillPublishRequest.status == PUBLISH_PENDING,
-        )
-        .first()
-    )
-    if dup:
-        raise HTTPException(409, "这个 Skill 已经有一份申请在审核中")
+    return submit_skill_request(db, actor, skill, body.target_scope, body.note)
 
-    req = SkillPublishRequest(
-        skill_id=skill.id,
-        tenant_id=skill.tenant_id,
-        requested_by=actor.user_id,
-        target_scope=body.target_scope,
-        status=PUBLISH_PENDING,
-        review_note=body.note or None,
+
+@router.post("/{skill_id}/publish", status_code=201)
+def request_publish(
+    skill_id: int,
+    body: PublishRequestBody,
+    db: Session = Depends(get_db),
+    actor: Actor = Depends(require_actor),
+):
+    """兼容旧 Skill 上架接口。"""
+    return _legacy_publish_request_dict(
+        _submit_publish_request(skill_id, body, db, actor)
     )
-    db.add(req)
-    db.commit()
-    db.refresh(req)
-    return _row_to_dict(req)
+
+
+@router.post("/{skill_id}/publication-requests", status_code=201)
+def create_skill_publication_request(
+    skill_id: int,
+    body: PublishRequestBody,
+    db: Session = Depends(get_db),
+    actor: Actor = Depends(require_actor),
+):
+    return publication_request_dict(
+        _submit_publish_request(skill_id, body, db, actor)
+    )
+
+
+@router.post("/{skill_id}/publication-requests/{request_id}/cancel")
+def cancel_skill_publication_request(
+    skill_id: int,
+    request_id: int,
+    body: SkillPublicationCancelBody,
+    db: Session = Depends(get_db),
+    actor: Actor = Depends(require_actor),
+):
+    """用户侧撤回自己的申请；管理员后台使用通用管理路由。"""
+    request = db.query(PublicationRequest).filter(
+        PublicationRequest.id == request_id,
+        PublicationRequest.resource_type == RESOURCE_SKILL,
+        PublicationRequest.resource_id == str(skill_id),
+    ).first()
+    if request is None:
+        raise HTTPException(404, "申请不存在")
+    return publication_request_dict(cancel_request(db, actor, request_id, body.note))
 
 
 # ── Bundle 上传 / 下载 ─────────────────────────────────────

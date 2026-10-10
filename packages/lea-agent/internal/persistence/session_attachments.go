@@ -178,3 +178,62 @@ func RemoveSessionAttachment(
 	n, err := res.RowsAffected()
 	return n > 0, err
 }
+
+// ReplaceSessionAttachments 把这个会话的挂载集合整体替换成 desired。
+//
+// 跟上面 AddSessionAttachment/RemoveSessionAttachment 那条"逐条增删"的路径是
+// 两种语义，服务两种不同的调用场景：
+//
+//	逐条增删   "挂载"/"摘除"两个独立按钮，一次只动一样，别的不受影响
+//	整体替换   发消息时带的 attachments 字段——调用方认为的就是这条会话现在
+//	          该有的完整清单，凡是不在这份清单里的旧挂载都要摘掉（见
+//	          router.SendRequest.Attachments 的说明）
+//
+// 用事务做"先清空、再按 desired 重新插"，不是因为原子性有多重要（这张表没有
+// 外键，中间态最多是短暂的"少几行"，见 017_session_attachments.sql），是为了
+// 避免在替换过程中另一个并发请求看到一份不完整的中间结果。
+//
+// 未知 kind 静默丢弃，跟 LoadSessionAttachments 那边"读到不认识的照常往下传"
+// 的宽容策略是同一条原则的两个方向：写入端拦，读取端放，理由见文件里
+// SessionAttachmentKinds 那段说明。
+func ReplaceSessionAttachments(
+	ctx context.Context, db *sql.DB, tenantID, sessionID, userID string, desired []SessionAttachment,
+) error {
+	if db == nil {
+		return nil
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM session_attachments WHERE tenant_id = ? AND session_id = ?`,
+		tenantID, sessionID,
+	); err != nil {
+		return err
+	}
+
+	// 去重：desired 里如果有重复的 (kind, ref_id)，唯一索引会让第二条 INSERT 报错——
+	// 前端传重了不该变成一次 500。
+	seen := make(map[string]bool, len(desired))
+	for _, item := range desired {
+		if !SessionAttachmentKinds[item.Kind] {
+			continue
+		}
+		key := item.Kind + ":" + strconv.Itoa(item.RefID)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO session_attachments (session_id, tenant_id, user_id, kind, ref_id)
+			 VALUES (?, ?, ?, ?, ?)`,
+			sessionID, tenantID, userID, item.Kind, item.RefID,
+		); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}

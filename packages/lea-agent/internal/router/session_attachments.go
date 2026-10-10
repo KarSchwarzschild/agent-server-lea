@@ -46,14 +46,40 @@ type attachBody struct {
 //
 // 三个挂载端点都要这一段，抽出来是因为它是**安全边界**：漏掉任何一个，就能靠猜
 // session_id 去改别人会话的工具集。跟 handleGetMessages 里那段是同一条判据。
-func sessionOwnerGuard(c *gin.Context) (*sql.DB, bool) {
+//
+// 先查内存、查不到再查库，不是"多一层缓存"，是两种会话状态都要认：
+//
+//	刚 POST /sessions 建的会话   只在 mgr 内存里，chat_sessions 还没这一行
+//	                            （首条消息才落库，见 017_session_attachments.sql
+//	                            和 handlers.go 的 handleCreateSession）
+//	已经发过消息的会话           chat_sessions 有行，但未必在**这个进程**的内存里
+//	                            （副本重启过、或者被 ensureCapacity 回收了）
+//
+// 只查库会把前一种误判成"不存在"——恰恰是用户想在发第一条消息之前先挂
+// 技能/工具的场景（表里没有外键，落哪张表都读得到，见 017 的说明）。只查内存
+// 又接不住第二种。两条都要查。
+func sessionOwnerGuard(c *gin.Context, mgr *session.Manager) (*sql.DB, bool) {
+	sessionID := c.Param("id")
+	tenantID := c.GetString("tenant_id")
+	userID := c.GetString("user_id")
+
 	db, err := persistence.DB()
 	if err != nil || db == nil {
 		c.JSON(503, gin.H{"error": "persistence unavailable"})
 		return nil, false
 	}
-	ownerUser, ownerTenant, err := persistence.GetSessionOwner(
-		c.Request.Context(), db, c.Param("id"))
+
+	if s := mgr.Get(sessionID); s != nil {
+		if !s.OwnedBy(tenantID, userID) {
+			// 404 而不是 403：跟下面数据库分支、以及 bind_tool 那边一致，
+			// 说"没有这个会话"才不泄露它存在。
+			c.JSON(404, gin.H{"error": "session not found"})
+			return nil, false
+		}
+		return db, true
+	}
+
+	ownerUser, ownerTenant, err := persistence.GetSessionOwner(c.Request.Context(), db, sessionID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			c.JSON(404, gin.H{"error": "session not found"})
@@ -62,8 +88,7 @@ func sessionOwnerGuard(c *gin.Context) (*sql.DB, bool) {
 		c.JSON(500, gin.H{"error": err.Error()})
 		return nil, false
 	}
-	// 404 而不是 403：跟 bind_tool 那边一致 —— 说"没有这个会话"才不泄露它存在。
-	if ownerUser != c.GetString("user_id") || ownerTenant != c.GetString("tenant_id") {
+	if ownerUser != userID || ownerTenant != tenantID {
 		c.JSON(404, gin.H{"error": "session not found"})
 		return nil, false
 	}
@@ -75,11 +100,15 @@ func applyAndReport(c *gin.Context, mgr *session.Manager, sessionID string, payl
 	if mgr.Drop(sessionID) {
 		payload["applies"] = "next_message"
 	} else {
-		// 正在生成或有 SSE 订阅者 —— 记标志，本轮收尾自己丢。
+		// Drop 失败 —— 会话忙或不在内存。两种情况要区分：
+		// 1. 在内存（正在生成或有 SSE 订阅者）→ 记标志，本轮收尾自己丢 → after_current_turn
+		// 2. 不在内存（本副本从未加载过）→ 下一条消息指纹自愈触发重建 → next_message
 		if s := mgr.Get(sessionID); s != nil {
 			s.MarkPendingRebuild()
+			payload["applies"] = "after_current_turn"
+		} else {
+			payload["applies"] = "next_message"
 		}
-		payload["applies"] = "after_current_turn"
 	}
 	c.JSON(200, payload)
 }
@@ -97,9 +126,9 @@ func applyAndReport(c *gin.Context, mgr *session.Manager, sessionID string, payl
 // 解析失败时**退回原始记录 + 200**，不是 502。理由：ref_id 已经是真的，用户至少能看到
 // "挂了 3 样"并且能摘掉它们（DELETE 只要 kind + ref_id）。整个报错的话一次 lea-config
 // 抖动会让挂载列表打不开，连摘除入口都没了。partial 字段告诉前端这次没拿到名字。
-func handleListSessionAttachments(_ *session.Manager) gin.HandlerFunc {
+func handleListSessionAttachments(mgr *session.Manager) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		db, ok := sessionOwnerGuard(c)
+		db, ok := sessionOwnerGuard(c, mgr)
 		if !ok {
 			return
 		}
@@ -170,7 +199,7 @@ func handleAttachToSession(mgr *session.Manager) gin.HandlerFunc {
 			return
 		}
 
-		db, ok := sessionOwnerGuard(c)
+		db, ok := sessionOwnerGuard(c, mgr)
 		if !ok {
 			return
 		}
@@ -200,7 +229,7 @@ func handleDetachFromSession(mgr *session.Manager) gin.HandlerFunc {
 			return
 		}
 
-		db, ok := sessionOwnerGuard(c)
+		db, ok := sessionOwnerGuard(c, mgr)
 		if !ok {
 			return
 		}

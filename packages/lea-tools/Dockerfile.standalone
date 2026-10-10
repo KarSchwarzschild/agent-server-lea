@@ -1,0 +1,56 @@
+# lea-tools —— 独立部署版 Dockerfile（构建上下文就是本目录 packages/lea-tools）
+#
+# 构建：
+#     cd packages/lea-tools
+#     docker build -f Dockerfile.standalone -t lea-tools:prod .
+# 或直接 `docker compose up -d --build`（见同目录 docker-compose.yml）。
+#
+# 跟同目录的 Dockerfile 的区别：那份的上下文是**仓库根**（monorepo 里 compose 用），要
+# 用根目录的 uv.lock 和 packages/lea-authkit；这份不依赖仓库里的任何别的东西，单拷本
+# 目录到服务器就能构建。为此做了两处替换：
+#
+#   依赖   requirements.txt（由 `uv export` 从 monorepo 的 uv.lock 导出，版本和哈希都
+#          钉死，跟 monorepo 里跑的是同一批）。更新依赖后在仓库根重新导出：
+#              uv export --package lea-tools --no-dev --frozen --no-emit-workspace \
+#                  -o packages/lea-tools/requirements.txt
+#   authkit  vendor/lea_authkit（源码拷贝，scripts/sync_vendor.py 同步，
+#            tests/test_vendor_authkit_in_sync.py 防漂移）。
+#
+# 用 pip 而不是 uv 装依赖：少拉一个 ghcr.io/astral-sh/uv 镜像。这台服务器所在的网络对
+# ghcr.io/quay.io 时通时不通（拉镜像超时是常见故障），能少一个外部镜像依赖就少一个坑。
+# requirements.txt 里带哈希，pip 会自动进入严格校验模式，效果等价于 uv 的 --frozen。
+#
+# 不拷 .env——密码、对象存储 key 不进镜像层（镜像层扒得出来，后续层删掉也没用）。
+# 配置全部运行时注入，见 docker-compose.yml 的 env_file。
+
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+COPY requirements.txt /tmp/requirements.txt
+# 国内网络可换镜像：docker build --build-arg PIP_INDEX_URL=https://... （pip 读同名环境变量）
+ARG PIP_INDEX_URL
+RUN pip install --no-cache-dir -r /tmp/requirements.txt \
+    && rm /tmp/requirements.txt
+
+WORKDIR /app
+COPY src ./src
+# 两个包合并进同一个 src/，各自的顶层目录不同（lea_tools/ 和 lea_authkit/），所以放在
+# 同一个 PYTHONPATH 下就够，不需要 pip install 它们。
+COPY vendor/lea_authkit ./src/lea_authkit
+ENV PYTHONPATH=/app/src
+
+# 这个服务**故意用 root 跑**。它要往共享存储（NFS）建 session 目录，给沙箱做 host-mount；
+# 跑不了 root（或者目录属主 UID 不匹配）时的表现不是报错，是**静默降级**——日志里一行
+# "host-mount skipped: shared storage not writable"，然后沙箱退回用容器内的本地 fs，
+# 沙箱一死用户的文件就没了，而一切看起来正常。想换非 root：把 NFS 目录属主设成对应 UID，
+# 并确认日志里没有那行。别只看服务起没起来——它照样会起来。
+
+EXPOSE 8400
+
+# slim 镜像没有 curl，用 python。
+HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=3 \
+    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8400/health',timeout=4).status==200 else 1)"
+
+CMD ["uvicorn", "lea_tools.server:app", "--host", "0.0.0.0", "--port", "8400"]

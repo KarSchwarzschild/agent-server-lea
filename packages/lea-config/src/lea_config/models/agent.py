@@ -31,7 +31,10 @@ class Agent(OwnerMixin, TenantMixin, Base):
 
     model = Column(String(100), default="")
     temperature = Column(Integer, default=7)
-    max_turns = Column(Integer, default=20)
+    # 100：一次 ReAct 迭代 = 一次模型往返，多文件任务每写一个文件吃一轮，20 会把
+    # "生成一套 PPT"这类任务在收尾处截断。跟 api/agents.py 的两处默认值、以及
+    # lea-agent 的 config_loader.go 兜底值保持一致（那边有完整说明）。
+    max_turns = Column(Integer, default=100)
     max_tokens = Column(Integer, default=4096)
     kb_mode = Column(String(20), default="tool")
     memory_mode = Column(String(20), default="always")

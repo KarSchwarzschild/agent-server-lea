@@ -33,6 +33,8 @@ class KBService:
             retrieval_top_k=data.get("retrieval_top_k", 5),
             score_threshold=data.get("score_threshold", 0.5),
             visibility=data.get("visibility", "private"),
+            reranker_model=data.get("reranker_model", ""),
+            reranker_enabled=data.get("reranker_enabled", True),
             vlm_enabled=data.get("vlm_enabled", True),
             vlm_model=data.get("vlm_model", ""),
             multimodal=data.get("multimodal", False),
@@ -80,7 +82,14 @@ class KBService:
         kb = self.get_kb(kb_id)
         if kb is None:
             return None
-        for field in ["name", "description", "retrieval_mode", "retrieval_top_k", "score_threshold", "visibility", "enabled"]:
+        # embedding_model/embedding_dim 故意也在这个白名单里：能不能改由调用方
+        # （server_user_kb.py 的路由层）按 kb.document_count 判断后再决定要不要把
+        # 它们塞进 data —— 这里不重复判断，否则两处判据分叉是迟早的事。
+        for field in [
+            "name", "description", "retrieval_mode", "retrieval_top_k", "score_threshold",
+            "visibility", "enabled", "embedding_model", "embedding_dim",
+            "reranker_model", "reranker_enabled", "vlm_model", "vlm_enabled", "multimodal",
+        ]:
             if field in data:
                 setattr(kb, field, data[field])
         self.db.flush()

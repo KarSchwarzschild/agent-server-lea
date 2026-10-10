@@ -12,7 +12,8 @@ import (
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/runtime"
 )
 
-// UserConfigProxy 把 /api/user/{agents,skills,tools}/* 反代到 lea-config 对应路径。
+// ResourceConfigProxy 把中性 /api/{agents,skills,tools,...} 和兼容的
+// /api/user/{agents,skills,tools,...} 反代到 lea-config 对应路径。
 //
 // 从 gin context 里拿 JWT 已验过的身份 → 注入 X-User-ID / X-Tenant-ID /
 // X-User-Role，**覆盖或删掉**客户端可能伪造的同名头。
@@ -27,23 +28,25 @@ import (
 // 下游。X-User-Role 一度就是不管的，于是浏览器加一个 X-User-Role: admin 就是管理员。
 //
 // lea-config 的路由前缀是 /agents（不是 /api/agents），所以 rewrite 时把
-// "/api/user" 前缀切掉。
+// "/api" 或兼容路径的 "/api/user" 前缀切掉。
 //
 // LEA_CONFIG_URL 环境变量控制 upstream，默认 http://localhost:8500。
-//
-// lea-config 的路由前缀是 /agents（不是 /api/agents），所以 rewrite 时把
-// "/api/user" 前缀切掉。
-//
-// LEA_CONFIG_URL 环境变量控制 upstream，默认 http://localhost:8500。
-func UserConfigProxy() gin.HandlerFunc {
+func ResourceConfigProxy() gin.HandlerFunc {
 	target := os.Getenv("LEA_CONFIG_URL")
 	if target == "" {
 		target = "http://localhost:8500"
 	}
 	return userProxy(target, "bad LEA_CONFIG_URL: ", func(p string) string {
-		// /api/user/agents/... → /agents/...
-		return strings.TrimPrefix(p, "/api/user")
+		// /api/agents/... 和 /api/user/agents/... 都重写为 /agents/...
+		if p == "/api/user" || strings.HasPrefix(p, "/api/user/") {
+			return strings.TrimPrefix(p, "/api/user")
+		}
+		return strings.TrimPrefix(p, "/api")
 	})
+}
+
+func UserConfigProxy() gin.HandlerFunc {
+	return ResourceConfigProxy()
 }
 
 // userProxy 是这一组反代的公共实现：注入身份、注入服务间密钥、重写路径。
@@ -146,19 +149,19 @@ func setUserRoleHeader(c *gin.Context) {
 }
 
 func UserAgentsProxy() gin.HandlerFunc {
-	return UserConfigProxy()
+	return ResourceConfigProxy()
 }
 
 func UserTeamsProxy() gin.HandlerFunc {
-	return UserConfigProxy()
+	return ResourceConfigProxy()
 }
 
 func UserSkillsProxy() gin.HandlerFunc {
-	return UserConfigProxy()
+	return ResourceConfigProxy()
 }
 
 func UserToolsProxy() gin.HandlerFunc {
-	return UserConfigProxy()
+	return ResourceConfigProxy()
 }
 
 // UserMCPServersProxy 反代 /api/user/mcp-servers/* → lea-config 的 /mcp-servers/*。
@@ -171,7 +174,7 @@ func UserToolsProxy() gin.HandlerFunc {
 // 授权仍然在 lea-config 那一侧（require_actor + visible_to + _require_can_edit）；
 // 这里只做身份注入，跟另外三条完全一样。
 func UserMCPServersProxy() gin.HandlerFunc {
-	return UserConfigProxy()
+	return ResourceConfigProxy()
 }
 
 // UserMCPActionsProxy 反代 /api/user/mcp-actions/{id}/test → lea-tools 的

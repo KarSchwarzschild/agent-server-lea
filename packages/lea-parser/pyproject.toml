@@ -20,7 +20,11 @@ dependencies = [
     "PyMuPDF>=1.24",
     "langchain-text-splitters>=0.2",
     "boto3>=1.34",
+    "lea-authkit",
 ]
+
+[tool.uv.sources]
+lea-authkit = { workspace = true }
 
 [build-system]
 requires = ["hatchling"]

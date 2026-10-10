@@ -38,6 +38,8 @@ from lea_rag.server_kb import router as kb_router
 from lea_rag.server_memory import router as memory_router
 from lea_rag.server_user_kb import router as user_kb_router
 from lea_rag.server_user_memory import router as user_memory_router
+from lea_rag.server_governance import internal_router as governance_internal_router
+from lea_rag.server_governance import router as governance_router
 
 logger = structlog.get_logger()
 
@@ -150,6 +152,8 @@ app.include_router(admin_kb_router)
 app.include_router(admin_memory_router)
 app.include_router(user_kb_router)
 app.include_router(user_memory_router)
+app.include_router(governance_router)
+app.include_router(governance_internal_router)
 
 
 @app.get("/models")

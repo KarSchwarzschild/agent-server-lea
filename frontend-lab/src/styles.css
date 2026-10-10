@@ -5,7 +5,7 @@
 html,
 body,
 #app {
-  min-height: 100%;
+  height: 100%;
 }
 
 body {
@@ -32,7 +32,9 @@ textarea {
 .app-shell {
   display: grid;
   grid-template-columns: 300px minmax(0, 1fr) 76px;
-  min-height: 100vh;
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
 }
 
 .app-shell.inspector-visible {
@@ -44,6 +46,8 @@ textarea {
   flex-direction: column;
   gap: 18px;
   padding: 18px;
+  min-height: 0;
+  overflow: hidden;
   border-right: 1px solid #e5e5e5;
   background: #f7f7f8;
 }
@@ -273,6 +277,9 @@ textarea {
 
 .grow {
   flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .main-stage {
@@ -281,6 +288,9 @@ textarea {
   gap: 18px;
   padding: 22px;
   min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .topbar {
@@ -309,6 +319,7 @@ textarea {
 }
 
 .conversation-stage {
+  flex: 1;
   min-height: 0;
 }
 
@@ -316,7 +327,10 @@ textarea {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  min-height: 46vh;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 18px 0;
 }
 
@@ -407,8 +421,20 @@ textarea {
 .bubble header {
   display: flex;
   justify-content: space-between;
+  align-items: center;
   gap: 12px;
   margin-bottom: 8px;
+}
+
+.bubble-header-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.token-usage {
+  color: #9a9ba1;
+  white-space: nowrap;
 }
 
 .bubble p {
@@ -416,9 +442,100 @@ textarea {
   line-height: 1.65;
 }
 
+/* markdown-it 渲染出来的正文——见 App.vue 的 renderMarkdown。基础排版跟着
+   .bubble p 的行高走，块级元素（代码块/表格/列表）各给一点区分度，别让代码
+   看起来跟正文一个颜色。 */
+.markdown-body {
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+}
+
+.markdown-body > :first-child {
+  margin-top: 0;
+}
+
+.markdown-body > :last-child {
+  margin-bottom: 0;
+}
+
+.markdown-body p {
+  margin: 0 0 10px;
+}
+
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3,
+.markdown-body h4 {
+  margin: 16px 0 8px;
+  line-height: 1.4;
+}
+
+.markdown-body ul,
+.markdown-body ol {
+  margin: 0 0 10px;
+  padding-left: 22px;
+}
+
+.markdown-body li {
+  margin: 3px 0;
+}
+
+.markdown-body blockquote {
+  margin: 0 0 10px;
+  padding: 4px 12px;
+  border-left: 3px solid #d4d4d4;
+  color: #5d5e63;
+}
+
+.markdown-body code {
+  padding: 2px 5px;
+  border-radius: 4px;
+  background: #f0f0f0;
+  color: #a8222a;
+  font-family: 'SFMono-Regular', Consolas, monospace;
+  font-size: 0.9em;
+}
+
+/* 代码块（```）里的 <code> 已经在灰底容器里了，别再叠一层背景/描红——
+   跟上面行内 code 是两种场景，共用规则会变成一坨灰上加灰。 */
+.markdown-body pre {
+  margin: 0 0 10px;
+  padding: 10px 12px;
+  overflow-x: auto;
+  border-radius: 6px;
+  background: #f4f5f7;
+}
+
+.markdown-body pre code {
+  padding: 0;
+  background: transparent;
+  color: #3a3d44;
+}
+
+.markdown-body table {
+  margin: 0 0 10px;
+  border-collapse: collapse;
+  font-size: 0.95em;
+}
+
+.markdown-body th,
+.markdown-body td {
+  padding: 5px 10px;
+  border: 1px solid #e1e7ef;
+}
+
+.markdown-body th {
+  background: #f7f9fc;
+}
+
+.markdown-body a {
+  color: #2f6fed;
+}
+
 .composer {
   display: flex;
   flex-direction: column;
+  flex: 0 0 auto;
   gap: 10px;
   padding-top: 10px;
   border-top: 1px solid #e8e8e8;
@@ -452,6 +569,16 @@ textarea {
   border: 1px solid #e7e7e7;
   border-radius: 8px;
   background: #ffffff;
+}
+
+/* 整张卡片是"打开配置"的入口时给个指针提示 —— 不给的话没人知道卡片本身能点，
+   而我们刚把"编辑"按钮从卡片上撤掉了。 */
+.asset-card.clickable-card {
+  cursor: pointer;
+}
+
+.asset-card.clickable-card:hover {
+  border-color: #c9c9c9;
 }
 
 .asset-card p,
@@ -591,6 +718,14 @@ textarea {
   font-size: 12px;
 }
 
+.activity-heading.clickable {
+  cursor: pointer;
+}
+
+.activity-toggle-hint {
+  color: #9a9ba1;
+}
+
 .activity-heading strong {
   flex: 1;
 }
@@ -620,6 +755,27 @@ textarea {
   overflow-wrap: anywhere;
   font-size: 11px;
   line-height: 1.45;
+}
+
+/* AskUser 问题文本不该跟别的工具原始输出一样灰底小字——这是需要用户认真读
+   的一句问话，不是调试日志。 */
+.ask-user-question {
+  max-height: none;
+  margin: 6px 0 0 14px;
+  padding: 8px 10px;
+  color: #374151;
+  background: #f7f9fc;
+  border: 1px solid #e1e7ef;
+  border-radius: 6px;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.ask-user-candidates {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0 0 14px;
 }
 
 /* 沙箱卡片的三种块。靠背景色区分"输入 / 正常输出 / 错误输出"——
@@ -731,6 +887,7 @@ textarea {
   display: flex;
   flex-direction: column;
   gap: 12px;
+  min-height: 0;
   border-left: 1px solid #e5e5e5;
   background: #fafafa;
   overflow: hidden;
@@ -747,6 +904,26 @@ textarea {
 
 .inspector.open {
   padding: 16px;
+}
+
+/* 折叠态需要整列都能点，展开后它就不能继续占一整列高度，否则会把标题、页签和
+   内容全部推到右栏底部。展开态把它收成右上角的独立图标。 */
+.inspector.open .inspector-toggle {
+  position: absolute;
+  top: 12px;
+  right: 10px;
+  z-index: 1;
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+}
+
+.inspector.open .inspector-toggle:hover {
+  background: #eef0f2;
+}
+
+.inspector.open .inspector-header {
+  padding-right: 30px;
 }
 
 /* auto-fit 而不是写死列数：加一个页签就得回来改一次数字，忘了就挤成一坨。 */
@@ -900,7 +1077,12 @@ textarea {
 }
 
 .inspector-body {
+  flex: 1 1 auto;
+  min-height: 0;
   gap: 10px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: 2px;
 }
 
 .file-row {
@@ -998,6 +1180,19 @@ textarea {
   white-space: pre-wrap;
 }
 
+/* PDF/HTML 预览——两者都是甩给浏览器原生渲染（PDF viewer / iframe 文档），
+   给个跟 .image-preview 相近的框高，不需要额外的内容态样式，内容本身
+   （PDF 页面 / HTML 文档）自己管排版。 */
+.file-preview-frame {
+  display: block;
+  width: 100%;
+  height: 480px;
+  margin-top: 12px;
+  border: 1px solid #e7e7e7;
+  border-radius: 4px;
+  background: #ffffff;
+}
+
 .probe-row {
   display: grid;
   grid-template-columns: 110px minmax(0, 1fr);
@@ -1017,11 +1212,20 @@ textarea {
 
 @media (max-width: 760px) {
   .app-shell {
+    height: auto;
+    min-height: 100vh;
+    min-height: 100dvh;
+    overflow: visible;
     grid-template-columns: 1fr;
   }
 
   .sidebar {
     position: static;
+    overflow: visible;
+  }
+
+  .main-stage {
+    overflow: visible;
   }
 
   .asset-grid {

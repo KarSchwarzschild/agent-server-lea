@@ -78,14 +78,20 @@ class MCPServerEnable(BaseModel):
     enabled: bool
 
 
-def _to_dict(s: MCPServer) -> dict:
+def _to_dict(s: MCPServer, actor: Actor) -> dict:
     """行 → 响应。
 
     ⚠️ **auth_config 不出现在响应里**，只给一个布尔。它装的是发给远端的 bearer token
     或 api key；列表接口对整个租户可见，把 key 放进去等于任何能列 server 的人都能拿到
     它。写得进去、读不出来，跟 tool_credentials 的取向一致。
     """
-    return {
+    can_edit = (
+        s.owner_user_id == actor.user_id
+        if s.owner_scope == MCP_SCOPE_USER
+        else actor.is_platform_admin
+        or (actor.is_tenant_admin and s.tenant_id == actor.tenant_id)
+    )
+    result = {
         "id": s.id,
         "tenant_id": s.tenant_id,
         "name": s.name,
@@ -107,6 +113,17 @@ def _to_dict(s: MCPServer) -> dict:
         "last_error": s.last_error or "",
         "created_at": s.created_at.isoformat() if s.created_at else None,
     }
+    result["publication_status"] = (
+        "draft"
+        if s.owner_scope == MCP_SCOPE_USER
+        else ("active" if s.enabled else "suspended")
+    )
+    result["allowed_actions"] = ["read"]
+    if can_edit:
+        result["allowed_actions"].extend(["update", "delete", "run_check", "sync"])
+    if s.owner_scope == MCP_SCOPE_USER and can_edit:
+        result["allowed_actions"].append("submit_publication")
+    return result
 
 
 def _validate_transport(t: str) -> None:
@@ -246,7 +263,7 @@ def list_servers(
         q = q.filter((MCPServer.name.ilike(like)) | (MCPServer.description.ilike(like)))
     total = q.count()
     rows = q.order_by(MCPServer.id).offset((page - 1) * size).limit(size).all()
-    return {"total": total, "page": page, "size": size, "items": [_to_dict(s) for s in rows]}
+    return {"total": total, "page": page, "size": size, "items": [_to_dict(s, actor) for s in rows]}
 
 
 @router.get("/{mcp_id}")
@@ -256,7 +273,7 @@ def get_server(
     actor: Actor = Depends(require_actor),
 ):
     s = _load_visible(db, actor, mcp_id)
-    return _to_dict(s)
+    return _to_dict(s, actor)
 
 
 @router.post("", status_code=201)
@@ -289,7 +306,7 @@ def create_server(
     db.add(s)
     db.commit()
     db.refresh(s)
-    return _to_dict(s)
+    return _to_dict(s, actor)
 
 
 @router.post("/mine", status_code=201)
@@ -344,7 +361,7 @@ def create_my_server(
     db.add(s)
     db.commit()
     db.refresh(s)
-    return _to_dict(s)
+    return _to_dict(s, actor)
 
 
 @router.put("/{mcp_id}")
@@ -370,7 +387,7 @@ def update_server(
         setattr(s, k, v)
     db.commit()
     db.refresh(s)
-    return _to_dict(s)
+    return _to_dict(s, actor)
 
 
 @router.patch("/{mcp_id}/enable")
@@ -385,7 +402,7 @@ def toggle_enable(
     s.enabled = body.enabled
     db.commit()
     db.refresh(s)
-    return _to_dict(s)
+    return _to_dict(s, actor)
 
 
 @router.delete("/{mcp_id}", status_code=204)

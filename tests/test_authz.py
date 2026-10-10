@@ -122,6 +122,29 @@ def test_public_visibility_grants_read_not_write():
     assert can(bob_t1, DELETE, pub) is False
 
 
+def test_shared_visibility_grants_read_not_write():
+    """knowledge_bases 的 shared = 同租户可读。之前只认 public，同租户的 shared
+
+    库会被当成私有——这条钉住修复后的行为，且同样不给写权限。
+    """
+    shared = own(user="alice", visibility="shared")
+    assert can(bob_t1, READ, shared) is True
+    assert can(bob_t1, UPDATE, shared) is False
+    assert can(bob_t1, DELETE, shared) is False
+
+
+def test_shared_visibility_does_not_cross_tenant():
+    shared = own(user="alice", tenant=T1, visibility="shared")
+    assert can(alice_t2, READ, shared) is False
+
+
+def test_public_visibility_crosses_tenant_for_read_only():
+    public = own(user="alice", tenant=T1, visibility="public")
+    assert can(alice_t2, READ, public) is True
+    assert can(alice_t2, UPDATE, public) is False
+    assert can(alice_t2, DELETE, public) is False
+
+
 def test_others_private_is_invisible():
     assert can(bob_t1, READ, own(user="alice")) is False
 
@@ -214,6 +237,9 @@ def db():
         LegacyRow(id=2, tenant_id=T1, owner="alice", visibility="private"),
         LegacyRow(id=3, tenant_id=T1, owner="bob", visibility="private"),
         LegacyRow(id=4, tenant_id=T1, owner="bob", visibility="public"),
+        LegacyRow(id=5, tenant_id=T1, owner="bob", visibility="shared"),
+        # 另一租户的 shared 不该漏给 alice@T1 —— 复用同一个坏 user_id 套路。
+        LegacyRow(id=6, tenant_id=T2, owner="carol", visibility="shared"),
     ])
     s.commit()
     yield s
@@ -242,8 +268,15 @@ def test_scoped_filter_platform_admin_crosses_tenants(db):
 
 
 def test_scoped_filter_legacy_owner_and_visibility(db):
-    # 平台的(1) + 自己的(2) + 别人公开的(4)。不含 bob 私有的(3)。
-    assert _ids(db, LegacyRow, alice_t1) == [1, 2, 4]
+    # 平台的(1) + 自己的(2) + 别人公开的(4) + 别人共享的(5)。不含 bob 私有的(3)，
+    # 不含另一租户的共享(6)。
+    assert _ids(db, LegacyRow, alice_t1) == [1, 2, 4, 5]
+
+
+def test_scoped_filter_public_crosses_tenants(db):
+    db.add(LegacyRow(id=7, tenant_id=T2, owner="carol", visibility="public"))
+    db.commit()
+    assert _ids(db, LegacyRow, alice_t1) == [1, 2, 4, 5, 7]
 
 
 def test_scoped_filter_count_matches_rows(db):

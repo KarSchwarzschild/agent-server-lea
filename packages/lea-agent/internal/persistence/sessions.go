@@ -21,6 +21,22 @@ type SessionRow struct {
 	IsArchived   bool
 }
 
+// EnsureSession creates the ownership row without counting a message. Queued execution needs the
+// row before a worker on another pod can rebuild the session and verify its owner.
+func EnsureSession(ctx context.Context, db *sql.DB, sessionID, userID, tenantID string, projectID *int, activeAgentID int, firstMessage string) error {
+	if db == nil {
+		return nil
+	}
+	_, err := db.ExecContext(ctx,
+		`INSERT INTO chat_sessions
+		    (id, user_id, tenant_id, project_id, active_agent_id, title, app_name, message_count, is_archived)
+		 VALUES (?, ?, ?, ?, ?, ?, 'chat', 0, 0)
+		 ON DUPLICATE KEY UPDATE id = id`,
+		sessionID, userID, tenantID, projectID, activeAgentID, deriveTitle(firstMessage),
+	)
+	return err
+}
+
 // TouchSession 首次建行 / 后续 message_count++。
 // created_at / last_active_at 交给 MySQL 的 DEFAULT / ON UPDATE。
 //

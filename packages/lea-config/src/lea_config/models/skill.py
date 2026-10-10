@@ -8,7 +8,7 @@
     租户下可见  (t1,      platform, NULL)    t1 所有人
     所有人可见  (default, platform, NULL)    所有租户
 
-「上架」就是改这两三列，由 skill_publish_requests 走审核流程（见 models/skill_publish.py）。
+「上架」就是改这两三列，由 publication_requests 走通用审核流程。
 
 旧的 `scope` 列（private/system/public）由 migrations/014 删除 —— 它把归属和可见性
 压在一列里，而且跟归属列在现网数据上是矛盾的（6 个平台级 skill 的 scope 是 private，

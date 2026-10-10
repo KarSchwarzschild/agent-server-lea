@@ -16,6 +16,7 @@ import (
 	"gitlab.ouc-online.com.cn/aibase/agentloop/tools/websearch"
 	"github.com/sony/gobreaker"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/breaker"
+	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/metrics"
 )
 
 var toolsGatewayURL = getEnv("LEA_TOOLS_URL", "http://localhost:8400")
@@ -169,8 +170,10 @@ func ExecuteRemoteTool(ctx context.Context, toolName string, params map[string]a
 	}
 	req.Header.Set("X-User-Role", "user")
 
+	gatewayStart := time.Now()
 	resp, err := gatewayClient.Do(req)
 	if err != nil {
+		metrics.RecordDownstreamCall("tools", "error", time.Since(gatewayStart))
 		// 降级：网关不可达时返回用户友好的错误信息，不阻断对话
 		fmt.Printf("[gateway] %s gatewayClient.Do err: %v\n", toolName, err)
 		return tool.Result{Content: []tool.ResultContent{
@@ -210,6 +213,7 @@ func ExecuteRemoteTool(ctx context.Context, toolName string, params map[string]a
 	// 所以这里宁可把错误原样交给模型：它下一轮能自己纠正（换个工具、或者说查不到），
 	// 而"成功但空"这个信号会让它以为拿到了数据。
 	if resp.StatusCode >= 400 {
+		metrics.RecordDownstreamCall("tools", "error", time.Since(gatewayStart))
 		msg := strings.TrimSpace(detailText(result.Detail))
 		if msg == "" {
 			msg = strings.TrimSpace(result.Error)
@@ -227,6 +231,7 @@ func ExecuteRemoteTool(ctx context.Context, toolName string, params map[string]a
 	}
 
 	if result.Error != "" || result.Status == "error" {
+		metrics.RecordDownstreamCall("tools", "error", time.Since(gatewayStart))
 		errMsg := result.Error
 		if errMsg == "" {
 			errMsg = "tool execution failed"
@@ -238,10 +243,12 @@ func ExecuteRemoteTool(ctx context.Context, toolName string, params map[string]a
 	}
 
 	if result.Result != nil {
+		metrics.RecordDownstreamCall("tools", "ok", time.Since(gatewayStart))
 		return tool.Result{
 			Content: []tool.ResultContent{{Type: tool.ResultContentTypeJSON, Data: result.Result}},
 		}, nil
 	}
+	metrics.RecordDownstreamCall("tools", "ok", time.Since(gatewayStart))
 	return tool.Result{
 		Content: []tool.ResultContent{{Type: tool.ResultContentTypeText, Text: "ok"}},
 	}, nil

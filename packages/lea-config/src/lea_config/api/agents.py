@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -58,7 +59,9 @@ class AgentCreate(BaseModel):
     # admin 字段（普通用户忽略）
     model: str = ""
     temperature: int = 7
-    max_turns: int = 20
+    # 100 而不是 20：一次迭代 = 一次模型往返，多文件任务每写一个文件就吃掉一轮。
+    # 跟 lea-agent 的 config_loader.py 兜底值保持一致，那边有完整说明。
+    max_turns: int = 100
     max_tokens: int = 4096
     kb_mode: str = "tool"
     memory_mode: str = "always"
@@ -84,6 +87,12 @@ class AgentUpdate(BaseModel):
     memory_mode: Optional[str] = None
     timeout_seconds: Optional[int] = None
     enabled: Optional[bool] = None
+    # 乐观并发控制：前端读到这个 agent 时带出的 updated_at，原样传回来。
+    # 省略=不检查（旧客户端兼容，行为等同于改之前那种"后写覆盖前写"）。
+    # 带了就必须跟数据库当前值完全一致才允许更新——两个标签页同时打开同一个
+    # agent 的编辑面板，先保存的那次会把 updated_at 往前推，后保存的那次
+    # 这里核对不上，返回 409 而不是悄悄覆盖掉先保存的人的修改。
+    expected_updated_at: Optional[datetime] = None
 
 
 class DefaultAgentBody(BaseModel):
@@ -129,8 +138,26 @@ def _resolve_super_agent(db: Session, tenant_id: str) -> Agent | None:
     )
 
 
-def _agent_to_dict(agent: Agent, current_user_id: str | None) -> dict:
+def _agent_to_dict(agent: Agent, actor: Actor) -> dict:
     is_super = agent.is_system and agent.name == "super-agent"
+    can_edit = _is_admin(actor) or (
+        agent.owner_scope == OWNER_SCOPE_USER and agent.owner_user_id == actor.user_id
+    )
+    publication_status = (
+        "draft"
+        if agent.owner_scope == OWNER_SCOPE_USER
+        else ("active" if agent.enabled else "suspended")
+    )
+    visibility = (
+        "private"
+        if agent.owner_scope == OWNER_SCOPE_USER
+        else ("global" if agent.tenant_id == DEFAULT_TENANT_ID else "tenant")
+    )
+    allowed_actions = ["read"]
+    if can_edit:
+        allowed_actions.extend(["update", "delete"])
+    if agent.owner_scope == OWNER_SCOPE_USER and can_edit:
+        allowed_actions.append("submit_publication")
     return {
         "id": agent.id,
         "name": "Super Agent" if is_super else agent.name,
@@ -141,22 +168,38 @@ def _agent_to_dict(agent: Agent, current_user_id: str | None) -> dict:
         "category": agent.category or "general",
         "category_label": agent.category or "\u901a\u7528",
         "is_system": bool(agent.is_system),
+        "tenant_id": agent.tenant_id,
+        "owner_scope": agent.owner_scope,
+        "owner_user_id": agent.owner_user_id,
+        "created_by": agent.created_by,
+        "visibility": visibility,
+        "can_edit": can_edit,
         "is_mine": bool(
-            current_user_id
+            actor.user_id
             and agent.created_by
-            and agent.created_by == current_user_id
+            and agent.created_by == actor.user_id
         ),
         "is_enabled": bool(agent.enabled),
         "sort_order": agent.sort_order or 0,
         "model": agent.model or "",
         "temperature": agent.temperature or 7,
-        "max_turns": agent.max_turns or 20,
+        # 兜底 100，跟建库默认值和 lea-agent 的 config_loader.py 保持一致——
+        # 三处任一处不一样，就会出现"界面显示 20、实际按 100 跑"这种查不出来的错位。
+        "max_turns": agent.max_turns or 100,
         "max_tokens": agent.max_tokens or 4096,
         "kb_mode": agent.kb_mode or "tool",
         "memory_mode": agent.memory_mode or "always",
         "timeout_seconds": agent.timeout_seconds or 120,
         "allowed_skills": None,
         "example_questions": agent.example_questions or [],
+        # 乐观并发控制用——前端保存时原样带回来当 expected_updated_at。
+        # ISO 格式字符串，不是 datetime 对象：JSON 里没有 datetime 类型，
+        # 而 isoformat() 的字符串排序/相等比较跟底层时间戳完全对应，
+        # 服务端那边收到的还是解析成 datetime 之后按值比较，不依赖字符串
+        # 格式本身要多精确，只要来回不失真。
+        "updated_at": agent.updated_at.isoformat() if agent.updated_at else None,
+        "publication_status": publication_status,
+        "allowed_actions": allowed_actions,
     }
 
 
@@ -243,7 +286,7 @@ async def list_agents(
             .all()
         )
         rows = items
-        result: dict = {"total": total, "items": [_agent_to_dict(a, actor.user_id) for a in rows]}
+        result: dict = {"total": total, "items": [_agent_to_dict(a, actor) for a in rows]}
     else:
         rows = q.order_by(Agent.sort_order, Agent.id).limit(200).all()
         # scope 过滤（内存侧）
@@ -251,7 +294,7 @@ async def list_agents(
             rows = [a for a in rows if a.created_by == actor.user_id]
         elif scope == "system":
             rows = [a for a in rows if a.is_system]
-        result = {"items": [_agent_to_dict(a, actor.user_id) for a in rows]}
+        result = {"items": [_agent_to_dict(a, actor) for a in rows]}
 
     # 缓存普通用户的简单查询结果
     if use_cache:
@@ -302,10 +345,10 @@ def get_agent(
         agent = _resolve_super_agent(db, actor.tenant_id)
         if agent is None:
             raise HTTPException(404, "super-agent not seeded")
-        return _agent_to_dict(agent, actor.user_id)
+        return _agent_to_dict(agent, actor)
 
     agent = _get_agent_or_404(db, agent_id, actor)
-    return _agent_to_dict(agent, actor.user_id)
+    return _agent_to_dict(agent, actor)
 
 
 @router.post("", status_code=201)
@@ -347,7 +390,7 @@ async def create_agent(
     # \u5931\u6548\u7f13\u5b58
     await invalidate_agent_cache(actor.tenant_id)
 
-    return _agent_to_dict(agent, actor.user_id)
+    return _agent_to_dict(agent, actor)
 
 
 @router.put("/{agent_id}")
@@ -362,7 +405,24 @@ async def update_agent(
     agent = _get_agent_or_404(db, agent_id, actor)
     _require_mine(agent, actor)
 
-    for k, v in body.model_dump(exclude_unset=True).items():
+    fields = body.model_dump(exclude_unset=True)
+    expected = fields.pop("expected_updated_at", None)
+    # 乐观并发控制：expected 为 None 时不检查（旧客户端兼容）。带了就必须
+    # 跟数据库当前值完全一致，否则说明这期间有别的请求已经改过这一行——
+    # 不管是同一个人开了两个标签页，还是同一租户里两个人同时编辑，结果都
+    # 一样：谁的 updated_at 对不上，谁就该先刷新看最新内容，而不是让自己
+    # 那份旧数据把刚保存的改动悄悄覆盖掉。
+    #
+    # 比较用 replace(microsecond=...) 而不是直接 ==：MySQL 的 DATETIME
+    # 默认不存微秒，但 Python 的 datetime 解析 ISO 字符串时哪怕原串没有
+    # 微秒部分也会补 0，反而是路上多绕一圈（序列化又反序列化）可能引入的
+    # 微小误差被放大成"明明没人改过却报冲突"的假阳性，两边都截到秒更稳。
+    if expected is not None:
+        current = agent.updated_at.replace(microsecond=0) if agent.updated_at else None
+        if current != expected.replace(microsecond=0):
+            raise HTTPException(409, "该 Agent 已被修改，请刷新后重试")
+
+    for k, v in fields.items():
         setattr(agent, k, v)
     db.commit()
     db.refresh(agent)
@@ -370,7 +430,7 @@ async def update_agent(
     # \u5931\u6548\u7f13\u5b58
     await invalidate_agent_cache(actor.tenant_id)
 
-    return _agent_to_dict(agent, actor.user_id)
+    return _agent_to_dict(agent, actor)
 
 
 @router.delete("/{agent_id}")
@@ -569,7 +629,7 @@ def share_agent(
     # 幂等：已经共享就直接返回，不 400。共享是"达到某个状态"，重复调用该无害 ——
     # 前端重试、双击按钮都会走到这里。
     if agent.owner_scope == OWNER_SCOPE_PLATFORM:
-        return {"agent": _agent_to_dict(agent, actor.user_id), "warnings": []}
+        return {"agent": _agent_to_dict(agent, actor), "warnings": []}
 
     blockers, warnings = _share_blockers(db, agent)
     if blockers:
@@ -588,7 +648,7 @@ def share_agent(
     # 软提示跟着成功一起返回 —— 共享成功了，但"你有个私有知识库在里面"这件事用户
     # 仍然该知道。丢掉它等于让软提示只在失败时出现，而那时反而没人看。
     return {
-        "agent": _agent_to_dict(agent, actor.user_id),
+        "agent": _agent_to_dict(agent, actor),
         "warnings": [w.model_dump() for w in warnings],
     }
 
@@ -611,7 +671,7 @@ def unshare_agent(
     _require_mine(agent, actor)
 
     if agent.owner_scope == OWNER_SCOPE_USER:
-        return {"agent": _agent_to_dict(agent, actor.user_id)}  # 幂等，同 share
+        return {"agent": _agent_to_dict(agent, actor)}  # 幂等，同 share
 
     if not agent.created_by:
         raise HTTPException(
@@ -622,7 +682,7 @@ def unshare_agent(
     agent.owner_user_id = agent.created_by
     db.commit()
     db.refresh(agent)
-    return {"agent": _agent_to_dict(agent, actor.user_id)}
+    return {"agent": _agent_to_dict(agent, actor)}
 
 
 # ── Skill Bindings ─────────────────────────────────────────

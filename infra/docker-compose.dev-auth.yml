@@ -3,7 +3,7 @@
 # ⚠️ 指向替身的 gateway **等于没有鉴权** —— 替身对任何 token 都返回同一个用户和租户。
 # 只在本机用，别带到任何共享环境。
 #
-# 起：  uv run --no-sync python scripts/dev_gateway_stub.py     # 另开一个终端
+# 起：  uv run --no-sync python scripts/dev_gateway_stub.py --role admin  # 另开一个终端
 #       cd infra && docker compose -f docker-compose.yml -f docker-compose.dev-auth.yml up -d gateway
 # 撤：  cd infra && docker compose -f docker-compose.yml up -d --force-recreate gateway
 #

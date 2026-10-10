@@ -34,25 +34,41 @@ app.add_middleware(MetricsMiddleware)
 
 # Register routers — 统一资源路径，无 /admin 前缀
 from lea_config.api.agents import router as agents_router
+from lea_config.api.audit_events import router as audit_events_router
+from lea_config.api.console_context import router as console_context_router
 from lea_config.api.internal import router as internal_router
+from lea_config.api.internal_governance import router as internal_governance_router
 from lea_config.api.llm_models import router as llm_models_router
 from lea_config.api.mcp_servers import router as mcp_servers_router
 from lea_config.api.models import router as models_router
+from lea_config.api.publication_requests import router as publication_requests_router
+from lea_config.api.publication_resources import router as publication_resources_router
+from lea_config.api.publications import router as publications_router
+from lea_config.api.providers import router as providers_router
+from lea_config.api.resource_checks import router as resource_checks_router
+from lea_config.api.retrieval_models_public import router as retrieval_models_public_router
 from lea_config.api.skills import router as skills_router
 from lea_config.api.teams import router as teams_router
 from lea_config.api.tools import router as tools_router
-from lea_config.api.users import users_router, roles_router
 
 app.include_router(agents_router)          # /agents
 app.include_router(skills_router)          # /skills
 app.include_router(tools_router)           # /tools
 app.include_router(teams_router)           # /teams
 app.include_router(internal_router)        # /internal
-app.include_router(users_router)           # /users
-app.include_router(roles_router)           # /roles
+app.include_router(internal_governance_router)
+# 用户、角色由外部租户系统维护。本地旧模型保留用于兼容数据和迁移，但不再暴露 CRUD。
 app.include_router(models_router)          # /retrieval/models（embedding/reranker/vlm/asr，admin）
 app.include_router(llm_models_router)      # /llm-models（可选聊天模型，登录即可读）
+app.include_router(retrieval_models_public_router)  # /retrieval-models（embedding/reranker/vlm 选择器，登录即可读）
 app.include_router(mcp_servers_router)     # /mcp-servers
+app.include_router(publication_requests_router)  # /publication-requests
+app.include_router(publication_resources_router)
+app.include_router(publications_router)
+app.include_router(resource_checks_router)
+app.include_router(providers_router)
+app.include_router(audit_events_router)      # /audit-events
+app.include_router(console_context_router)
 
 
 @app.get("/health")

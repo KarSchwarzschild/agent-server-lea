@@ -8,6 +8,7 @@ import (
 
 	"github.com/gin-contrib/sse"
 	"github.com/gin-gonic/gin"
+	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/persistence"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/session"
 )
 
@@ -30,7 +31,7 @@ import (
 // 顺带修掉一个单副本就存在的 bug：老链路 POST 返 202 时 turn 已经在跑，客户端
 // 之后才 GET 订阅，而 broadcast 满了就丢、没有 buffer、没有 replay，所以这两步
 // 之间的 start 和头几个 delta 是直接丢的。这里 Subscribe 排在 Send 之前。
-func handleSendStream(mgr *session.Manager) gin.HandlerFunc {
+func handleSendStream(mgr *session.Manager, coordinator RunCoordinator) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req SendRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
@@ -65,6 +66,15 @@ func handleSendStream(mgr *session.Manager) gin.HandlerFunc {
 			c.JSON(500, gin.H{"error": err.Error()})
 			return
 		}
+		sess, err = applyRequestAttachments(c.Request.Context(), mgr, sess, req, c.GetString("tenant_id"), c.GetString("user_id"))
+		if err != nil {
+			c.JSON(500, gin.H{"error": err.Error()})
+			return
+		}
+		if coordinator != nil {
+			handleTemporalSendStream(c, coordinator, sess, req)
+			return
+		}
 
 		// Subscribe 必须在 Send 之前 —— 见上面关于丢头部事件的说明。
 		events := sess.Subscribe()
@@ -72,7 +82,8 @@ func handleSendStream(mgr *session.Manager) gin.HandlerFunc {
 
 		// Send 排在写响应头之前：一旦写了 200 + event-stream，状态码就定死了，
 		// 错误只能以 SSE 事件的形式告知客户端。趁还能返状态码先把它跑掉。
-		if err := sess.Send(req.Message, req.AttachmentIDs, req.planControl()); err != nil {
+		runID, err := sess.SendWithRun(req.Message, req.AttachmentIDs, req.planControl())
+		if err != nil {
 			// 这个 agent 是专家团，计划模式在团里跑不起来。400 而不是 500：
 			// 请求本身不成立，重试不会变好。
 			if errors.Is(err, session.ErrPlanModeUnsupported) {
@@ -83,6 +94,11 @@ func handleSendStream(mgr *session.Manager) gin.HandlerFunc {
 			// 打断，走不到这里）。409 而不是 500 —— 这是可预期的并发。
 			if errors.Is(err, session.ErrBusy) {
 				c.JSON(409, gin.H{"error": "a turn is already running for this session"})
+				return
+			}
+			// 会话已经被软删（另一个标签页点了"删除"）。见 handlers.go 同处的说明。
+			if errors.Is(err, persistence.ErrSessionArchived) {
+				c.JSON(410, gin.H{"error": "该对话已被删除", "code": "session_archived"})
 				return
 			}
 			c.JSON(500, gin.H{"error": err.Error()})
@@ -102,7 +118,7 @@ func handleSendStream(mgr *session.Manager) gin.HandlerFunc {
 		// 头要靠 Access-Control-Expose-Headers 和代理配置才读得到，而这两者失效
 		// 时是静默的 —— 丢了 session_id 等于丢了会话。带内事件走客户端已有的
 		// 那条解析路径，没有额外前提。
-		c.SSEvent("session", gin.H{"session_id": sess.ID()})
+		c.SSEvent("session", gin.H{"session_id": sess.ID(), "run_id": runID})
 		c.Writer.Flush()
 
 		pumpEvents(c, events, func() { onClientGone(sess, req.OnDisconnect) })

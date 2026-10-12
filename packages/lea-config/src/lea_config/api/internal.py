@@ -18,7 +18,9 @@ from lea_config.models.binding import (
     AgentToolBinding,
 )
 from lea_config.models.knowledge import KnowledgeBase
-from lea_config.models.llm_provider import LLMProvider
+from lea_config.models.llm_provider import LLMProvider, models_of, window_of
+from lea_config.models.llm_provider import tenant_first as provider_tenant_first
+from lea_config.models.llm_provider import visible_to as provider_visible_to
 from lea_config.models.mcp_server import MCPServer
 from lea_config.models.mcp_server import visible_to as mcp_visible_to
 from lea_config.models.skill import Skill
@@ -43,15 +45,12 @@ def _context_window_of(provider: LLMProvider, model_name: str) -> int:
     精确匹配模型名，不做前缀匹配。前缀匹配正是被换掉的那套（Go 里的
     contextWindowFor），它的毛病是模型名多一个后缀就静默落进缺省 —— 而"静默"是
     这一整轮改动要消灭的东西。宁可查不到走兜底，那条路径至少是明确的。
+
+    实现委托给 models/llm_provider.window_of：/llm-models 用的是同一个函数，
+    两边透出的窗口必须是同一个数。这个薄壳留着是因为本模块的调用点和注释都指着
+    这个名字。
     """
-    limits = provider.model_limits or {}
-    if not isinstance(limits, dict):
-        return 0
-    try:
-        return max(0, int(limits.get(model_name, 0)))
-    except (TypeError, ValueError):
-        # 配置里填了非数字。返 0 走兜底，不要让一次手滑把整个会话打挂。
-        return 0
+    return window_of(provider, model_name)
 
 
 def _resolve_super_agent(db: Session, tenant_id: str) -> Agent | None:
@@ -255,17 +254,20 @@ def get_agent_config(
         }
 
     # LLM Provider — 匹配 agent.model 对应的 provider
+    #
+    # 判据走 models/llm_provider.py 那一套，跟 /llm-models 共用。两边必须完全同形：
+    # 那个端点就是把这里的匹配结果投影给前端选择器，分叉的话用户会选到一个列表里
+    # 有、运行时却选不中的名字，请求悄悄走默认 provider。
     llm_config = {}
     model_name = agent.model or ""
     if model_name:
-        providers = db.query(LLMProvider).filter(
-            LLMProvider.tenant_id == agent.tenant_id,
-            LLMProvider.enabled == True,
-        ).all()
+        providers = provider_tenant_first(
+            db.query(LLMProvider).filter(*provider_visible_to(agent.tenant_id)).all(),
+            agent.tenant_id,
+        )
         matched = None
         for p in providers:
-            supported = [m.strip() for m in (p.models or "").split(",") if m.strip()]
-            if model_name in supported:
+            if model_name in models_of(p):
                 matched = p
                 break
         if not matched:

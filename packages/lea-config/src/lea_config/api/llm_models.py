@@ -30,7 +30,13 @@ from sqlalchemy.orm import Session
 
 from lea_authkit import Actor, require_actor
 from lea_config.database import get_db
-from lea_config.models.llm_provider import LLMProvider
+from lea_config.models.llm_provider import (
+    LLMProvider,
+    models_of,
+    tenant_first,
+    visible_to,
+    window_of,
+)
 
 router = APIRouter(prefix="/llm-models", tags=["llm-models"])
 
@@ -42,43 +48,37 @@ def list_chat_models(
 ):
     """列出当前租户能用的聊天模型。
 
-    ⚠️ 筛选判据必须跟 `internal.py` 解析 provider 时**一模一样**
-    （tenant_id 相等 + enabled=True + models 按逗号切分后精确匹配）。
-    两边分叉的话，这里会列出运行时其实选不中的模型 —— 用户选了它，请求却
-    悄悄走了默认 provider，比没有这个列表还糟。
+    ⚠️ 筛选判据必须跟 `internal.py` 解析 provider 时**一模一样**，所以两边都走
+    models/llm_provider.py 里那一套 visible_to / tenant_first / models_of /
+    window_of，不在这里重写条件。两边分叉的话，这里会列出运行时其实选不中的
+    模型 —— 用户选了它，请求却悄悄走了默认 provider，比没有这个列表还糟。
+
+    （原先两边各写一遍"tenant_id 严格相等"，于是也一起错了同一处：非 default
+    租户看到空列表。靠注释约束同形状不够，判据抽成函数才真的锁住。）
 
     context_window 为 0 表示 provider 没配这个模型的窗口，lea-agent 会走
-    保守兜底。原样透出 0 而不是塞个缺省值，理由同 `_context_window_of`：
-    两边各有一个缺省，它们迟早不一样。
+    保守兜底（32k）。原样透出 0 而不是塞个缺省值：两边各有一个缺省，它们迟早
+    不一样。
     """
-    providers = (
-        db.query(LLMProvider)
-        .filter(
-            LLMProvider.tenant_id == actor.tenant_id,
-            LLMProvider.enabled == True,  # noqa: E712
-        )
-        .all()
+    providers = tenant_first(
+        db.query(LLMProvider).filter(*visible_to(actor.tenant_id)).all(),
+        actor.tenant_id,
     )
 
     # 同名模型可能出现在多个 provider 里。按名字去重，保留**先匹配到的那个**
-    # —— internal.py 的匹配是 `for p in providers: ... break`，取的也是第一个。
-    # 这里若改成"后者覆盖前者"，列表显示的 provider 就会跟实际调用的不是同一个。
+    # —— internal.py 的匹配是 `for p in providers: ... break`，取的也是第一个，
+    # 且两边的顺序都由 tenant_first 定（本租户优先于 default）。这里若改成
+    # "后者覆盖前者"，列表显示的 provider 就会跟实际调用的不是同一个。
     seen: dict[str, dict] = {}
     for p in providers:
-        limits = p.model_limits if isinstance(p.model_limits, dict) else {}
-        for raw in (p.models or "").split(","):
-            name = raw.strip()
-            if not name or name in seen:
+        for name in models_of(p):
+            if name in seen:
                 continue
-            try:
-                window = max(0, int(limits.get(name, 0)))
-            except (TypeError, ValueError):
-                window = 0
             seen[name] = {
                 "name": name,
                 "provider": p.name,
                 "is_default": bool(p.is_default),
-                "context_window": window,
+                "context_window": window_of(p, name),
             }
 
     return {"items": sorted(seen.values(), key=lambda m: m["name"])}

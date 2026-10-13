@@ -1,5 +1,11 @@
 # 🐳 Docker 镜像重建 + 前端测试 + 接口文档更新
 
+> **停更提示（2026-10-13）**：本文停更在 2026-09-15，当时还没有 frontend-console，
+> 服务与镜像的对应关系也变了（现在 `agent-worker` 共用 `lea-agent:test`、
+> `retrieval-worker` 共用 `lea-rag:test`，漏重启会跑旧代码）。
+>
+> 测试服上的重建步骤以 `docs/TEST_SERVER_DEPLOY.md` 为准。
+
 **日期**: 2026-09-15  
 **目的**: 明确哪些服务需要重建、如何做前端测试、接口文档是否要改
 

@@ -1,5 +1,13 @@
 # 🎯 快速参考卡片
 
+> **停更提示（2026-10-13）**：本文停更在 2026-09-16。下面"关键文件位置"里列的
+> `CURRENT_STATUS.md`、`DEPLOYMENT_CHECKLIST.md`、`FINAL_SUMMARY.md` 等已移到
+> `docs/archive/`。
+>
+> 当前实际在用的部署路径：
+> - 测试服 → `docs/TEST_SERVER_DEPLOY.md`
+> - 生产 CCE/k8s → `infra/k8s/README.md`
+
 ## 📂 关键文件位置
 
 ### 配置文件（新建）

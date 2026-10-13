@@ -30,7 +30,8 @@ Nginx/Ingress 仍只做 HTTP 负载均衡，不负责把同一会话固定到某
 
 ## 客户端入口
 
-浏览器只访问 `lea-gateway:8080` 对应的 Ingress。它用外部 HS256 JWT 验签，随后：
+浏览器只访问 `lea-gateway:8080` 对应的 Ingress。它按 OIDC/JWKS 验签统一登录签发的
+RS256 JWT（issuer 见本节末），随后：
 
 ```text
 /api/chat/*、/api/sessions/*、/api/files/*  -> lea-agent

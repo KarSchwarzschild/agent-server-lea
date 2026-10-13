@@ -13,9 +13,10 @@ LEA Platform 是一个多服务智能教育平台，包含会话代理、配置�
 | lea-rag | packages/lea-rag | 8300 | 知识库和检索 |
 | lea-tools | packages/lea-tools | 8400 | 文件、沙箱和工具服务 |
 | lea-config | packages/lea-config | 8500 | 专家、团队和配置管理 |
-| frontend-user | frontend-user | 由网关或前端开发服务器提供 | 用户端 |
-| frontend-admin | frontend-admin | 由网关或前端开发服务器提供 | 管理端 |
-| frontend-lab | frontend-lab | 开发环境常用 9300 | 实验和调试前端 |
+| frontend-lab | frontend-lab | 开发常用 9300；测试服 8880 | **当前唯一的主前端**，新功能都做在这里 |
+| frontend-console | frontend-console | 测试服 8890 | 管理控制台：发布审批、审计 |
+| frontend-user | frontend-user | — | **已停用**，不要再改 |
+| frontend-admin | frontend-admin | — | **已停用**，不要再改 |
 
 服务之间依赖 MySQL、Redis、对象存储、Milvus，以及部分环境中的 Cube 沙箱。
 
@@ -23,13 +24,17 @@ LEA Platform 是一个多服务智能教育平台，包含会话代理、配置�
 
 ## 从哪里开始
 
-- START_HERE.md：生产部署快速导航。
-- QUICK_REFERENCE.md：常用命令、验证和回滚速查。
-- DEPLOYMENT_CHECKLIST.md：部署前后执行清单。
-- DEPLOYMENT_GUIDE.md：完整部署说明。
-- CURRENT_STATUS.md：当前状态和剩余事项。
-- infra/k8s/README.md：CCE/Kubernetes 部署说明。
+- **docs/TEST_SERVER_DEPLOY.md：测试服（202.205.160.9）部署手册 —— 当前实际在用的那条路径。**
+- **infra/k8s/README.md：CCE/Kubernetes 部署说明 —— 生产那条路径。**
+- docs/FRONTEND_API.md：前端接口真源（不要看 API_CONTRACT.md，那是老系统规格）。
 - docs/：接口、架构、测试和专项设计文档。
+
+根目录还剩 DEPLOYMENT_GUIDE.md、QUICK_REFERENCE.md、DOCKER_REBUILD_AND_TESTING.md
+三份，停更在 2026-09-16。里面的具体命令和清单仍有参考价值，但端口、服务清单和
+部署路径跟现状已经对不上，用之前先跟上面两份核对。
+
+另有 11 份 2026-09 的"生产就绪"系列文档已移到 `docs/archive/`，原因见
+`docs/archive/README.md`。
 
 ## 本地验证
 
@@ -38,7 +43,7 @@ LEA Platform 是一个多服务智能教育平台，包含会话代理、配置�
     docker compose -f infra/docker-compose.verify.yml up -d
     docker compose -f infra/docker-compose.verify.yml ps
 
-部署前应执行数据库迁移、检查 Redis 和网关配置，并按 DEPLOYMENT_CHECKLIST.md 完成健康检查、指标检查和 E2E 验证。不要只以容器 Running 作为上线依据。
+部署前应执行数据库迁移、检查 Redis 和网关配置，并完成健康检查、指标检查和 E2E 验证。不要只以容器 Running 作为上线依据。测试服的具体步骤见 docs/TEST_SERVER_DEPLOY.md。
 
 ## 环境变量
 

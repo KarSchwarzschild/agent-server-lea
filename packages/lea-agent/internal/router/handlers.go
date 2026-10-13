@@ -28,8 +28,10 @@ func InitMessageCache(cacheLayer *cache.Cache, db *sql.DB, redisClient *redis.Cl
 }
 
 type SendRequest struct {
-	SessionID     string  `json:"session_id"`
-	AgentID       int     `json:"agent_id"`
+	SessionID string `json:"session_id"`
+	AgentID   int    `json:"agent_id"`
+	// Model 是当前会话的临时模型选择，不会修改 Agent 的全局配置。
+	Model         string  `json:"model,omitempty"`
 	ProjectID     *int    `json:"project_id,omitempty"`
 	Message       string  `json:"message"`
 	AttachmentIDs []int64 `json:"attachment_ids"`
@@ -127,6 +129,7 @@ func applyRequestAttachments(
 	refreshed, err := mgr.GetOrCreate(ctx, session.Params{
 		SessionID: sess.ID(),
 		AgentID:   req.AgentID,
+		Model:     req.Model,
 		TenantID:  tenantID,
 		UserID:    userID,
 		ProjectID: req.ProjectID,
@@ -151,6 +154,7 @@ func handleSend(mgr *session.Manager, coordinator RunCoordinator) gin.HandlerFun
 		sess, err := mgr.GetOrCreate(c.Request.Context(), session.Params{
 			SessionID: req.SessionID,
 			AgentID:   req.AgentID,
+			Model:     req.Model,
 			TenantID:  tenantID,
 			UserID:    userID,
 			ProjectID: req.ProjectID,
@@ -235,6 +239,7 @@ func submitTemporalRun(ctx context.Context, coordinator RunCoordinator, sess *se
 		AttachmentIDs: req.AttachmentIDs,
 		PlanMode:      req.PlanMode,
 		PlanAction:    req.PlanAction,
+		Model:         req.Model,
 	})
 	cancel()
 	if err != nil {
@@ -486,8 +491,9 @@ func handleTurnStatus(mgr *session.Manager, coordinator RunCoordinator) gin.Hand
 func handleCreateSession(mgr *session.Manager) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req struct {
-			AgentID   *int `json:"agent_id,omitempty"`
-			ProjectID *int `json:"project_id,omitempty"`
+			AgentID   *int   `json:"agent_id,omitempty"`
+			ProjectID *int   `json:"project_id,omitempty"`
+			Model     string `json:"model,omitempty"`
 		}
 		// EOF = 没有 body，等价于 {}。其余解析错误仍然是 400：那是**格式坏了**，
 		// 静默当成缺省会把一个拼错的字段名变成"悄悄用了 super-agent"。
@@ -521,6 +527,7 @@ func handleCreateSession(mgr *session.Manager) gin.HandlerFunc {
 
 		sess, err := mgr.GetOrCreate(c.Request.Context(), session.Params{
 			AgentID:   agentID,
+			Model:     req.Model,
 			TenantID:  tenantID,
 			UserID:    userID,
 			ProjectID: req.ProjectID,
@@ -567,6 +574,7 @@ func handleListSessions(_ *session.Manager) gin.HandlerFunc {
 				"id":             r.ID,
 				"title":          r.Title,
 				"agent_id":       r.AgentID,
+				"model":          r.Model,
 				"project_id":     r.ProjectID,
 				"message_count":  r.MessageCount,
 				"last_active_at": r.LastActiveAt,

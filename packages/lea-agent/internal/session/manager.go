@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,6 +22,9 @@ import (
 type Params struct {
 	SessionID string
 	AgentID   int
+	// Model 是当前消息的会话级模型选择。空值沿用 Agent 默认模型；非空值
+	// 只影响本次会话运行时配置，不写回 Agent。
+	Model     string
 	TenantID  string
 	UserID    string
 	ProjectID *int
@@ -197,6 +201,20 @@ func (m *Manager) GetOrCreate(ctx context.Context, p Params) (*AgentSession, err
 			if !s.OwnedBy(p.TenantID, p.UserID) {
 				return nil, ErrForbidden
 			}
+			rebuildRequired := false
+			// 引擎在 Build 时固定模型。模型选择变更后，空闲会话可以直接重建；
+			// 若上一轮仍在运行，则让它完成并在下一次请求重新建，避免中途切模型。
+			requestedModel := strings.TrimSpace(p.Model)
+			if requestedModel != "" && s.cfg != nil && s.cfg.Model != requestedModel {
+				if !m.Drop(p.SessionID) {
+					s.MarkPendingRebuild()
+					s.Touch()
+					return s, nil
+				}
+				log.Printf("session_rebuild_needed session=%s reason=model_changed from=%s to=%s", p.SessionID, s.cfg.Model, requestedModel)
+				metrics.RecordSessionRebuild("model_changed")
+				rebuildRequired = true
+			}
 			// 挂载集合变了吗？变了就得重建 —— 引擎的工具数组在 engine.Build 那一刻
 			// 冻住，事后改不了。
 			//
@@ -206,13 +224,15 @@ func (m *Manager) GetOrCreate(ctx context.Context, p Params) (*AgentSession, err
 			// 于是"在 A 上挂载、在 B 上对话"时，B 手里还是旧的工具集。
 			//
 			// 放在归属校验**之后**：先确认这人有资格碰这个会话，再花一次查询。
-			if !m.attachmentsChanged(ctx, s, p) {
+			if !rebuildRequired && !m.attachmentsChanged(ctx, s, p) {
 				s.Touch()
 				return s, nil
 			}
-			log.Printf("session_rebuild_needed session=%s reason=attachments_changed", p.SessionID)
-			metrics.RecordSessionRebuild("attachments_changed")
-			if !m.Drop(p.SessionID) {
+			if !rebuildRequired {
+				log.Printf("session_rebuild_needed session=%s reason=attachments_changed", p.SessionID)
+				metrics.RecordSessionRebuild("attachments_changed")
+			}
+			if !rebuildRequired && !m.Drop(p.SessionID) {
 				// 正在跑一轮（或有 SSE 订阅者）—— 那个引擎对象正被占用，丢不得。
 				// 置标志让它本轮收尾时自己丢，这一轮继续用旧工具集：用户等着这轮的
 				// 结果，不该为了换工具集把它掐掉。
@@ -220,7 +240,7 @@ func (m *Manager) GetOrCreate(ctx context.Context, p Params) (*AgentSession, err
 				s.Touch()
 				return s, nil
 			}
-			// 丢掉了，落到下面走完整重建 —— 归属已经在上面验过，不必再查库。
+			// 丢掉了，或模型变化已经丢掉，落到下面走完整重建 —— 归属已经在上面验过。
 		} else if err := verifySessionOwner(ctx, p); err != nil {
 			// 内存里没有 —— 可能是别的副本在跑、可能本进程重启过、也可能这个
 			// session_id 压根不是调用方的。**必须查库确认归属才能往下走。**
@@ -234,6 +254,14 @@ func (m *Manager) GetOrCreate(ctx context.Context, p Params) (*AgentSession, err
 			// 返 200 并带出了受害者的历史。安全边界取决于负载均衡挑了谁 —— 而单副本
 			// 下永远命中上面那条内存分支，所以测不出来。
 			return nil, err
+		}
+	}
+	// 新进程、另一个副本或服务重启后内存里没有这段会话。请求没显式带模型时，
+	// 从 chat_sessions 恢复上次选择；老客户端也因此不会把会话悄悄切回 Agent 默认。
+	if p.SessionID != "" && strings.TrimSpace(p.Model) == "" {
+		db, err := persistence.DB()
+		if err == nil && db != nil {
+			p.Model = persistence.GetSessionModel(ctx, db, p.SessionID)
 		}
 	}
 
@@ -252,7 +280,7 @@ func (m *Manager) GetOrCreate(ctx context.Context, p Params) (*AgentSession, err
 	eff := m.agentToLoad(ctx, p)
 	p.AgentID = eff
 
-	cfg, err := runtime.LoadAgentConfig(ctx, eff, p.TenantID)
+	cfg, err := runtime.LoadAgentConfig(ctx, eff, p.TenantID, p.Model)
 	if err != nil {
 		if eff == 0 {
 			return nil, fmt.Errorf("load agent config: %w", err)
@@ -262,7 +290,7 @@ func (m *Manager) GetOrCreate(ctx context.Context, p Params) (*AgentSession, err
 		// NewAgentSession 直接报错，用户看到的是"会话开不了"而不是"少个专家"。
 		// 指纹仍按 eff 记（见 mergeSessionAttachments），所以列没变时不会每条消息反复重建。
 		log.Printf("active_agent_load_failed session=%s agent=%d err=%v —— 回退默认 super-agent", p.SessionID, eff, err)
-		cfg, err = runtime.LoadAgentConfig(ctx, 0, p.TenantID)
+		cfg, err = runtime.LoadAgentConfig(ctx, 0, p.TenantID, p.Model)
 		if err != nil {
 			return nil, fmt.Errorf("load fallback agent config: %w", err)
 		}

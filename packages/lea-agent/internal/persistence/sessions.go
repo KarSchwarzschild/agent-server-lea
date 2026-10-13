@@ -14,6 +14,7 @@ type SessionRow struct {
 	ID           string
 	Title        string
 	AgentID      *int
+	Model        string
 	ProjectID    *int
 	MessageCount int
 	LastActiveAt time.Time
@@ -23,16 +24,16 @@ type SessionRow struct {
 
 // EnsureSession creates the ownership row without counting a message. Queued execution needs the
 // row before a worker on another pod can rebuild the session and verify its owner.
-func EnsureSession(ctx context.Context, db *sql.DB, sessionID, userID, tenantID string, projectID *int, activeAgentID int, firstMessage string) error {
+func EnsureSession(ctx context.Context, db *sql.DB, sessionID, userID, tenantID string, projectID *int, activeAgentID int, model, firstMessage string) error {
 	if db == nil {
 		return nil
 	}
 	_, err := db.ExecContext(ctx,
 		`INSERT INTO chat_sessions
-		    (id, user_id, tenant_id, project_id, active_agent_id, title, app_name, message_count, is_archived)
-		 VALUES (?, ?, ?, ?, ?, ?, 'chat', 0, 0)
-		 ON DUPLICATE KEY UPDATE id = id`,
-		sessionID, userID, tenantID, projectID, activeAgentID, deriveTitle(firstMessage),
+		    (id, user_id, tenant_id, project_id, active_agent_id, model, title, app_name, message_count, is_archived)
+		 VALUES (?, ?, ?, ?, ?, NULLIF(?, ''), ?, 'chat', 0, 0)
+		 ON DUPLICATE KEY UPDATE model = COALESCE(NULLIF(VALUES(model), ''), model)`,
+		sessionID, userID, tenantID, projectID, activeAgentID, strings.TrimSpace(model), deriveTitle(firstMessage),
 	)
 	return err
 }
@@ -46,7 +47,7 @@ func EnsureSession(ctx context.Context, db *sql.DB, sessionID, userID, tenantID 
 // activeAgentID 只在**首次建行**时写进 active_agent_id —— 它是这个会话的"激活 agent"
 // 初值（"召唤"时首条消息带的那个 agent，或 0=默认）。之后切专家走
 // SetSessionActiveAgent，UPDATE 分支不碰它，免得每轮把用户中途切的专家又覆盖回请求带的值。
-func TouchSession(ctx context.Context, db *sql.DB, sessionID, userID, tenantID string, projectID *int, activeAgentID int, firstMessage string) error {
+func TouchSession(ctx context.Context, db *sql.DB, sessionID, userID, tenantID string, projectID *int, activeAgentID int, model, firstMessage string) error {
 	if db == nil {
 		return nil
 	}
@@ -55,9 +56,10 @@ func TouchSession(ctx context.Context, db *sql.DB, sessionID, userID, tenantID s
 	res, err := db.ExecContext(ctx,
 		`UPDATE chat_sessions
 		    SET message_count = COALESCE(message_count, 0) + 1,
+		        model = COALESCE(NULLIF(?, ''), model),
 		        last_active_at = NOW()
 		  WHERE id = ?`,
-		sessionID,
+		strings.TrimSpace(model), sessionID,
 	)
 	if err != nil {
 		return err
@@ -71,9 +73,9 @@ func TouchSession(ctx context.Context, db *sql.DB, sessionID, userID, tenantID s
 	title := deriveTitle(firstMessage)
 	_, err = db.ExecContext(ctx,
 		`INSERT INTO chat_sessions
-		    (id, user_id, tenant_id, project_id, active_agent_id, title, app_name, message_count, is_archived)
-		 VALUES (?, ?, ?, ?, ?, ?, 'chat', 1, 0)`,
-		sessionID, userID, tenantID, projectID, activeAgentID, title,
+		    (id, user_id, tenant_id, project_id, active_agent_id, model, title, app_name, message_count, is_archived)
+		 VALUES (?, ?, ?, ?, ?, NULLIF(?, ''), ?, 'chat', 1, 0)`,
+		sessionID, userID, tenantID, projectID, activeAgentID, strings.TrimSpace(model), title,
 	)
 	return err
 }
@@ -97,6 +99,22 @@ func GetSessionActiveAgent(ctx context.Context, db *sql.DB, sessionID string) in
 		return 0
 	}
 	return agentID
+}
+
+// GetSessionModel 返回这个会话最后实际使用的模型。空串表示尚未固化，调用方继续
+// 使用 Agent 默认模型。查询失败也返回空串，让聊天能力按原有默认路径降级。
+func GetSessionModel(ctx context.Context, db *sql.DB, sessionID string) string {
+	if db == nil || sessionID == "" {
+		return ""
+	}
+	var model sql.NullString
+	if err := db.QueryRowContext(ctx,
+		`SELECT NULLIF(TRIM(COALESCE(model, '')), '') FROM chat_sessions WHERE id = ?`,
+		sessionID,
+	).Scan(&model); err != nil || !model.Valid {
+		return ""
+	}
+	return model.String
 }
 
 // SetSessionActiveAgent 切换这个会话的激活 agent。agentID=0 表示回到默认 super-agent。
@@ -133,7 +151,8 @@ func ListSessions(ctx context.Context, db *sql.DB, tenantID, userID string, limi
 	// 会话列表/聊天头靠它显示"现在挂的是哪个专家"。0=默认 super-agent，用 NULLIF 归一成
 	// NULL，让前端拿到的 agent_id 语义跟以前一致（NULL = 没挂特定 agent）。
 	rows, err := db.QueryContext(ctx,
-		`SELECT id, project_id, COALESCE(title, ''), NULLIF(COALESCE(active_agent_id, 0), 0) AS agent_id, COALESCE(message_count, 0),
+		`SELECT id, project_id, COALESCE(title, ''), NULLIF(COALESCE(active_agent_id, 0), 0) AS agent_id,
+		        COALESCE(model, ''), COALESCE(message_count, 0),
 		        COALESCE(last_active_at, created_at), created_at, COALESCE(is_archived, 0)
 		   FROM chat_sessions
 		  WHERE tenant_id = ? AND user_id = ? AND COALESCE(is_archived, 0) = 0
@@ -151,7 +170,7 @@ func ListSessions(ctx context.Context, db *sql.DB, tenantID, userID string, limi
 		var s SessionRow
 		var projectID, agentID sql.NullInt64
 		var archived int
-		if err := rows.Scan(&s.ID, &projectID, &s.Title, &agentID, &s.MessageCount,
+		if err := rows.Scan(&s.ID, &projectID, &s.Title, &agentID, &s.Model, &s.MessageCount,
 			&s.LastActiveAt, &s.CreatedAt, &archived); err != nil {
 			return nil, err
 		}

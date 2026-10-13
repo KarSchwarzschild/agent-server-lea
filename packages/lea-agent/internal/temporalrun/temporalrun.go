@@ -35,6 +35,7 @@ type Input struct {
 	TenantID      string
 	UserID        string
 	AgentID       int
+	Model         string
 	ProjectID     *int
 	Message       string
 	AttachmentIDs []int64
@@ -166,6 +167,7 @@ func (c *Coordinator) dispatchPending(ctx context.Context) {
 			TenantID:      dispatch.TenantID,
 			UserID:        dispatch.UserID,
 			AgentID:       dispatch.AgentID,
+			Model:         dispatch.Request.Model,
 			ProjectID:     dispatch.ProjectID,
 			Message:       dispatch.Request.Message,
 			AttachmentIDs: dispatch.Request.AttachmentIDs,
@@ -252,6 +254,7 @@ func (a *Activities) Execute(ctx context.Context, input Input) error {
 	sess, err := a.Manager.GetOrCreate(ctx, session.Params{
 		SessionID: input.SessionID,
 		AgentID:   input.AgentID,
+		Model:     input.Model,
 		TenantID:  input.TenantID,
 		UserID:    input.UserID,
 		ProjectID: input.ProjectID,

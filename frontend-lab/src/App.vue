@@ -22,6 +22,7 @@ import {
   shareAgent,
   unshareAgent,
   createKnowledgeBase,
+  createMemory,
   createMcpServer,
   createTool,
   createTeam,
@@ -29,6 +30,7 @@ import {
   deleteTeam,
   addTeamMember,
   deleteKnowledgeDocument,
+  deleteMemory,
   deleteUserFile,
   downloadAttachment,
   downloadWorkspaceFile,
@@ -44,6 +46,7 @@ import {
   listTeamMembers,
   listKnowledgeBases,
   listKnowledgeDocuments,
+  listMemories,
   listSessions,
   listSkills,
   listTools,
@@ -79,6 +82,8 @@ import {
   deleteTool,
   updateKnowledgeBase,
   deleteKnowledgeBase,
+  updateMemory,
+  clearMemories,
   searchKnowledgeBase,
   bindAgentKnowledgeBase,
   bindAgentSkill,
@@ -95,7 +100,7 @@ import {
   type McpMarketItem,
   type SkillMarketItem,
   type ToolMarketItem, type ProjectItem,
-  type ShareCheck, type ShareBlocker, type ChatModel, type RetrievalModel, type PublishRequest
+  type ShareCheck, type ShareBlocker, type ChatModel, type RetrievalModel, type PublishRequest, type MemoryItem, type MemoryCategory, type MemoryScope
   , type AgentInfo, type AgentBindings, type KnowledgeBaseItem, type KnowledgeDocument, type KnowledgeSearchHit, type SessionAttachment, type TeamInfo, type TeamMember, type TenantItem
 } from './api'
 import {
@@ -104,6 +109,7 @@ import {
   AppsOutline,
   AttachOutline,
   BookOutline,
+  BulbOutline,
   ChatbubblesOutline,
   ChevronBackOutline,
   ChevronForwardOutline,
@@ -114,6 +120,7 @@ import {
   FolderOutline,
   LibraryOutline,
   PeopleOutline,
+  RefreshOutline,
   SearchOutline,
   SettingsOutline,
   TerminalOutline
@@ -133,7 +140,7 @@ import {
   type UploadFileInfo
 } from 'naive-ui'
 
-type NavKey = 'chat' | 'projects' | 'experts' | 'market' | 'knowledge' | 'tasks' | 'settings'
+type NavKey = 'chat' | 'projects' | 'experts' | 'market' | 'knowledge' | 'memories' | 'tasks' | 'settings'
 // library = 用户的长期文件库（跨会话）。跟 files 那页是两回事：files 是**当前会话**
 // 工作区里的东西，30 天就随会话回收；library 是长期留下来的。
 type InspectorTab = 'files' | 'library' | 'artifacts' | 'citations' | 'debug'
@@ -247,10 +254,11 @@ const navItems = [
   { key: 'experts', label: '专家', icon: PeopleOutline },
   { key: 'market', label: '市场', icon: CompassOutline },
   { key: 'knowledge', label: '知识库', icon: LibraryOutline },
+  { key: 'memories', label: '记忆', icon: BulbOutline },
   { key: 'settings', label: '设置', icon: SettingsOutline }
 ] as const
 
-const conversations = ref<{ id: string; title: string; meta: string; project_id?: number | null; agent_id?: number | null }[]>([])
+const conversations = ref<{ id: string; title: string; meta: string; project_id?: number | null; agent_id?: number | null; model?: string | null }[]>([])
 const projects = ref<ProjectItem[]>([])
 const expertItems = ref<AgentInfo[]>([])
 const teamItems = ref<TeamInfo[]>([])
@@ -264,7 +272,17 @@ const editingKnowledgeBaseId = ref<number | null>(null)
 const knowledgeSearchQuery = ref('')
 const knowledgeSearchResults = ref<KnowledgeSearchHit[]>([])
 const knowledgeSearchLoading = ref(false)
-const expertForm = ref({ name: '', description: '', category: 'general', soul_prompt: '', model: 'qwen3-max', skill_ids: [] as number[], mcp_ids: [] as number[], tool_ids: [] as number[], kb_ids: [] as number[] })
+const memories = ref<MemoryItem[]>([])
+const memoriesLoading = ref(false)
+const memoriesLoaded = ref(false)
+const memoryError = ref('')
+const memorySearch = ref('')
+const memoryCategory = ref<'all' | MemoryCategory>('all')
+const memoryScope = ref<'all' | MemoryScope>('all')
+const selectedMemoryId = ref<number | null>(null)
+const memoryEditorMode = ref<'create' | 'edit' | null>(null)
+const memoryForm = ref<{ content: string; category: MemoryCategory; importance: number; scope: MemoryScope }>({ content: '', category: 'fact', importance: 5, scope: 'global' })
+const expertForm = ref({ name: '', description: '', category: 'general', soul_prompt: '', model: 'qwen-plus', skill_ids: [] as number[], mcp_ids: [] as number[], tool_ids: [] as number[], kb_ids: [] as number[] })
 const teamFormOpen = ref(false)
 const editingTeamId = ref<number | null>(null)
 const teamForm = ref({ agent_id: 0, strategy: 'star', decomposer_prompt: '', synthesizer_prompt: '', max_subtasks: 5, member_ids: [] as number[] })
@@ -337,7 +355,7 @@ const mountPanelOpen = ref(false)
 const mountKind = ref<SessionAttachment['kind']>('skill')
 const mountSelection = ref(0)
 const modelPanelOpen = ref(false)
-const modelDraft = ref('qwen3-max')
+const modelDraft = ref('qwen-plus')
 // 可选聊天模型。取不到就是空数组 —— 选择器开着 tag，照样能手输，不影响用。
 const chatModels = ref<ChatModel[]>([])
 const modelOptions = computed(() => chatModels.value.map(model => ({
@@ -346,6 +364,18 @@ const modelOptions = computed(() => chatModels.value.map(model => ({
   label: model.is_default ? `${model.name}（${model.provider} · 默认）` : `${model.name}（${model.provider}）`,
   value: model.name
 })))
+const defaultChatModel = computed(() =>
+  chatModels.value.find(model => model.is_default)?.name || chatModels.value[0]?.name || 'qwen-plus'
+)
+
+function selectCurrentModel(value: unknown) {
+  const model = typeof value === 'string' ? value.trim() : ''
+  if (!model) return
+  modelDraft.value = model
+  const conversation = conversations.value.find(item => item.id === currentSessionId.value)
+  if (conversation) conversation.model = model
+  modelPanelOpen.value = false
+}
 
 async function loadChatModels() {
   try {
@@ -473,6 +503,153 @@ const apiForm = ref({
 })
 
 const activeTitle = computed(() => navItems.find(item => item.key === activeNav.value)?.label || '对话')
+const memoryCategoryOptions: { label: string; value: MemoryCategory }[] = [
+  { label: '事实', value: 'fact' },
+  { label: '偏好', value: 'preference' },
+  { label: '身份', value: 'identity' },
+  { label: '进展', value: 'progress' }
+]
+const memoryScopeOptions = computed<{ label: string; value: MemoryScope }[]>(() => [
+  { label: '平台级 · 跨 Agent', value: 'global' },
+  ...expertItems.value.map(expert => ({ label: `Agent · ${expert.name}`, value: `agent:${expert.id}` as MemoryScope }))
+])
+const selectedMemory = computed(() => memories.value.find(item => item.id === selectedMemoryId.value) || null)
+const filteredMemories = computed(() => {
+  const query = memorySearch.value.trim().toLowerCase()
+  return memories.value.filter(item => {
+    if (memoryCategory.value !== 'all' && item.category !== memoryCategory.value) return false
+    if (memoryScope.value !== 'all' && item.scope !== memoryScope.value) return false
+    return !query || item.content.toLowerCase().includes(query)
+  })
+})
+
+function memoryCategoryLabel(category: string) {
+  return memoryCategoryOptions.find(item => item.value === category)?.label || category
+}
+
+function memoryScopeLabel(scope: string) {
+  if (scope === 'global') return '平台级 · 跨 Agent'
+  const agentId = Number(scope.replace(/^agent:/, ''))
+  const expert = expertItems.value.find(item => item.id === agentId)
+  return expert ? `Agent · ${expert.name}` : (Number.isFinite(agentId) ? `Agent #${agentId}` : '未知范围')
+}
+
+function memoryScopeType(scope: string) {
+  return scope === 'global' ? 'success' : 'info'
+}
+
+function formatMemoryDate(value?: string | null) {
+  if (!value) return '时间未知'
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString()
+}
+
+function openNavigation(key: NavKey) {
+  activeNav.value = key
+  if (key === 'memories') void loadMemories()
+}
+
+async function loadMemories(force = false) {
+  if (memoriesLoading.value || (memoriesLoaded.value && !force)) return
+  memoriesLoading.value = true
+  memoryError.value = ''
+  try {
+    memories.value = await listMemories()
+    memoriesLoaded.value = true
+    if (selectedMemoryId.value && !memories.value.some(item => item.id === selectedMemoryId.value)) {
+      selectedMemoryId.value = null
+      memoryEditorMode.value = null
+    }
+  } catch (error) {
+    memoryError.value = error instanceof Error ? error.message : String(error)
+    requestLogs.value.unshift({ method: 'GET', path: '/api/user/memories', status: 'ERR', time: 0, body: memoryError.value })
+  } finally {
+    memoriesLoading.value = false
+  }
+}
+
+function startCreateMemory() {
+  selectedMemoryId.value = null
+  memoryForm.value = { content: '', category: 'fact', importance: 5, scope: 'global' }
+  memoryEditorMode.value = 'create'
+}
+
+function selectMemory(item: MemoryItem) {
+  selectedMemoryId.value = item.id
+  memoryEditorMode.value = null
+}
+
+function startEditMemory(item: MemoryItem) {
+  selectedMemoryId.value = item.id
+  memoryForm.value = { content: item.content, category: item.category, importance: item.importance || 5, scope: item.scope || 'global' }
+  memoryEditorMode.value = 'edit'
+}
+
+function cancelMemoryEdit() {
+  memoryEditorMode.value = null
+  if (!selectedMemoryId.value) selectedMemoryId.value = memories.value[0]?.id || null
+}
+
+async function saveMemory() {
+  const content = memoryForm.value.content.trim()
+  if (!content || submitBusyKey.value) return
+  submitBusyKey.value = 'memory-save'
+  memoryError.value = ''
+  const editingId = memoryEditorMode.value === 'edit' ? selectedMemoryId.value : null
+  try {
+    if (editingId) {
+      await updateMemory(editingId, { content, category: memoryForm.value.category, importance: memoryForm.value.importance, scope: memoryForm.value.scope })
+    } else {
+      const created = await createMemory({ content, category: memoryForm.value.category, importance: memoryForm.value.importance, scope: memoryForm.value.scope })
+      selectedMemoryId.value = created.id
+    }
+    memoryEditorMode.value = null
+    memoriesLoaded.value = false
+    await loadMemories(true)
+  } catch (error) {
+    memoryError.value = error instanceof Error ? error.message : String(error)
+    requestLogs.value.unshift({ method: editingId ? 'PUT' : 'POST', path: editingId ? `/api/user/memories/${editingId}` : '/api/user/memories', status: 'ERR', time: 0, body: memoryError.value })
+  } finally {
+    submitBusyKey.value = ''
+  }
+}
+
+async function removeMemory(item: MemoryItem) {
+  if (!window.confirm('删除这条记忆？后续对话将不再使用它。') || submitBusyKey.value) return
+  submitBusyKey.value = `memory-delete-${item.id}`
+  memoryError.value = ''
+  try {
+    await deleteMemory(item.id)
+    memories.value = memories.value.filter(memory => memory.id !== item.id)
+    if (selectedMemoryId.value === item.id) {
+      selectedMemoryId.value = memories.value[0]?.id || null
+      memoryEditorMode.value = null
+    }
+  } catch (error) {
+    memoryError.value = error instanceof Error ? error.message : String(error)
+    requestLogs.value.unshift({ method: 'DELETE', path: `/api/user/memories/${item.id}`, status: 'ERR', time: 0, body: memoryError.value })
+  } finally {
+    submitBusyKey.value = ''
+  }
+}
+
+async function removeAllMemories() {
+  if (!memories.value.length || !window.confirm('清空全部长期记忆？此操作无法撤销。') || submitBusyKey.value) return
+  submitBusyKey.value = 'memory-clear'
+  memoryError.value = ''
+  try {
+    await clearMemories()
+    memories.value = []
+    selectedMemoryId.value = null
+    memoryEditorMode.value = null
+  } catch (error) {
+    memoryError.value = error instanceof Error ? error.message : String(error)
+    requestLogs.value.unshift({ method: 'DELETE', path: '/api/user/memories', status: 'ERR', time: 0, body: memoryError.value })
+  } finally {
+    submitBusyKey.value = ''
+  }
+}
+
 function marketCategoryKey(category?: string) {
   return category || 'uncategorized'
 }
@@ -515,13 +692,14 @@ const modeConfigurations = computed(() => chatMode.value === 'expert'
   ? expertItems.value.map(expert => ({ value: `agent:${expert.id}`, label: expert.name }))
   : teamItems.value.map(team => ({ value: `team:${team.id}`, label: team.name || `专家团 #${team.id}` })))
 
-function sessionRow(session: { id: string; title: string; message_count: number; last_active_at: string; project_id?: number | null; agent_id?: number | null }) {
+function sessionRow(session: { id: string; title: string; message_count: number; last_active_at: string; project_id?: number | null; agent_id?: number | null; model?: string | null }) {
   return {
     id: session.id,
     title: session.title || '未命名会话',
     meta: `${session.message_count} 条消息 · ${new Date(session.last_active_at).toLocaleString()}`,
     project_id: session.project_id,
-    agent_id: session.agent_id
+    agent_id: session.agent_id,
+    model: session.model
   }
 }
 
@@ -533,7 +711,7 @@ async function refreshSessionList() {
 function upsertConversation(sessionId: string, projectId = selectedProjectId.value || null) {
   const existing = conversations.value.find(item => item.id === sessionId)
   if (existing) return existing
-  const item = { id: sessionId, title: '新对话', meta: '正在同步…', project_id: projectId, agent_id: agentId.value || null }
+  const item = { id: sessionId, title: '新对话', meta: '正在同步…', project_id: projectId, agent_id: agentId.value || null, model: modelDraft.value }
   conversations.value.unshift(item)
   return item
 }
@@ -545,7 +723,7 @@ async function loadWorkspace() {
       const agents = Array.isArray(agentResult.value) ? agentResult.value : agentResult.value.items || []
       expertItems.value = agents
       if (agents[0]) {
-        modelDraft.value = agents[0].model || 'qwen3-max'
+        modelDraft.value = agents[0].model || defaultChatModel.value
         teamForm.value.agent_id = agents[0].id
       }
     }
@@ -576,14 +754,14 @@ async function loadWorkspace() {
 // 留下的 editingExpertId 会让"创建"变成又改一遍那个专家。跟知识库那边同一个套路。
 function openCreateExpertForm() {
   editingExpertId.value = null
-  expertForm.value = { name: '', description: '', category: 'general', soul_prompt: '', model: 'qwen3-max', skill_ids: [], mcp_ids: [], tool_ids: [], kb_ids: [] }
+  expertForm.value = { name: '', description: '', category: 'general', soul_prompt: '', model: defaultChatModel.value, skill_ids: [], mcp_ids: [], tool_ids: [], kb_ids: [] }
   expertFormOpen.value = true
 }
 
 function closeExpertForm() {
   expertFormOpen.value = false
   editingExpertId.value = null
-  expertForm.value = { name: '', description: '', category: 'general', soul_prompt: '', model: 'qwen3-max', skill_ids: [], mcp_ids: [], tool_ids: [], kb_ids: [] }
+  expertForm.value = { name: '', description: '', category: 'general', soul_prompt: '', model: defaultChatModel.value, skill_ids: [], mcp_ids: [], tool_ids: [], kb_ids: [] }
 }
 
 async function createMarketExpert() {
@@ -638,7 +816,7 @@ async function editExpert(expert: AgentInfo) {
     description: expert.description || '',
     category: expert.category || 'general',
     soul_prompt: expert.soul_prompt || '',
-    model: expert.model || 'qwen3-max',
+    model: expert.model || defaultChatModel.value,
     skill_ids: [], mcp_ids: [], tool_ids: [], kb_ids: []
   }
   expertFormOpen.value = true
@@ -836,7 +1014,7 @@ function startWithConfiguration(configuration: AgentInfo | TeamInfo) {
   const nextAgentId = 'agent_id' in configuration ? configuration.agent_id : configuration.id
   agentId.value = nextAgentId
   selectedTeamId.value = 'agent_id' in configuration ? configuration.id : null
-  modelDraft.value = expertItems.value.find(expert => expert.id === nextAgentId)?.model || 'qwen3-max'
+  modelDraft.value = expertItems.value.find(expert => expert.id === nextAgentId)?.model || defaultChatModel.value
   configurationSelection.value = 'agent_id' in configuration ? `team:${configuration.id}` : `agent:${configuration.id}`
   currentSessionId.value = ''
   selectedConversation.value = ''
@@ -858,7 +1036,7 @@ function startWithConfiguration(configuration: AgentInfo | TeamInfo) {
 function previewConfiguration(agent: AgentInfo | TeamInfo | null) {
   const nextAgentId = agent && 'agent_id' in agent ? agent.agent_id : agent?.id || 0
   agentId.value = nextAgentId
-  modelDraft.value = expertItems.value.find(expert => expert.id === nextAgentId)?.model || 'qwen3-max'
+  modelDraft.value = expertItems.value.find(expert => expert.id === nextAgentId)?.model || defaultChatModel.value
   selectedTeamId.value = agent && 'agent_id' in agent ? agent.id : null
   chatMode.value = agent && 'agent_id' in agent ? 'team' : agent ? 'expert' : 'default'
 }
@@ -1883,7 +2061,7 @@ async function openSession(sessionId: string) {
     configurationSelection.value = selectedTeamId.value
       ? `team:${selectedTeamId.value}`
       : agentId.value ? `agent:${agentId.value}` : 'default'
-    modelDraft.value = expertItems.value.find(item => item.id === agentId.value)?.model || 'qwen3-max'
+    modelDraft.value = conversation?.model || expertItems.value.find(item => item.id === agentId.value)?.model || defaultChatModel.value
     const result = await getMessages(sessionId)
     // 陈旧响应丢弃：这一步之后还有好几步要写共享状态（消息列表、附件、
     // 工作区文件，最后甚至会去接一条正在直播的 SSE 流），任何一步都可能
@@ -1979,7 +2157,7 @@ async function removeConversation(sessionId: string) {
 
 async function ensureCurrentSession() {
   if (currentSessionId.value) return currentSessionId.value
-  const result = await createSession(agentId.value, selectedProjectId.value || undefined)
+  const result = await createSession(agentId.value, selectedProjectId.value || undefined, modelDraft.value.trim() || undefined)
   currentSessionId.value = result.session_id
   selectedConversation.value = result.session_id
   upsertConversation(result.session_id)
@@ -2060,24 +2238,6 @@ async function unmountResource(resource: SessionAttachment) {
     sessionAttachments.value = sessionAttachments.value.filter(item => !(item.kind === resource.kind && item.ref_id === resource.ref_id))
   } catch (error) {
     requestLogs.value.unshift({ method: 'DELETE', path: `/api/sessions/${currentSessionId.value}/attachments/${resource.kind}/${resource.ref_id}`, status: 'ERR', time: 0, body: error instanceof Error ? error.message : String(error) })
-  }
-}
-
-async function saveCurrentModel() {
-  if (!agentId.value || !modelDraft.value.trim() || submitBusyKey.value) return
-  submitBusyKey.value = 'model-save'
-  try {
-    const updated = await updateAgent(agentId.value, { model: modelDraft.value.trim() })
-    const index = expertItems.value.findIndex(item => item.id === updated.id)
-    if (index >= 0) expertItems.value[index] = { ...expertItems.value[index], ...updated }
-    modelPanelOpen.value = false
-    await newConversation()
-  } catch (error) {
-    requestLogs.value.unshift({ method: 'PUT', path: `/api/user/agents/${agentId.value}`, status: 'ERR', time: 0, body: error instanceof Error ? error.message : String(error) })
-    inspectorOpen.value = true
-    inspectorTab.value = 'debug'
-  } finally {
-    submitBusyKey.value = ''
   }
 }
 
@@ -2220,7 +2380,7 @@ async function sendChatMessage(value: string, planAction = '') {
   resumeAttempts = 0
   resumeAvailable.value = false
   try {
-    stopCurrentStream = await sendMessageStream({ session_id: currentSessionId.value || undefined, agent_id: agentId.value, project_id: selectedProjectId.value || undefined, message: value, attachment_ids: attachmentIds.value, plan_mode: planAction ? false : chatMode.value === 'plan', plan_action: planAction, attachments: attachmentsPayload }, event => applyChatEvent(assistant, event))
+    stopCurrentStream = await sendMessageStream({ session_id: currentSessionId.value || undefined, agent_id: agentId.value, project_id: selectedProjectId.value || undefined, message: value, model: modelDraft.value.trim() || undefined, attachment_ids: attachmentIds.value, plan_mode: planAction ? false : chatMode.value === 'plan', plan_action: planAction, attachments: attachmentsPayload }, event => applyChatEvent(assistant, event))
     // 挂载的整体替换是后端在处理这条消息时原子完成的（跟这次 fetch 是同一个
     // 请求），走到这里说明已经落库——把暂存的转成已确认，跟服务端同步一次
     // 用来刷新 chip 显示，不影响已经在跑的这一轮。
@@ -2833,7 +2993,7 @@ function escapeHtml(text: string): string {
             v-for="item in navItems"
             :key="item.key"
             :class="{ active: activeNav === item.key }"
-            @click="activeNav = item.key"
+            @click="openNavigation(item.key)"
           >
             <n-icon :component="item.icon" />
             <span>{{ item.label }}</span>
@@ -3024,12 +3184,12 @@ function escapeHtml(text: string): string {
             </div>
             <div v-if="modelPanelOpen" class="session-config-panel composer-panel">
               <!-- tag 打开 = 列表里没有的名字仍然能手输。租户没配 llm_providers 时
-                   列表是空的，纯下拉会让"设置模型"这件事彻底做不了。 -->
+                   列表是空的，纯下拉会让"选择模型"这件事彻底做不了。 -->
               <n-select
-                v-model:value="modelDraft" :options="modelOptions" filterable tag
+                :value="modelDraft" :options="modelOptions" filterable tag
                 placeholder="选择或输入模型名称" style="min-width: 240px"
+                @update:value="selectCurrentModel"
               />
-              <n-button type="primary" :loading="submitBusyKey === 'model-save'" :disabled="!!submitBusyKey" @click="saveCurrentModel">保存模型</n-button>
               <small v-if="!chatModels.length" class="toolbar-label">没读到可选模型列表，可直接输入名称。</small>
             </div>
             <div v-if="mountPanelOpen" class="session-config-panel mount-panel composer-panel">
@@ -3408,6 +3568,118 @@ function escapeHtml(text: string): string {
               </template>
             </div>
           </n-modal>
+        </section>
+
+        <section v-else-if="activeNav === 'memories'" class="content-board memory-board">
+          <div class="memory-toolbar">
+            <div>
+              <h2>我的长期记忆</h2>
+              <p>{{ memories.length }} 条内容会在相关对话中用于个性化回答</p>
+            </div>
+            <div class="memory-toolbar-actions">
+              <n-button quaternary circle title="刷新记忆" :loading="memoriesLoading" @click="loadMemories(true)">
+                <template #icon><n-icon :component="RefreshOutline" /></template>
+              </n-button>
+              <n-button type="primary" @click="startCreateMemory">
+                <template #icon><n-icon :component="Add" /></template>
+                新增记忆
+              </n-button>
+            </div>
+          </div>
+
+          <div class="memory-filters">
+            <n-input v-model:value="memorySearch" clearable placeholder="搜索记忆内容" />
+            <n-select
+              v-model:value="memoryCategory"
+              :options="[{ label: '全部分类', value: 'all' }, ...memoryCategoryOptions]"
+              aria-label="按记忆分类筛选"
+            />
+            <n-select
+              v-model:value="memoryScope"
+              :options="[{ label: '全部范围', value: 'all' }, ...memoryScopeOptions]"
+              aria-label="按记忆范围筛选"
+            />
+          </div>
+
+          <p v-if="memoryError" class="memory-error">{{ memoryError }}</p>
+
+          <div class="memory-workbench">
+            <div class="memory-list" aria-label="长期记忆列表">
+              <div v-if="memoriesLoading && !memoriesLoaded" class="memory-empty">正在读取记忆...</div>
+              <div v-else-if="!filteredMemories.length" class="memory-empty">
+                <n-icon :component="BulbOutline" />
+                <strong>{{ memories.length ? '没有匹配的记忆' : '还没有长期记忆' }}</strong>
+                <span>{{ memories.length ? '调整搜索词或分类筛选。' : '对话会自动提取，你也可以手动添加。' }}</span>
+              </div>
+              <template v-else>
+                <button
+                  v-for="item in filteredMemories"
+                  :key="item.id"
+                  class="memory-row"
+                  :class="{ active: selectedMemoryId === item.id }"
+                  @click="selectMemory(item)"
+                >
+                  <span class="memory-row-top">
+                    <span class="memory-row-tags">
+                      <n-tag size="tiny" :bordered="false">{{ memoryCategoryLabel(item.category) }}</n-tag>
+                      <n-tag size="tiny" :bordered="false" :type="memoryScopeType(item.scope)">{{ memoryScopeLabel(item.scope) }}</n-tag>
+                    </span>
+                    <small>重要度 {{ item.importance }}/10</small>
+                  </span>
+                  <strong>{{ item.content }}</strong>
+                  <span class="memory-row-meta">{{ formatMemoryDate(item.created_at) }} · 使用 {{ item.access_count || 0 }} 次</span>
+                </button>
+              </template>
+            </div>
+
+            <div class="memory-detail">
+              <template v-if="memoryEditorMode">
+                <div class="memory-detail-header">
+                  <div><small>{{ memoryEditorMode === 'create' ? 'NEW MEMORY' : 'EDIT MEMORY' }}</small><h3>{{ memoryEditorMode === 'create' ? '新增记忆' : '编辑记忆' }}</h3></div>
+                </div>
+                <div class="memory-form">
+                  <label><span>记忆内容</span><n-input v-model:value="memoryForm.content" type="textarea" placeholder="例如：我偏好先看结论，再看详细推导。" :autosize="{ minRows: 6, maxRows: 14 }" maxlength="4000" show-count /></label>
+                  <div class="memory-form-grid">
+                    <label><span>分类</span><n-select v-model:value="memoryForm.category" :options="memoryCategoryOptions" /></label>
+                    <label><span>重要度</span><n-input-number v-model:value="memoryForm.importance" :min="1" :max="10" /></label>
+                  </div>
+                  <label><span>记忆范围</span><n-select v-model:value="memoryForm.scope" :options="memoryScopeOptions" /></label>
+                  <div class="card-actions">
+                    <n-button type="primary" :loading="submitBusyKey === 'memory-save'" :disabled="!memoryForm.content.trim() || !!submitBusyKey" @click="saveMemory">{{ memoryEditorMode === 'create' ? '添加记忆' : '保存修改' }}</n-button>
+                    <n-button quaternary :disabled="submitBusyKey === 'memory-save'" @click="cancelMemoryEdit">取消</n-button>
+                  </div>
+                </div>
+              </template>
+
+              <template v-else-if="selectedMemory">
+                <div class="memory-detail-header">
+                  <div><small>MEMORY #{{ selectedMemory.id }}</small><h3>{{ memoryCategoryLabel(selectedMemory.category) }}</h3></div>
+                  <n-tag :bordered="false">重要度 {{ selectedMemory.importance }}/10</n-tag>
+                </div>
+                <p class="memory-content">{{ selectedMemory.content }}</p>
+                <dl class="memory-metadata">
+                  <div><dt>记忆范围</dt><dd>{{ memoryScopeLabel(selectedMemory.scope) }}</dd></div>
+                  <div><dt>创建时间</dt><dd>{{ formatMemoryDate(selectedMemory.created_at) }}</dd></div>
+                  <div><dt>被使用</dt><dd>{{ selectedMemory.access_count || 0 }} 次</dd></div>
+                </dl>
+                <div class="card-actions memory-detail-actions">
+                  <n-button secondary @click="startEditMemory(selectedMemory)">编辑</n-button>
+                  <n-button type="error" quaternary :loading="submitBusyKey === `memory-delete-${selectedMemory.id}`" :disabled="!!submitBusyKey" @click="removeMemory(selectedMemory)">删除</n-button>
+                </div>
+              </template>
+
+              <div v-else class="memory-detail-empty">
+                <n-icon :component="BulbOutline" />
+                <h3>选择一条记忆</h3>
+                <p>你可以检查 AI 记住了什么，并随时修正或删除。</p>
+              </div>
+            </div>
+          </div>
+
+          <div class="memory-footer">
+            <span>只显示当前账号在当前租户下的记忆。</span>
+            <n-button type="error" quaternary size="small" :loading="submitBusyKey === 'memory-clear'" :disabled="!memories.length || !!submitBusyKey" @click="removeAllMemories">清空全部记忆</n-button>
+          </div>
         </section>
 
         <section v-else-if="activeNav === 'projects'" class="content-board">

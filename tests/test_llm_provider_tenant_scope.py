@@ -157,6 +157,12 @@ def resolved_llm(client, agent_id: int) -> dict:
     return res.json()["llm"]
 
 
+def resolved_config(client, agent_id: int, model: str) -> dict:
+    res = client.get(f"/internal/agent-config/{agent_id}", params={"model": model})
+    assert res.status_code == 200, res.text
+    return res.json()
+
+
 # ── 主缺口 ────────────────────────────────────────────────────────────
 
 
@@ -198,6 +204,29 @@ def test_non_default_tenant_resolves_window_not_env_fallback(client):
     llm = resolved_llm(client, agent_id)
     assert llm.get("model_context_window") == 128000
     assert llm.get("llm_base_url") == "https://tenant_qwen.example.com/v1"
+
+
+def test_session_model_override_selects_provider_without_mutating_agent(client):
+    seed_provider(
+        client, "platform",
+        tenant=DEFAULT_TENANT_ID,
+        models="qwen-plus,glm-4-plus",
+        limits={"qwen-plus": 128000, "glm-4-plus": 64000},
+        is_default=True,
+    )
+    agent_id = seed_agent(client, "expert", tenant=T1, model="qwen-plus")
+
+    config = resolved_config(client, agent_id, "glm-4-plus")
+    assert config["agent"]["model"] == "glm-4-plus"
+    assert config["llm"]["model_context_window"] == 64000
+
+    db = client.Session()
+    try:
+        from lea_config.models.agent import Agent
+
+        assert db.get(Agent, agent_id).model == "qwen-plus"
+    finally:
+        db.close()
 
 
 # ── 两个消费者必须同意 ─────────────────────────────────────────────────

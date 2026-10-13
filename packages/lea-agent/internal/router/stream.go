@@ -42,6 +42,7 @@ func handleSendStream(mgr *session.Manager, coordinator RunCoordinator) gin.Hand
 		sess, err := mgr.GetOrCreate(c.Request.Context(), session.Params{
 			SessionID: req.SessionID,
 			AgentID:   req.AgentID,
+			Model:     req.Model,
 			TenantID:  c.GetString("tenant_id"),
 			UserID:    c.GetString("user_id"),
 			ProjectID: req.ProjectID,

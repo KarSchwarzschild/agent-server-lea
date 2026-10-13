@@ -195,29 +195,55 @@ class MemoryService:
                     id=r.id, content=r.content, category=r.category or "fact",
                     importance=r.importance or 5, access_count=r.access_count or 0,
                     created_at=r.created_at, score=0.0,
+                    scope=getattr(r, "scope", None) or "global",
                 )
                 for r in rows
             ]
         finally:
             db.close()
 
-    async def update(self, memory_id: int, content: str | None = None, category: str | None = None) -> bool:
-        """更新记忆内容或类别。内容变更时重新同步向量。"""
+    async def update(
+        self,
+        memory_id: int,
+        content: str | None = None,
+        category: str | None = None,
+        importance: int | None = None,
+        scope: str | None = None,
+        *,
+        user_id: str | None = None,
+        tenant_id: str | None = None,
+    ) -> bool:
+        """更新记忆内容、类别或范围；影响检索的字段变化时重建向量。"""
         from lea_rag.db.models import UserMemory
 
         db = self._get_db()
         try:
-            mem = db.query(UserMemory).filter(UserMemory.id == memory_id).first()
+            query = db.query(UserMemory).filter(UserMemory.id == memory_id)
+            if user_id is not None:
+                query = query.filter(UserMemory.user_id == user_id)
+            if tenant_id is not None:
+                query = query.filter(UserMemory.tenant_id == tenant_id)
+            mem = query.first()
             if not mem:
                 return False
             if content is not None:
                 mem.content = content
-                mem.embedding_synced = False
             if category is not None:
                 mem.category = category
+            if importance is not None:
+                mem.importance = importance
+            if scope is not None:
+                mem.scope = scope
+            vector_changed = content is not None or category is not None or scope is not None
+            if vector_changed:
+                mem.embedding_synced = False
             db.commit()
 
-            if content is not None:
+            if vector_changed:
+                try:
+                    self._delete_from_milvus(mem.id)
+                except Exception as e:
+                    logger.warning("memory_old_vector_delete_failed", id=memory_id, error=str(e))
                 try:
                     await self._sync_to_milvus(
                         mem.id, mem.content, mem.user_id, mem.tenant_id or "default",
@@ -229,13 +255,24 @@ class MemoryService:
         finally:
             db.close()
 
-    async def delete(self, memory_id: int) -> bool:
+    async def delete(
+        self,
+        memory_id: int,
+        *,
+        user_id: str | None = None,
+        tenant_id: str | None = None,
+    ) -> bool:
         """删除单条记忆（MySQL + Milvus）。"""
         from lea_rag.db.models import UserMemory
 
         db = self._get_db()
         try:
-            mem = db.query(UserMemory).filter(UserMemory.id == memory_id).first()
+            query = db.query(UserMemory).filter(UserMemory.id == memory_id)
+            if user_id is not None:
+                query = query.filter(UserMemory.user_id == user_id)
+            if tenant_id is not None:
+                query = query.filter(UserMemory.tenant_id == tenant_id)
+            mem = query.first()
             if not mem:
                 return False
             db.delete(mem)

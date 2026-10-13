@@ -103,6 +103,7 @@ def _tenant_llm_fallback(model_name: str) -> dict:
 def get_agent_config(
     agent_id: int,
     tenant_id: str = Query("", description="租户 id；agent_id=0 兜底时用"),
+    model: str = Query("", description="当前会话临时使用的模型；不写回 Agent 配置"),
     db: Session = Depends(get_db),
 ):
     """返回完整 Agent 运行时配置（一次查全）。
@@ -253,13 +254,15 @@ def get_agent_config(
             "members": [_row_to_dict(m) for m in members],
         }
 
-    # LLM Provider — 匹配 agent.model 对应的 provider
+    # LLM Provider — 默认匹配 agent.model；会话请求可以传 model 临时覆盖。
+    # 覆盖只影响这一次运行时配置，不修改 Agent 行，因此不同用户/会话可以并行
+    # 使用不同模型，行为和云端聊天产品一致。
     #
     # 判据走 models/llm_provider.py 那一套，跟 /llm-models 共用。两边必须完全同形：
     # 那个端点就是把这里的匹配结果投影给前端选择器，分叉的话用户会选到一个列表里
     # 有、运行时却选不中的名字，请求悄悄走默认 provider。
     llm_config = {}
-    model_name = agent.model or ""
+    model_name = model.strip() or agent.model or ""
     if model_name:
         providers = provider_tenant_first(
             db.query(LLMProvider).filter(*provider_visible_to(agent.tenant_id)).all(),
@@ -283,8 +286,12 @@ def get_agent_config(
         else:
             llm_config = _tenant_llm_fallback(model_name)
 
+    agent_out = _row_to_dict(agent)
+    if model_name:
+        agent_out["model"] = model_name
+
     return {
-        "agent": _row_to_dict(agent),
+        "agent": agent_out,
         "kb_ids": kb_ids,
         "skills": skills,
         "tools": tools,

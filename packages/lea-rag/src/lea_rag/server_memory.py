@@ -264,7 +264,7 @@ async def debug_memory_trace(body: DebugMemoryTraceRequest):
     t2 = _time.time()
     try:
         retriever = MemoryRetriever()
-        scopes = [f"user:{body.user_id}"]
+        scopes = ["global"]
         if body.agent_id:
             scopes.append(f"agent:{body.agent_id}")
         memories = await retriever.search(

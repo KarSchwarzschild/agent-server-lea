@@ -2,7 +2,7 @@
 
 验证点：
 1. extractor._parse_facts 正确解析 scope 字段
-2. scope 路由逻辑 (profile → user:xx, context → agent:xx)
+2. scope 路由逻辑 (profile → global, context → agent:xx)
 3. API 合约：add/search/extract 端点支持 scope 参数
 4. DB 层正确存储 scope
 
@@ -70,7 +70,7 @@ class TestParseFacts:
 
 
 class TestScopeRouting:
-    """验证 profile→user:xx, context→agent:xx 的路由。"""
+    """验证 profile→global, context→agent:xx 的路由。"""
 
     @pytest.fixture(autouse=True)
     def setup_db(self):
@@ -80,15 +80,16 @@ class TestScopeRouting:
         Base.metadata.drop_all(bind=engine)
 
     @pytest.mark.asyncio
-    async def test_profile_routes_to_user_scope(self):
-        """profile scope 的记忆存为 user:{user_id}。"""
+    async def test_profile_routes_to_global_scope(self, monkeypatch):
+        """profile scope 的记忆存为当前用户跨 Agent 共享的 global。"""
         from lea_rag.memory.service import MemoryService
 
         svc = MemoryService()
+        monkeypatch.setattr(svc, "_sync_to_milvus", AsyncMock())
         mid = await svc.add(
             user_id="stu1", content="用户是大二学生",
             category="identity", importance=8,
-            scope="user:stu1",
+            scope="global",
         )
         assert mid > 0
 
@@ -97,14 +98,15 @@ class TestScopeRouting:
         db = SessionLocal()
         row = db.query(UserMemory).filter(UserMemory.id == mid).first()
         db.close()
-        assert row.scope == "user:stu1"
+        assert row.scope == "global"
 
     @pytest.mark.asyncio
-    async def test_context_routes_to_agent_scope(self):
+    async def test_context_routes_to_agent_scope(self, monkeypatch):
         """context scope 的记忆存为 agent:{agent_id}。"""
         from lea_rag.memory.service import MemoryService
 
         svc = MemoryService()
+        monkeypatch.setattr(svc, "_sync_to_milvus", AsyncMock())
         mid = await svc.add(
             user_id="stu1", content="正在用微积分解优化问题",
             category="progress", importance=6,
@@ -127,9 +129,11 @@ class TestMemoryAPIContract:
     """验证 server_memory.py 端点接受 scope 参数。"""
 
     @pytest.fixture(autouse=True)
-    def setup(self):
+    def setup(self, monkeypatch):
         from lea_rag.db import Base, engine
+        from lea_rag.memory.service import MemoryService
         Base.metadata.create_all(bind=engine)
+        monkeypatch.setattr(MemoryService, "_sync_to_milvus", AsyncMock())
         from lea_rag.server import app
         from fastapi.testclient import TestClient
         self.client = TestClient(app)
@@ -141,7 +145,7 @@ class TestMemoryAPIContract:
         r = self.client.post("/memory/add", json={
             "user_id": "u1",
             "content": "测试记忆",
-            "scope": "user:u1",
+            "scope": "global",
         })
         assert r.status_code == 200
         assert "id" in r.json()
@@ -164,7 +168,7 @@ class TestMemoryAPIContract:
             r = self.client.post("/memory/search", json={
                 "user_id": "u1",
                 "query": "测试",
-                "scopes": ["user:u1", "agent:42"],
+                "scopes": ["global", "agent:42"],
             })
         assert r.status_code == 200
         assert r.json() == []

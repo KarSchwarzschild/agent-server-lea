@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -80,7 +81,11 @@ func BuildPlatformTools(cfg *AgentConfig, tenantID, userID, sessionID string) []
 	// memory_search 只读，子代理该有。memory_add 不在这里 —— 见
 	// BuildMainSessionTools。
 	if cfg.MemoryMode != "off" {
-		tools = append(tools, &MemorySearchTool{tenantID: tenantID, userID: userID})
+		tools = append(tools, &MemorySearchTool{
+			tenantID: tenantID,
+			userID:   userID,
+			agentID:  strconv.Itoa(cfg.ID),
+		})
 	}
 
 	// get_plan 是只读的，**专家和子代理都该有**：转交链里执行第 3 步的那个专家，
@@ -149,7 +154,11 @@ func BuildMainSessionTools(cfg *AgentConfig, tenantID, userID, sessionID string,
 	})
 	// memory_add 只在 memory 开启时注册
 	if cfg != nil && cfg.MemoryMode != "off" {
-		tools = append(tools, &MemoryAddTool{tenantID: tenantID, userID: userID})
+		tools = append(tools, &MemoryAddTool{
+			tenantID: tenantID,
+			userID:   userID,
+			agentID:  strconv.Itoa(cfg.ID),
+		})
 	}
 	return tools
 }
@@ -535,6 +544,7 @@ func (t *KBSearchTool) Run(ctx context.Context, input json.RawMessage, tctx *too
 type MemorySearchTool struct {
 	tenantID string
 	userID   string
+	agentID  string
 }
 
 func (t *MemorySearchTool) Name() string            { return "memory_search" }
@@ -559,6 +569,7 @@ func (t *MemorySearchTool) Run(ctx context.Context, input json.RawMessage, tctx 
 		"query":     params.Query,
 		"user_id":   t.userID,
 		"tenant_id": t.tenantID,
+		"scopes":    []string{"global", "agent:" + t.agentID},
 	}
 	body, _ := json.Marshal(payload)
 
@@ -638,6 +649,7 @@ func (t *MemorySearchTool) Run(ctx context.Context, input json.RawMessage, tctx 
 type MemoryAddTool struct {
 	tenantID string
 	userID   string
+	agentID  string
 }
 
 func (t *MemoryAddTool) Name() string            { return "memory_add" }
@@ -648,6 +660,10 @@ func (t *MemoryAddTool) InputSchema() tool.Schema {
 		Type: tool.SchemaTypeObject,
 		Properties: map[string]tool.Schema{
 			"content": {Type: tool.SchemaTypeString, Description: "要记住的内容"},
+			"scope": {
+				Type: tool.SchemaTypeString, Description: "记忆范围：platform 跨 Agent 共享，agent 仅当前 Agent 使用",
+				Enum: []any{"platform", "agent"}, Default: "platform",
+			},
 		},
 		Required: []string{"content"},
 	}
@@ -656,13 +672,19 @@ func (t *MemoryAddTool) InputSchema() tool.Schema {
 func (t *MemoryAddTool) Run(ctx context.Context, input json.RawMessage, tctx *tool.Context, out chan<- tool.Event) (tool.Result, error) {
 	var params struct {
 		Content string `json:"content"`
+		Scope   string `json:"scope"`
 	}
 	json.Unmarshal(input, &params)
+	scope := "global"
+	if params.Scope == "agent" {
+		scope = "agent:" + t.agentID
+	}
 
 	payload := map[string]any{
 		"content":   params.Content,
 		"user_id":   t.userID,
 		"tenant_id": t.tenantID,
+		"scope":     scope,
 	}
 	body, _ := json.Marshal(payload)
 

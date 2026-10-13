@@ -228,7 +228,7 @@ func handleRetryOperationRun(coordinator RunCoordinator) gin.HandlerFunc {
 			err = coordinator.Dispatch(ctx, temporalrun.Input{
 				RunID: dispatch.ID, SessionID: dispatch.SessionID, TenantID: dispatch.TenantID,
 				UserID: dispatch.UserID, AgentID: dispatch.AgentID, ProjectID: dispatch.ProjectID,
-				Message: dispatch.Request.Message, AttachmentIDs: dispatch.Request.AttachmentIDs,
+				Model: dispatch.Request.Model, Message: dispatch.Request.Message, AttachmentIDs: dispatch.Request.AttachmentIDs,
 				PlanMode: dispatch.Request.PlanMode, PlanAction: dispatch.Request.PlanAction,
 			})
 			cancel()

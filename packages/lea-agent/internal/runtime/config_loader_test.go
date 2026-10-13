@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 
 	"gitlab.ouc-online.com.cn/aibase/agentloop/tool"
@@ -151,6 +152,31 @@ func TestDeadKeyIsIgnored(t *testing.T) {
 	}
 	if len(schema.Required) != 2 {
 		t.Fatalf("schema_json 该照常生效，required = %v", schema.Required)
+	}
+}
+
+func TestModelOverrideReachesConfigService(t *testing.T) {
+	t.Helper()
+	queries := make(chan url.Values, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		queries <- r.URL.Query()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(leaConfigPayload))
+	}))
+	t.Cleanup(srv.Close)
+	old := configServiceURL
+	configServiceURL = srv.URL
+	t.Cleanup(func() { configServiceURL = old })
+
+	if _, err := LoadAgentConfig(context.Background(), 2, "tenant with spaces", "glm-4 plus"); err != nil {
+		t.Fatalf("LoadAgentConfig: %v", err)
+	}
+	query := <-queries
+	if got := query.Get("tenant_id"); got != "tenant with spaces" {
+		t.Fatalf("tenant_id = %q, want tenant with spaces", got)
+	}
+	if got := query.Get("model"); got != "glm-4 plus" {
+		t.Fatalf("model = %q, want glm-4 plus", got)
 	}
 }
 

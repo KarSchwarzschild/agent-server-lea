@@ -17,7 +17,8 @@ const chatSessionsDDL = `CREATE TABLE IF NOT EXISTS chat_sessions (
 	user_id         TEXT NOT NULL,
 	tenant_id       TEXT NOT NULL DEFAULT '',
 	project_id      INTEGER NULL,
-	active_agent_id INTEGER NOT NULL DEFAULT 0
+	active_agent_id INTEGER NOT NULL DEFAULT 0,
+	model           TEXT NULL
 )`
 
 func testSessionsDB(t *testing.T) *sql.DB {
@@ -107,5 +108,20 @@ func TestSetSessionActiveAgent_OwnershipFilter(t *testing.T) {
 	}
 	if got := GetSessionActiveAgent(ctx, db, "victim"); got != 3 {
 		t.Fatalf("受害会话的 active_agent_id 被越权改动：得到 %d，应仍是 3", got)
+	}
+}
+
+func TestGetSessionModel(t *testing.T) {
+	db := testSessionsDB(t)
+	ctx := context.Background()
+	seedSession(t, db, "s1", "t1", "u1", 0)
+	if _, err := db.Exec(`UPDATE chat_sessions SET model = ? WHERE id = ?`, "glm-4-plus", "s1"); err != nil {
+		t.Fatal(err)
+	}
+	if got := GetSessionModel(ctx, db, "s1"); got != "glm-4-plus" {
+		t.Fatalf("model = %q, want glm-4-plus", got)
+	}
+	if got := GetSessionModel(ctx, db, "missing"); got != "" {
+		t.Fatalf("missing session model = %q, want empty", got)
 	}
 }

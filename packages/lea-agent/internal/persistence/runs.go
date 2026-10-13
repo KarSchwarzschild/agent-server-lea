@@ -78,6 +78,7 @@ type AgentRun struct {
 
 type AgentRunRequest struct {
 	Message       string  `json:"message"`
+	Model         string  `json:"model,omitempty"`
 	AttachmentIDs []int64 `json:"attachment_ids"`
 	PlanMode      bool    `json:"plan_mode"`
 	PlanAction    string  `json:"plan_action"`

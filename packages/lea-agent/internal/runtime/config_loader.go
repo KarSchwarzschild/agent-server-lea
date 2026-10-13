@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -194,21 +195,27 @@ type AgentConfig struct {
 
 var httpClient = &http.Client{Timeout: 10 * time.Second}
 
-// LoadAgentConfig 取 agent 的完整运行时配置。
+// LoadAgentConfig 取 agent 的完整运行时配置。modelOverride 非空时只为当前
+// 会话临时替换模型，不修改 lea-config 中的 Agent 配置。
 // H2：agentID=0（前端硬编码 super-agent）时，lea-config 会兜底到 tenant super-agent，
 // 返回的 cfg.ID 是解析后的真实 agent 主键。
-func LoadAgentConfig(ctx context.Context, agentID int, tenantID string) (*AgentConfig, error) {
+func LoadAgentConfig(ctx context.Context, agentID int, tenantID string, modelOverride ...string) (*AgentConfig, error) {
+	requestedModel := ""
+	if len(modelOverride) > 0 {
+		requestedModel = strings.TrimSpace(modelOverride[0])
+	}
 	// 降级保护：缓存未初始化时直接回源
 	if globalCache == nil {
-		return loadAgentConfigFromSource(ctx, agentID, tenantID)
+		return loadAgentConfigFromSource(ctx, agentID, tenantID, requestedModel)
 	}
 
-	// 缓存键：agent:{id}:{tenant}
-	cacheKey := fmt.Sprintf("agent:%d:%s", agentID, tenantID)
+	// 缓存键必须包含临时模型，否则先请求 qwen、再请求 deepseek 会复用错的
+	// provider/base_url/api_key 配置。
+	cacheKey := fmt.Sprintf("agent:%d:%s:%s", agentID, tenantID, requestedModel)
 
 	// 通过缓存加载
 	data, err := globalCache.GetOrLoad(ctx, cacheKey, func(ctx context.Context) ([]byte, error) {
-		cfg, err := loadAgentConfigFromSource(ctx, agentID, tenantID)
+		cfg, err := loadAgentConfigFromSource(ctx, agentID, tenantID, requestedModel)
 		if err != nil {
 			return nil, err
 		}
@@ -231,9 +238,16 @@ func LoadAgentConfig(ctx context.Context, agentID int, tenantID string) (*AgentC
 }
 
 // loadAgentConfigFromSource 从 lea-config 加载配置（原 LoadAgentConfig 逻辑）
-func loadAgentConfigFromSource(ctx context.Context, agentID int, tenantID string) (*AgentConfig, error) {
-	url := fmt.Sprintf("%s/internal/agent-config/%d?tenant_id=%s", configServiceURL, agentID, tenantID)
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+func loadAgentConfigFromSource(ctx context.Context, agentID int, tenantID string, modelOverride ...string) (*AgentConfig, error) {
+	requestedModel := ""
+	if len(modelOverride) > 0 {
+		requestedModel = strings.TrimSpace(modelOverride[0])
+	}
+	configURL := fmt.Sprintf("%s/internal/agent-config/%d?tenant_id=%s", configServiceURL, agentID, url.QueryEscape(tenantID))
+	if requestedModel != "" {
+		configURL += "&model=" + url.QueryEscape(requestedModel)
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", configURL, nil)
 	if err != nil {
 		return nil, err
 	}

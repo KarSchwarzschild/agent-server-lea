@@ -78,6 +78,7 @@ export type SessionRow = {
   is_archived: boolean
   project_id?: number | null
   agent_id?: number | null
+  model?: string | null
 }
 
 export type ProjectItem = { id: number; name: string; description?: string; session_count?: number; is_archived?: boolean }
@@ -118,6 +119,16 @@ export type AgentInfo = {
   avatar?: string
   model?: string
   is_mine?: boolean
+  // 下面三个后端一直在返回（agents.py 的 _agent_to_dict），只是这里没声明，
+  // 于是前端拿不到它们、只能靠猜。缺 is_system + tenant_id 的直接后果是
+  // "默认模式下 agent_id=0 该解成哪一行"解不出来——而同一个租户的 listAgents
+  // 里会出现**两个** super-agent（本租户那个 + default 那个），光靠名字分不开。
+  is_system?: boolean
+  tenant_id?: string
+  // can_edit 是后端算好的权限结论（管理员，或 owner_scope=user 且是自己的）。
+  // 前端直接用它，不要自己再推一遍：推错的方向是让按钮看着能点、点了被
+  // 后端 403，而那个 403 在这个界面上是不可见的。
+  can_edit?: boolean
   // 乐观并发控制用——保存时原样带回去当 expected_updated_at，见
   // updateAgent 的说明。没有这个字段（老缓存数据）就不校验。
   updated_at?: string
@@ -227,6 +238,19 @@ export type KnowledgeSearchHit = {
   source_filename?: string
 }
 
+export type MemoryCategory = 'fact' | 'preference' | 'identity' | 'progress'
+export type MemoryScope = 'global' | `agent:${number}`
+
+export type MemoryItem = {
+  id: number
+  content: string
+  category: MemoryCategory
+  importance: number
+  access_count: number
+  scope: MemoryScope
+  created_at?: string | null
+}
+
 // UserFile 是"我的文件"列表里的一行。上传件和模型交付的成品合并在一个列表里 ——
 // 用户不关心这个区别，他要的是"我的文件"。kind 保留是因为删除/导入要知道去哪张表。
 export type UserFile = {
@@ -275,8 +299,8 @@ export const getMessages = (id: string) => request<{ messages: MessageRow[] }>(`
 export const setSessionActiveAgent = (sessionId: string, agentId: number) => request<{ session_id: string; agent_id: number; active: boolean }>(`/api/sessions/${sessionId}/active-agent`, {
   method: 'PUT', body: JSON.stringify({ agent_id: agentId }), headers: { 'Content-Type': 'application/json' }
 })
-export const createSession = (agentId = 0, projectId?: number) => request<{ session_id: string }>('/api/sessions', {
-  method: 'POST', body: JSON.stringify({ agent_id: agentId, ...(projectId ? { project_id: projectId } : {}) }), headers: { 'Content-Type': 'application/json' }
+export const createSession = (agentId = 0, projectId?: number, model?: string) => request<{ session_id: string }>('/api/sessions', {
+  method: 'POST', body: JSON.stringify({ agent_id: agentId, ...(projectId ? { project_id: projectId } : {}), ...(model ? { model } : {}) }), headers: { 'Content-Type': 'application/json' }
 })
 export const deleteSession = (id: string) => request<{ ok: boolean }>(`/api/sessions/${id}`, { method: 'DELETE' })
 
@@ -426,6 +450,15 @@ export const deleteKnowledgeDocument = (kbId: number, documentId: number) => req
 export const searchKnowledgeBase = (kbId: number, query: string, limit = 5) => request<{ results: KnowledgeSearchHit[]; total: number }>(`/api/user/knowledge-bases/${kbId}/search`, {
   method: 'POST', body: JSON.stringify({ query, limit }), headers: { 'Content-Type': 'application/json' }
 })
+export const listMemories = (limit = 200) => request<MemoryItem[]>(`/api/user/memories?limit=${limit}`)
+export const createMemory = (payload: { content: string; category: MemoryCategory; importance: number; scope: MemoryScope }) => request<{ id: number; scope: MemoryScope }>('/api/user/memories', {
+  method: 'POST', body: JSON.stringify(payload), headers: { 'Content-Type': 'application/json' }
+})
+export const updateMemory = (memoryId: number, payload: { content?: string; category?: MemoryCategory; importance?: number; scope?: MemoryScope }) => request<{ ok: boolean }>(`/api/user/memories/${memoryId}`, {
+  method: 'PUT', body: JSON.stringify(payload), headers: { 'Content-Type': 'application/json' }
+})
+export const deleteMemory = (memoryId: number) => request<{ ok: boolean }>(`/api/user/memories/${memoryId}`, { method: 'DELETE' })
+export const clearMemories = () => request<{ deleted: number }>('/api/user/memories', { method: 'DELETE' })
 export const listSkills = (visibility?: 'private' | 'tenant' | 'global') => request<{ skills: SkillMarketItem[] }>(`/api/user/skills?page=1&size=50${visibility ? `&visibility=${visibility}` : ''}`)
 export const updateSkill = (skillId: number, payload: { display_name?: string; description?: string; category?: string; system_prompt?: string; model_tier?: string; allowed_tools?: string[]; enabled?: boolean }) => request<SkillMarketItem>(`/api/user/skills/${skillId}`, {
   method: 'PUT', body: JSON.stringify(payload), headers: { 'Content-Type': 'application/json' }
@@ -614,6 +647,8 @@ export async function downloadAttachment(id: number) {
 export async function sendMessageStream(
   payload: {
     session_id?: string; agent_id: number; project_id?: number; message: string
+    // 当前会话这一轮使用的模型。空值表示沿用 Agent 的默认模型；不写回 Agent 配置。
+    model?: string
     attachment_ids?: number[]; plan_mode?: boolean; plan_action?: string
     // 完整替换语义——每次都发这条会话现在该有的完整清单（已挂载 + 这一轮新选的），
     // 不是"这次要新增的增量"。省略这个字段=不动现有挂载（后端按 nil 处理，

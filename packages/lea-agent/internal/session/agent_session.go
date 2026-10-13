@@ -641,7 +641,7 @@ func (s *AgentSession) SubmitRun(ctx context.Context, message string, attachment
 		}
 		return "", fmt.Errorf("open run store: %w", err)
 	}
-	if err := persistence.EnsureSession(ctx, db, s.id, s.userID, s.tenantID, s.projectID, s.activeAgentID, message); err != nil {
+	if err := persistence.EnsureSession(ctx, db, s.id, s.userID, s.tenantID, s.projectID, s.activeAgentID, s.cfg.Model, message); err != nil {
 		return "", err
 	}
 	runID := uuid.NewString()
@@ -654,6 +654,7 @@ func (s *AgentSession) SubmitRun(ctx context.Context, message string, attachment
 		ProjectID: s.projectID,
 		Request: map[string]any{
 			"message":        message,
+			"model":          s.cfg.Model,
 			"attachment_ids": attachmentIDs,
 			"plan_mode":      plan.Mode,
 			"plan_action":    plan.Action,
@@ -745,6 +746,7 @@ func (s *AgentSession) startRun(parent context.Context, runID string, create boo
 			ProjectID: s.projectID,
 			Request: map[string]any{
 				"message":        message,
+				"model":          s.cfg.Model,
 				"attachment_ids": attachmentIDs,
 				"plan_mode":      plan.Mode,
 				"plan_action":    plan.Action,
@@ -847,7 +849,7 @@ func (s *AgentSession) startRun(parent context.Context, runID string, create boo
 		}
 
 		if db != nil {
-			if err := persistence.TouchSession(ctx, db, s.id, s.userID, s.tenantID, s.projectID, s.activeAgentID, userMsg); err != nil {
+			if err := persistence.TouchSession(ctx, db, s.id, s.userID, s.tenantID, s.projectID, s.activeAgentID, s.cfg.Model, userMsg); err != nil {
 				log.Printf("touch_session_failed session=%s err=%v", s.id, err)
 			}
 		}

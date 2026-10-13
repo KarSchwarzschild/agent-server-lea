@@ -105,6 +105,14 @@ def test_document_retry_cleans_partial_rows_before_enqueue(db, monkeypatch):
     )
     db.commit()
 
+    # __init__ 也得挡掉：它在构造时就去连 Milvus（connections.connect），只 patch
+    # delete_by_document 的话实例化那一步先炸，报的是 grpc.FutureTimeoutError ——
+    # 看上去像网络问题，其实是这条用例在干净环境里压根跑不起来。这条用例要验的是
+    # "重试前把残留的 chunk/section 删干净"，跟 Milvus 实际连通性无关。
+    monkeypatch.setattr(
+        "lea_rag.index.milvus_index.MilvusKBIndex.__init__",
+        lambda _self, *_args, **_kwargs: None,
+    )
     monkeypatch.setattr(
         "lea_rag.index.milvus_index.MilvusKBIndex.delete_by_document",
         lambda _self, _document_id: None,

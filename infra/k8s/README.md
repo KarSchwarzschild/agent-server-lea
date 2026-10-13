@@ -68,6 +68,45 @@ CI 必须同时 checkout lea-platform 和 agentloop 两个仓库并保持同级�
 长期更好的做法是给 agentloop 打 tag 发成正式 Go module、删掉 replace。现在没做是
 因为两个仓库在同步改，每次改都发版是实打实的摩擦。
 
+### 用 CI 构建（推荐）
+
+`.gitlab-ci.yml` 已经把上面这些手动命令固化了：`main` 和 tag 上会构建全部 8 个
+镜像（含两个前端），每个打三个 tag ——
+
+| tag | 用途 |
+|---|---|
+| `<commit-sha>` | **不可变。部署和回滚都指它。** |
+| `<branch-slug>` | 「给我这个分支最新的」 |
+| `latest`（仅 main） | 不关心版本的场合 |
+
+**部署时务必用 sha tag。**用 `latest` 会直接退回到"线上跑的是哪个 commit 查不
+出来"那个问题 —— 那是这套东西要解决的问题之一，别自己绕回去。
+
+CI 里有两处需要环境配合，缺了会在对应 job 上明确报错（不会静默）：
+
+1. **agentloop 的访问权限。**CI 要 clone 这个兄弟仓库。用的是 `CI_JOB_TOKEN`，
+   需要在 agentloop 项目的 Settings → CI/CD → Job token permissions 里把本项目
+   加进允许列表，否则 403。
+2. **镜像推送目标。**`.gitlab-ci.yml` 里现在用 GitLab 自带 Registry 的预定义
+   变量（`$CI_REGISTRY_IMAGE`）。本仓库的 manifest 注释写的是华为 SWR —— 如果
+   确定推 SWR，改 `.docker-build` 里的 `docker login` 和各 job 的 `IMAGE_BASE`
+   即可，其余不用动。
+
+### manifest 里的镜像地址是占位符
+
+6 份 Deployment 现在写的是 `<svc>:REPLACE_ME`，**原样 apply 会拉不到镜像**。
+部署前替换成完整地址 + sha tag。
+
+同时 6 份都加了 `imagePullSecrets: lea-registry`（之前完全没有，私有 registry
+必拉不到）。这个 Secret 要自己建：
+
+```bash
+kubectl create secret docker-registry lea-registry \
+    --docker-server=<registry> --docker-username=<u> --docker-password=<p>
+```
+
+名字对不上的表现是 Pod 卡在 `ImagePullBackOff`。
+
 ## 部署
 
 ```bash

@@ -1,0 +1,223 @@
+# GitLab CI —— 测试 + 构建推送
+#
+# 为什么需要它：在这之前仓库没有任何 CI，624 个测试只在有人手动想起来时跑。改坏
+# 一处东西，没有任何机制会告知。对交接来说这是最要紧的一件基础设施。
+#
+# ── 这份配置依赖三件环境上的事，缺哪件哪个 job 失败（都会给出明确报错）────────
+#
+# 1. 一个 docker executor 的 runner（test 阶段够用；build 阶段还要能跑 dind，
+#    见 .docker-build）。
+#
+# 2. Container Registry 已启用。用的是 GitLab 预定义变量 $CI_REGISTRY_IMAGE,
+#    没启用的话 docker login 会失败。要是镜像推别处（华为 SWR 之类），把
+#    .docker-build 里的 login 和 IMAGE_BASE 换掉即可，其余不用动。
+#
+# 3. **CI 能 clone agentloop 这个兄弟仓库。** 这条最容易卡住，原因见下面
+#    go-test 的注释。
+#
+# ── 阶段 ────────────────────────────────────────────────────────────────────
+#
+#   lint    ruff（快，先挡住格式和明显问题）
+#   test    pytest 全量 + go test 全量
+#   build   构建并推 7 个镜像，带版本号 tag
+#
+# build 只在 main 和 tag 上跑。每个 MR 都构建 7 个镜像太烧 runner，而且在没有
+# 自动部署的现状下也用不上。
+
+stages:
+  - lint
+  - test
+  - build
+
+variables:
+  # 私有 GitLab 走不了公网校验和数据库，跟各 Dockerfile 里保持一致。
+  GOPROXY: "https://goproxy.cn,direct"
+  GOPRIVATE: "gitlab.ouc-online.com.cn"
+  GONOSUMDB: "gitlab.ouc-online.com.cn"
+  GIT_DEPTH: "20"
+
+# ── lint ───────────────────────────────────────────────────────────────────
+
+# ⚠️ 非阻塞（allow_failure），**这是有意的**。
+#
+# 现状是 718 个 ruff 错误。做成阻塞门禁的话流水线从第一天起就全红，而长期红的 CI
+# 等于没有 CI —— 大家会学会忽略它，连 pytest 真的挂了都看不见。所以先让它只报告。
+#
+# 分布（uvx ruff check . --statistics）：
+#   220 I001  import 未排序        [可自动修]
+#   122 UP045 Optional[x] 老写法    [可自动修]
+#    94 E501  行过长               [要手改]
+#    90 F401  未使用的 import      [可自动修，但要看是不是故意的 re-export]
+#    42 E402  import 不在文件顶部  [要手改，多半是"延迟 import 避免循环依赖"，
+#                                   那种该加 noqa 而不是挪位置]
+#
+# 513 个可以 `ruff check --fix` 自动修。但那会产出一个碰到几乎每个文件的巨型 diff,
+# 跟任何在途改动都冲突 —— 所以值得单独做一次、挑没有并行工作的时候，而不是夹在
+# 功能提交里。做完之后把 allow_failure 去掉，门禁才真正生效。
+ruff:
+  stage: lint
+  image: ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+  allow_failure: true
+  script:
+    # ruff 没有在 dependency-groups 里（pyproject.toml 只有 [tool.ruff] 配置段），
+    # 所以用 uvx 临时取，不动依赖清单。
+    - uvx ruff check . --output-format=gitlab > gl-code-quality-report.json || true
+    - uvx ruff check . --statistics
+  artifacts:
+    when: always
+    reports:
+      codequality: gl-code-quality-report.json
+    expire_in: 1 week
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
+# ── test ───────────────────────────────────────────────────────────────────
+
+pytest:
+  stage: test
+  image: ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+  script:
+    # testpaths 在 pyproject.toml 里列死了（**逐个文件**，不是目录 —— 那边有一段
+    # 注释解释为什么：目录写法会把起服务的集成测试和评测脚本也收进来，表现是整个
+    # pytest 崩在 collection 阶段而不是失败）。所以这里不传路径，让它用配置。
+    - uv sync --frozen
+    - uv run pytest -q --junitxml=report.xml
+  artifacts:
+    when: always
+    reports:
+      junit: report.xml
+    expire_in: 1 week
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
+go-test:
+  stage: test
+  image: golang:1.26
+  variables:
+    GOFLAGS: "-mod=mod"
+  before_script:
+    # agentloop 是**本仓库之外**的兄弟仓库，packages/lea-agent/go.mod 里有：
+    #     replace gitlab.ouc-online.com.cn/aibase/agentloop => ../../../agentloop
+    # 相对 packages/lea-agent/ 往上三层 —— 也就是本仓库目录的**同级**。CI 默认只
+    # checkout 本仓库，所以必须手动把它 clone 到正确位置，否则 go 报
+    # "replacement directory ../../../agentloop does not exist"。
+    #
+    # CI_JOB_TOKEN 要能读 agentloop，需要在 agentloop 项目里把本项目加进
+    # Settings → CI/CD → Job token permissions 的允许列表。不加的话这里 403。
+    # 换成部署令牌也行，把下面的 URL 改成带 token 的形式。
+    - git clone --depth 1 "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/aibase/agentloop.git" "${CI_PROJECT_DIR}/../agentloop"
+  script:
+    - cd packages/lea-agent
+    - go build ./...
+    - go vet ./...
+    - go test -count=1 ./...
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
+# ── build ──────────────────────────────────────────────────────────────────
+#
+# 镜像 tag 策略。这是这次要解决的核心问题之一：原来测试服上打的是固定 tag
+# `:test`，docker build 会把上一版顶掉 —— 于是**没有"上一个镜像"可以切回去**,
+# 回滚等于代码退回去重走全流程。
+#
+# 现在每次构建打三个 tag：
+#   $CI_COMMIT_SHORT_SHA   不可变，回滚就指它。这是真正解决回滚的那一个
+#   $CI_COMMIT_REF_SLUG    分支名，方便"给我 main 最新的"
+#   latest（仅 main）      给不关心版本的场合
+#
+# 部署时**用 sha tag**，不要用 latest —— 用了 latest 就又回到"线上跑的是哪个
+# commit 查不出来"那个问题上。
+
+.docker-build:
+  stage: build
+  image: docker:27
+  services:
+    - docker:27-dind
+  variables:
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_BUILDKIT: "1"
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_TAG
+
+# 用 !reference 而不是 YAML 锚点（&/*）：锚点指向一个序列，插进 script 的列表里会
+# 变成嵌套数组，能不能跑取决于 GitLab 的隐式展平行为。!reference 是官方机制，明确。
+.push-tags:
+  script:
+    - docker tag "$IMG:$CI_COMMIT_SHORT_SHA" "$IMG:$CI_COMMIT_REF_SLUG"
+    - docker push "$IMG:$CI_COMMIT_SHORT_SHA"
+    - docker push "$IMG:$CI_COMMIT_REF_SLUG"
+    - if [ "$CI_COMMIT_BRANCH" = "main" ]; then
+        docker tag "$IMG:$CI_COMMIT_SHORT_SHA" "$IMG:latest";
+        docker push "$IMG:latest";
+      fi
+
+build:lea-agent:
+  extends: .docker-build
+  script:
+    - export IMG="$CI_REGISTRY_IMAGE/lea-agent"
+    # 跟 go-test 同一个理由要 clone agentloop；这里还要把它作为**具名构建上下文**
+    # 传进去。packages/lea-agent/Dockerfile 头部那段注释解释了为什么不能把上下文
+    # 设成两个仓库的父目录（那下面还有 transformers / MinerU，上下文会涨到几个 GB）。
+    - apk add --no-cache git
+    - git clone --depth 1 "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/aibase/agentloop.git" /tmp/agentloop
+    - docker build --build-context agentloop=/tmp/agentloop
+        -f packages/lea-agent/Dockerfile
+        -t "$IMG:$CI_COMMIT_SHORT_SHA" .
+    - !reference [.push-tags, script]
+
+build:lea-gateway:
+  extends: .docker-build
+  script:
+    - export IMG="$CI_REGISTRY_IMAGE/lea-gateway"
+    - docker build -f packages/lea-gateway/Dockerfile -t "$IMG:$CI_COMMIT_SHORT_SHA" .
+    - !reference [.push-tags, script]
+
+build:lea-config:
+  extends: .docker-build
+  script:
+    - export IMG="$CI_REGISTRY_IMAGE/lea-config"
+    - docker build -f packages/lea-config/Dockerfile -t "$IMG:$CI_COMMIT_SHORT_SHA" .
+    - !reference [.push-tags, script]
+
+build:lea-rag:
+  extends: .docker-build
+  script:
+    - export IMG="$CI_REGISTRY_IMAGE/lea-rag"
+    - docker build -f packages/lea-rag/Dockerfile -t "$IMG:$CI_COMMIT_SHORT_SHA" .
+    - !reference [.push-tags, script]
+
+build:lea-parser:
+  extends: .docker-build
+  script:
+    - export IMG="$CI_REGISTRY_IMAGE/lea-parser"
+    - docker build -f packages/lea-parser/Dockerfile -t "$IMG:$CI_COMMIT_SHORT_SHA" .
+    - !reference [.push-tags, script]
+
+build:lea-tools:
+  extends: .docker-build
+  script:
+    - export IMG="$CI_REGISTRY_IMAGE/lea-tools"
+    - docker build -f packages/lea-tools/Dockerfile -t "$IMG:$CI_COMMIT_SHORT_SHA" .
+    - !reference [.push-tags, script]
+
+# 前端的构建上下文是各自的目录（不是仓库根），跟后端不同 —— 见
+# infra/docker-compose.test-server.yml 里 frontend / admin-console 的 context。
+build:frontend-lab:
+  extends: .docker-build
+  script:
+    - export IMG="$CI_REGISTRY_IMAGE/frontend-lab"
+    - docker build -f frontend-lab/Dockerfile -t "$IMG:$CI_COMMIT_SHORT_SHA" frontend-lab
+    - !reference [.push-tags, script]
+
+build:frontend-console:
+  extends: .docker-build
+  script:
+    - export IMG="$CI_REGISTRY_IMAGE/frontend-console"
+    - docker build -f frontend-console/Dockerfile -t "$IMG:$CI_COMMIT_SHORT_SHA" frontend-console
+    - !reference [.push-tags, script]

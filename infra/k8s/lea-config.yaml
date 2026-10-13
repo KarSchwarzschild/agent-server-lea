@@ -16,10 +16,20 @@ spec:
     metadata:
       labels: {app: lea-config}
     spec:
+      # 私有 registry 必需。用
+      #   kubectl create secret docker-registry lea-registry \
+      #       --docker-server=<registry> --docker-username=<u> --docker-password=<p>
+      # 创建；名字对不上的表现是 Pod 卡在 ImagePullBackOff。
+      imagePullSecrets:
+        - name: lea-registry
       containers:
         - name: lea-config
-          image: lea-config:dev   # 换成 SWR 地址 + 具体 tag
-          imagePullPolicy: IfNotPresent
+          # ⚠️ 占位符。部署前替换成 registry 地址 + 不可变 tag，例如
+          #     swr.<region>.myhuaweicloud.com/<组织>/lea-config:<commit-sha>
+          # **用 commit sha，不要用 latest** —— 用 latest 就回到了"线上跑的是哪个
+          # commit 查不出来"那个问题。CI 每次构建都会打 sha tag，见 .gitlab-ci.yml。
+          image: lea-config:REPLACE_ME
+          imagePullPolicy: Always
           ports:
             - {name: http, containerPort: 8500}
           envFrom:

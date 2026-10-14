@@ -3,18 +3,33 @@ global:
   evaluation_interval: 15s
   external_labels:
     cluster: 'lea-platform'
-    environment: 'staging'
+    environment: 'test'
 
-# Prometheus 会保留 15 天的数据
-# 生产环境改成 30 天或更长，取决于存储空间
 rule_files:
   - 'alerts.yml'
 
+# ── 目标地址用 compose 服务名 ────────────────────────────────────────────────
+#
+# 这份配置之前的目标全都采不到，实测确认了三个独立的原因，每个都值得记下来：
+#
+#   1. 主机名错。原来写的是 lea-agent / lea-config / lea-rag，而
+#      infra/docker-compose.test-server.yml 里的服务名是 agent / config / rag
+#      （容器名才是 lea-agent-test 那种）。compose 网络按**服务名**解析，所以
+#      lea-agent 在网络里不存在。
+#   2. lea-agent 的端口错。原来写 8200，实际 metrics 挂在主端口 **8100** 的 gin
+#      路由上（cmd/server/main.go 里 r.GET("/metrics", ...)），没有独立的指标端口。
+#   3. Python 服务的 /metrics 被服务间鉴权挡着，返 401。Prometheus 的 scrape_configs
+#      不支持自定义请求头，所以靠把 /metrics 加进 lea_authkit 的 EXEMPT_PATHS 解决
+#      （理由和 /health 同构：采集器带不了自定义头）。
+#
+# 上线前记得按环境核对一遍：k8s 里的目标应该换成 Service 名或者改用
+# kubernetes_sd_configs 自动发现，不要照抄这份 compose 的服务名。
+
 scrape_configs:
-  # lea-agent: 聊天引擎，核心服务
+  # lea-agent：聊天引擎。metrics 在主端口，不是 8200。
   - job_name: 'lea-agent'
     static_configs:
-      - targets: ['lea-agent:8200']
+      - targets: ['agent:8100']
     metrics_path: '/metrics'
     scrape_interval: 15s
     scrape_timeout: 10s
@@ -24,10 +39,10 @@ scrape_configs:
       - target_label: service
         replacement: 'lea-agent'
 
-  # lea-config: agent 配置 + 缓存
+  # lea-config：agent 配置 + 缓存
   - job_name: 'lea-config'
     static_configs:
-      - targets: ['lea-config:8500']
+      - targets: ['config:8500']
     metrics_path: '/metrics'
     scrape_interval: 15s
     scrape_timeout: 10s
@@ -37,10 +52,10 @@ scrape_configs:
       - target_label: service
         replacement: 'lea-config'
 
-  # lea-rag: 知识库检索 + 文档处理
+  # lea-rag：知识库检索 + 文档处理 + 记忆
   - job_name: 'lea-rag'
     static_configs:
-      - targets: ['lea-rag:8300']
+      - targets: ['rag:8300']
     metrics_path: '/metrics'
     scrape_interval: 15s
     scrape_timeout: 10s
@@ -50,10 +65,16 @@ scrape_configs:
       - target_label: service
         replacement: 'lea-rag'
 
-  # lea-tools: 工具执行 + 沙箱 + MCP
+  # lea-tools：工具执行 + 沙箱 + MCP
+  #
+  # ⚠️ 它**不在这个 compose 栈里**，按约定部署在远端 10.192.241.137:8400
+  # （见 docker-compose.test-server.yml 头部）。所以这里写 IP 而不是服务名。
+  #
+  # 实测（2026-10-13）这个端口是 connection refused —— 服务当时没在跑。这个 job
+  # 会显示 down，那是真实状态，不是配置错。
   - job_name: 'lea-tools'
     static_configs:
-      - targets: ['lea-tools:8400']
+      - targets: ['10.192.241.137:8400']
     metrics_path: '/metrics'
     scrape_interval: 15s
     scrape_timeout: 10s
@@ -63,12 +84,37 @@ scrape_configs:
       - target_label: service
         replacement: 'lea-tools'
 
-  # Redis（可选，如果 redis_exporter 在运行）
+  # ── 下面三个服务没有配 job，因为它们压根没有指标端点（实测 2026-10-13）──────
+  #
+  # 不配**永远 down 的目标**是有意的：那种目标会训练人忽略告警面板，比没有更糟。
+  # 等补上埋点之后再把 job 加回来。
+  #
+  #   lea-gateway     没有 /metrics。main.go 里没有 promhttp，访问那个路径得到的
+  #                   401 是鉴权中间件挡在未注册路由上，不是鉴权问题。
+  #                   **这个缺口最该先补** —— 网关是所有请求的必经之路，也是唯一
+  #                   对公网的服务。它没有指标，等于"整体 QPS / 错误率 / 延迟"这
+  #                   三个最基本的问题都答不了。补法：引 promhttp，在鉴权中间件
+  #                   之前注册 /metrics（跟 /health 一样放行）。
+  #
+  #   lea-agent-worker 不监听任何 HTTP 端口（cmd/worker/main.go 里没有 http.Server）。
+  #                   它的主职是从 Temporal Task Queue 取活。于是**排队执行的那条
+  #                   链路完全没有可观测性** —— 长任务卡住、重试风暴、Task Queue
+  #                   堆积，全都看不见。补法：给 worker 起一个只服务 /metrics 的
+  #                   HTTP server。
+  #
+  #   lea-parser      /metrics 返 404（带不带内部 token 都一样）。
+
+  # Prometheus 自己。自监控很便宜，而且"采集器是不是还活着"这个问题得有人答。
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # Redis / MySQL 需要各自的 exporter，现在没部署。要加的话起
+  # oliver006/redis_exporter 和 prom/mysqld-exporter，然后把下面两段打开。
   # - job_name: 'redis'
   #   static_configs:
   #     - targets: ['redis-exporter:9121']
-
-  # MySQL（可选，如果 mysqld_exporter 在运行）
+  #
   # - job_name: 'mysql'
   #   static_configs:
   #     - targets: ['mysql-exporter:9104']

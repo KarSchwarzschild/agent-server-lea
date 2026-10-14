@@ -64,10 +64,21 @@ logger = structlog.get_logger()
 
 HEADER = "X-Internal-Token"
 
-# 探针要用，不能鉴权 —— k8s 的 readiness/liveness 不会带自定义头。
-# 只放 /health 一条：/docs 和 /openapi.json **故意不放**，它们会把整个接口面
-# （包括 admin 那几组）暴露给任何能连上端口的东西。
-EXEMPT_PATHS = frozenset({"/health"})
+# 探针和采集器要用，不能鉴权 —— k8s 的 readiness/liveness 和 Prometheus 的 scrape
+# 都不会带自定义头。Prometheus 的 scrape_configs 压根**不支持**自定义请求头（只有
+# Basic / Bearer / mTLS），所以 /metrics 想被采集就只能走白名单。
+#
+# /docs 和 /openapi.json **故意不放**，它们会把整个接口面（包括 admin 那几组）
+# 暴露给任何能连上端口的东西。
+#
+# /metrics 放出来之前确认过内容：标签只有路由模板、method、状态码和 kb_id，没有
+# 租户或用户标识（见各服务 metrics.py 的 _endpoint_label —— 它取的是路由模板而不
+# 是实际路径，既防基数爆炸也顺带不泄资源 ID）。暴露面是"有哪些端点、各自多少次
+# 多快"，在集群内网里是监控系统的正常输入。
+#
+# 仍然**不该让它出集群**：infra/k8s/networkpolicy.yaml 限制了谁能连这些端口，
+# 加端点时别把 /metrics 一起放进公网 Ingress。
+EXEMPT_PATHS = frozenset({"/health", "/metrics"})
 
 
 def _configured_token() -> str:

@@ -109,23 +109,10 @@ groups:
             Instance: {{ $labels.instance }}
             检查 Redis 连接和容量。
 
-      - alert: CacheMissRate
-        expr: |
-          (
-            sum(rate(lea_config_cache_misses_total[5m]))
-            /
-            sum(rate(lea_config_cache_requests_total[5m]))
-          ) > 0.5
-        for: 15m
-        labels:
-          severity: warning
-          service: lea-config
-        annotations:
-          summary: "缓存命中率过低 < 50%"
-          description: |
-            命中率: {{ $value | humanizePercentage }}
-            Instance: {{ $labels.instance }}
-            可能是 Redis 故障或容量不足。
+      # CacheMissRate 删掉了（2026-10-13）。它用的 lea_config_cache_misses_total /
+      # lea_config_cache_requests_total 两个指标在代码里不存在，所以这条规则从来
+      # 不会触发；而它想表达的事情跟上面那条 CacheInvalidationRateHigh 重复 ——
+      # 那条用的 lea_config_agent_config_loads_total{status="cache_miss"} 是真实存在的。
 
       # ========== 数据库告警 ==========
 
@@ -142,18 +129,22 @@ groups:
             Instance: {{ $labels.instance }}
             检查数据库是否有慢查询或索引缺失。
 
-      - alert: DBConnectionPoolExhausted
-        expr: lea_config_db_connection_pool_usage > 0.8
-        for: 5m
-        labels:
-          severity: warning
-          service: lea-config
-        annotations:
-          summary: "数据库连接池使用率 > 80%"
-          description: |
-            使用率: {{ $value | humanizePercentage }}
-            Instance: {{ $labels.instance }}
-            增加连接池大小或优化查询。
+      # DBConnectionPoolExhausted 注释掉了（2026-10-13）：
+      # lea_config_db_connection_pool_usage 这个指标在代码里不存在，规则永不触发。
+      #
+      # 连接池耗尽是很值得告警的一件事，所以这条**该补**而不是该删 —— 要补的是埋点：
+      # 在 lea-config 里把 SQLAlchemy 的 pool.status()（checkedout / pool_size）
+      # 导成一个 Gauge，然后把下面三行打开。
+      #
+      # - alert: DBConnectionPoolExhausted
+      #   expr: lea_config_db_connection_pool_usage > 0.8
+      #   for: 5m
+      #   labels:
+      #     severity: warning
+      #     service: lea-config
+      #   annotations:
+      #     summary: "数据库连接池使用率 > 80%"
+      #     description: "增加连接池大小或优化查询。"
 
       # ========== KB/RAG 告警 ==========
 
@@ -201,8 +192,14 @@ groups:
             Instance: {{ $labels.instance }}
             检查沙箱和 MCP 连接状态。
 
+      # 原来用的 lea_tools_sandbox_timeouts_total 不存在。实际有的是
+      # lea_tools_sandbox_executions_total，带 status 标签 —— 所以按 status 过滤
+      # 来表达同一件事，不用新加埋点。
+      #
+      # status 的取值已核对：success / error / timeout
+      # （packages/lea-tools/src/lea_tools/metrics.py:58，打点在同文件 148 行）。
       - alert: SandboxExecutionTimeout
-        expr: rate(lea_tools_sandbox_timeouts_total[5m]) > 0
+        expr: rate(lea_tools_sandbox_executions_total{status="timeout"}[5m]) > 0
         for: 5m
         labels:
           severity: warning
@@ -254,21 +251,20 @@ groups:
             P99 延迟: {{ $value | humanizeDuration }}
             Instance: {{ $labels.instance }}
 
-      - alert: CeleryTaskQueueLarge
-        expr: lea_rag_celery_queue_size > 1000
-        for: 15m
-        labels:
-          severity: warning
-          service: lea-rag
-        annotations:
-          summary: "Celery 任务队列堆积 > 1000"
-          description: |
-            当前队列: {{ $value }}
-            Instance: {{ $labels.instance }}
-            考虑增加 worker 数量。
+      # CeleryTaskQueueLarge 删掉了（2026-10-13）。两个理由叠在一起：
+      # lea_rag_celery_queue_size 这个指标不存在，而且 **Celery 本身已经不在调用
+      # 链里**了 —— 现在只剩在 packages/lea-apps-legacy（归档代码）。异步执行走的
+      # 是 Temporal（lea-agent-worker + Task Queue）。
+      #
+      # "队列堆积"仍然是该告警的事，但对象变了：要看的是 Temporal 的 Task Queue
+      # backlog。Temporal 自己导 Prometheus 指标（server 侧的
+      # temporal_task_queue_* 之类），路子是把 Temporal 加成一个 scrape 目标，
+      # 而不是在 lea-rag 里加埋点。
 
       - alert: SessionMemoryHigh
-        expr: lea_agent_session_count > 400
+        # 指标名是 lea_agent_active_sessions（metrics.go:99），原来写的
+        # lea_agent_session_count 不存在 —— 这条告警因此从来不会触发。
+        expr: lea_agent_active_sessions > 400
         for: 10m
         labels:
           severity: warning
@@ -279,14 +275,20 @@ groups:
             当前会话数: {{ $value }}
             Instance: {{ $labels.instance }}
 
-      - alert: AttachmentLoadFailures
-        expr: increase(lea_agent_session_attachments_load_errors_total[5m]) > 0
-        for: 5m
-        labels:
-          severity: info
-        annotations:
-          summary: "会话级挂载加载失败"
-          description: |
-            5 分钟内失败数: {{ $value }}
-            Instance: {{ $labels.instance }}
-            这不会中断对话，但需要检查挂载来源。
+      # AttachmentLoadFailures 注释掉了（2026-10-13）：
+      # lea_agent_session_attachments_load_errors_total 这个指标不存在，规则永不触发。
+      #
+      # 这条**该补埋点**而不是该删。挂载加载失败是故意 fail-soft 的（见
+      # session/manager.go 里 mergeSessionAttachments 那段注释：整段失败只记日志不
+      # 阻断，因为"少几个临时工具比整段对话打不开轻得多"）—— 正因为它对用户不可见,
+      # 才需要指标兜着，否则这类故障只存在于日志里，没人会发现。
+      #
+      # 补法：在 mergeSessionAttachments 的失败分支里 inc 一个 Counter。
+      #
+      # - alert: AttachmentLoadFailures
+      #   expr: increase(lea_agent_session_attachments_load_errors_total[5m]) > 0
+      #   for: 5m
+      #   labels:
+      #     severity: info
+      #   annotations:
+      #     summary: "会话级挂载加载失败"

@@ -1,0 +1,85 @@
+# infra/docker-compose.monitoring.yml —— 测试服的 Prometheus + Grafana
+#
+# 为什么单独一份：业务栈（docker-compose.test-server.yml）重建业务镜像的频率远高于
+# 监控栈。放一起的话每次 up -d 都要把监控也过一遍，而监控恰恰是出问题时唯一还能
+# 看的东西 —— 不该跟着业务一起抖。
+#
+# 启动（**必须跟业务栈同一个 project**，否则进不去同一个网络、采集不到任何目标）：
+#
+#     cd infra
+#     docker compose -p lea-test --env-file ../.env \
+#         -f docker-compose.test-server.yml -f docker-compose.monitoring.yml \
+#         up -d prometheus grafana
+#
+# 只带 -f docker-compose.monitoring.yml 一个文件是不行的：Prometheus 要靠 compose
+# 网络里的服务名（agent / config / rag）解析目标，而那些服务定义在另一份里。
+#
+# ── 端口策略 ────────────────────────────────────────────────────────────────
+#
+# 两个都绑 127.0.0.1，跟 minio / milvus / temporal-ui 一致。
+#
+# Grafana 默认口令是 admin/admin，而这台机器多半有公网 IP —— 暴露出去等于把所有
+# 业务指标（和 Grafana 里配的数据源凭据）送人。要看就 ssh 端口转发：
+#
+#     ssh -L 3003:127.0.0.1:3003 -L 9090:127.0.0.1:9090 root@202.205.160.9
+#
+# 然后本机开 http://127.0.0.1:3003
+#
+# Grafana 用宿主 3003，不是惯常的 3000/3001。两个都不能用，原因不一样：
+#   3000  在 10.192.241.137 上是 Cube 沙箱的端口，两边都记成 3000 排查时容易搞混
+#   3001  这台机器上已经被 one-api-2 这个容器占着（跟本项目无关，不要动它）
+#   3002  也被占了
+# 换端口前先 `ss -tln | grep :<port>` 确认一下 —— 这台机器上跑着不少跟本项目无关
+# 的东西。
+
+services:
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    container_name: lea-prometheus-test
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      # 保留 15 天。这台机器磁盘已经 85%（2026-10-13 实测），别配更长 ——
+      # 真要长期留存，该往远端存储推，不是在本地堆。
+      - '--storage.tsdb.retention.time=15d'
+      - '--web.enable-lifecycle'
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-test-data:/prometheus
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  grafana:
+    image: grafana/grafana:11.5.1
+    container_name: lea-grafana-test
+    ports:
+      - "127.0.0.1:3003:3000"
+    environment:
+      # 口令从 .env 取，不写死在文件里。没设的话用 admin —— 因为只绑 127.0.0.1,
+      # 风险可接受，但生产上必须设。
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      # 禁掉匿名访问和注册：这是个只给运维看的实例。
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # 用不到的外联一律关掉，省得它去连公网（这台机器的出网未必通）。
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-test-data:/var/lib/grafana
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  prometheus-test-data:
+  grafana-test-data:

@@ -51,6 +51,24 @@ agent_config_load_duration = Histogram(
 )
 
 
+def _endpoint_label(request: Request) -> str:
+    """endpoint 标签取**路由模板**而不是实际路径。
+
+    原来用的是 request.url.path，于是 /agents/1、/agents/2 … 各自是一条独立的时间
+    序列。路径里带的是用户生成的主键，所以 series 数量没有上限 —— 这是 Prometheus
+    最典型的基数爆炸（内存按 series 数涨），而且把资源 ID 泄进了指标。
+
+    改成 /agents/{agent_id} 这种模板之后，一个端点就是一条序列。
+
+    拿不到 route 的情况（404 没匹配上任何路由、或中间件在路由之前就短路了）归成
+    一个固定的 "unmatched" —— 这里**不能回退到 request.url.path**，否则扫描器打一
+    串随机路径就能把序列数顶上去，等于留了个远程把监控打爆的口子。
+    """
+    route = request.scope.get("route")
+    path_format = getattr(route, "path", None) if route else None
+    return path_format or "unmatched"
+
+
 class MetricsMiddleware(BaseHTTPMiddleware):
     """记录 HTTP 请求指标的中间件"""
 
@@ -62,7 +80,7 @@ class MetricsMiddleware(BaseHTTPMiddleware):
 
         # 记录指标
         duration = time.time() - start
-        endpoint = request.url.path
+        endpoint = _endpoint_label(request)
         method = request.method
         status = self._status_to_label(response.status_code)
 

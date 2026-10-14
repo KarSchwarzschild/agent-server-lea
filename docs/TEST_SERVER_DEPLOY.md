@@ -191,6 +191,61 @@ curl -s -X POST -H "Authorization: Bearer $TOK" -H "X-Selected-Tenant-ID: wjtest
 
 会话是**首次发消息才落库**的，建完立刻查 `chat_sessions` 查不到，不是 bug。
 
+## 监控（Prometheus + Grafana）
+
+跟业务栈分开一份 `infra/docker-compose.monitoring.yml`，但**必须挂同一个 compose
+project**，否则进不去同一个网络、采集不到任何目标：
+
+```bash
+cd /root/lea-platform/infra
+docker compose -p lea-test --env-file ../.env \
+    -f docker-compose.test-server.yml -f docker-compose.monitoring.yml \
+    up -d prometheus grafana
+```
+
+两个都绑 `127.0.0.1`，外网访问不到。要看就端口转发：
+
+```bash
+ssh -L 3003:127.0.0.1:3003 -L 9090:127.0.0.1:9090 root@202.205.160.9
+# 然后本机开 http://127.0.0.1:3003 （Grafana，默认 admin/admin）
+#            http://127.0.0.1:9090 （Prometheus）
+```
+
+Grafana 用宿主 **3003**：3001 和 3002 在这台机器上被跟本项目无关的容器占着
+（`one-api-2` 等），3000 在 10.192.241.137 上是 Cube 沙箱。换端口前先
+`ss -tln | grep :<port>`。
+
+### 拉镜像的坑
+
+这台机器**连不上 Docker Hub**（`registry-1.docker.io` TLS handshake timeout）。
+`/etc/docker/daemon.json` 里配了两个加速站，但 daemon 没重启过所以没生效 ——
+而重启 dockerd 会把这台机器上所有容器带下来，包括一堆跟本项目无关的，所以不要
+那么做。
+
+办法是显式指定镜像站地址拉，再 retag 成 compose 期望的名字：
+
+```bash
+docker pull docker.1ms.run/prom/prometheus:v3.1.0
+docker tag  docker.1ms.run/prom/prometheus:v3.1.0 prom/prometheus:v3.1.0
+```
+
+### 当前采集到什么
+
+5 个目标全 up：`lea-agent`、`lea-config`、`lea-rag`、`lea-tools`、`prometheus`
+自身。15 条告警规则加载正常。
+
+**三个服务没有指标端点**，所以没配 job（配了只会得到永远 down 的目标，而永远 down
+的目标会训练人忽略面板）：
+
+| 服务 | 情况 | 影响 |
+|---|---|---|
+| `lea-gateway` | 没有 `/metrics`（main.go 里没引 promhttp） | **最该先补**。网关是所有请求的必经之路和唯一对公网的服务，没有指标等于整体 QPS / 错误率 / 延迟三个最基本的问题都答不了 |
+| `lea-agent-worker` | 不监听任何 HTTP 端口 | 排队执行那条链路完全没有可观测性 —— 长任务卡住、重试风暴、Task Queue 堆积都看不见 |
+| `lea-parser` | `/metrics` 返 404 | 解析服务无指标 |
+
+另外 Redis 和 MySQL 需要各自的 exporter，现在没部署（`prometheus.yml` 里留了注释
+好的配置段，起 exporter 之后打开即可）。
+
 ## 回滚
 
 镜像打的是 `:test` 这个固定 tag，`docker compose build` 会把上一版顶掉，所以

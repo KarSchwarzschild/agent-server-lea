@@ -20,12 +20,10 @@
 
 from __future__ import annotations
 
-from typing import Optional
-
 from fastapi import APIRouter, Depends, Query
+from lea_authkit import Actor, require_actor
 from sqlalchemy.orm import Session
 
-from lea_authkit import Actor, require_actor
 from lea_config.database import get_db
 from lea_config.models.retrieval_model import RetrievalModel
 
@@ -36,7 +34,7 @@ _ALLOWED_TYPES = ("embedding", "reranker", "vlm", "asr")
 
 @router.get("")
 def list_retrieval_models(
-    model_type: Optional[str] = Query(None, pattern=r"^(embedding|reranker|vlm|asr)$"),
+    model_type: str | None = Query(None, pattern=r"^(embedding|reranker|vlm|asr)$"),
     db: Session = Depends(get_db),
     actor: Actor = Depends(require_actor),
 ):

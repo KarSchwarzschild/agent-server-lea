@@ -17,7 +17,6 @@ import re
 import sys
 from pathlib import Path
 
-
 # ── 让 python 能 import lea_server （不依赖 pip install -e） ──────
 _ROOT = Path(__file__).resolve().parents[2]
 for pkg in ("lea-server", "lea-graph", "lea-apps", "lea-rag"):
@@ -180,7 +179,8 @@ def cmd_assert_sandbox(session_id: str) -> int:
     sandbox_calls = extra.get("sandbox_calls") or []
     if not sandbox_calls:
         print(
-            f"[assert_sandbox] extra.sandbox_calls 空 (msg#{latest.id})；LLM 没调 sandbox_exec，或 collector 没收到事件。"
+            f"[assert_sandbox] extra.sandbox_calls 空 (msg#{latest.id})；"
+            f"LLM 没调 sandbox_exec，或 collector 没收到事件。"
             f" raw extra keys={list(extra.keys())}",
             file=sys.stderr,
         )

@@ -45,7 +45,7 @@ class HybridRetriever:
 
     def _build_retriever(self, source_ids: list[int] | None = None, metadata_filters: list | None = None):
         kwargs: dict = {}
-        from llama_index.core.vector_stores import MetadataFilter, MetadataFilters, FilterOperator
+        from llama_index.core.vector_stores import FilterOperator, MetadataFilter, MetadataFilters
 
         filters_list = []
         if source_ids:

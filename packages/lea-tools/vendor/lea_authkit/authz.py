@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import structlog
-from fastapi import Depends, Header, HTTPException
+from fastapi import Header, HTTPException
 
 from lea_authkit.internal_auth import _configured_token
 

@@ -5,12 +5,13 @@
 # 3. Redis 不可用时降级回源（不报错）
 # 4. 缓存失效后重新加载
 
-import requests
-import redis
+import io
 import json
 import sys
-import io
 import time
+
+import redis
+import requests
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
@@ -79,22 +80,22 @@ cached = r.get(cache_key)
 if cached:
     try:
         cfg = json.loads(cached)
-        print(f"  [OK] 缓存已写入 Redis")
+        print("  [OK] 缓存已写入 Redis")
         print(f"      - agent_id: {cfg.get('id')}")
         print(f"      - model: {cfg.get('model')}")
         ttl = r.ttl(cache_key)
         print(f"      - TTL: {ttl}s")
     except json.JSONDecodeError:
-        print(f"  [ERROR] 缓存内容不是合法 JSON", file=sys.stderr)
+        print("  [ERROR] 缓存内容不是合法 JSON", file=sys.stderr)
 else:
-    print(f"  [WARN] Redis 中未找到缓存（可能缓存功能未启用）")
+    print("  [WARN] Redis 中未找到缓存（可能缓存功能未启用）")
 
 # 判据 2：二次加载命中缓存
 print("\n[2/4] 二次加载（应命中缓存）")
 # 再创建一个会话
 session_id2 = create_session(agent_id=0)
 print(f"  [OK] 第二个会话创建成功: {session_id2}")
-print(f"  [PASS] 如果 lea-agent 日志中无新的 /internal/agent-config 调用，说明命中缓存")
+print("  [PASS] 如果 lea-agent 日志中无新的 /internal/agent-config 调用，说明命中缓存")
 
 # 判据 3：缓存失效
 print("\n[3/4] 缓存失效后重新加载")
@@ -107,9 +108,9 @@ print(f"  [OK] 会话创建成功: {session_id3}")
 time.sleep(0.5)
 cached = r.get(cache_key)
 if cached:
-    print(f"  [OK] 缓存已重新写入")
+    print("  [OK] 缓存已重新写入")
 else:
-    print(f"  [WARN] 缓存未写入")
+    print("  [WARN] 缓存未写入")
 
 # 判据 4：TTL 抖动（防雪崩）
 print("\n[4/4] 验证 TTL 抖动（防雪崩）")
@@ -134,9 +135,9 @@ if len(ttls) > 1:
     if ttl_range > 0:
         print(f"  [OK] TTL 有抖动 (range={ttl_range}s)，防雪崩生效")
     else:
-        print(f"  [WARN] TTL 无抖动，可能是样本太少")
+        print("  [WARN] TTL 无抖动，可能是样本太少")
 else:
-    print(f"  [SKIP] TTL 样本不足")
+    print("  [SKIP] TTL 样本不足")
 
 # 检查缓存内容完整性
 print("\n[验证] 缓存内容完整性")
@@ -148,7 +149,7 @@ if cached:
     if missing:
         print(f"  [ERROR] 缺少字段: {missing}", file=sys.stderr)
     else:
-        print(f"  [OK] 缓存内容完整")
+        print("  [OK] 缓存内容完整")
         print(f"      - id: {cfg['id']}")
         print(f"      - name: {cfg['name']}")
         print(f"      - model: {cfg['model']}")

@@ -12,7 +12,6 @@ from __future__ import annotations
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-
 from lea_authkit import HEADER, install_internal_auth, internal_headers
 
 TOKEN = "tok-abc-123"

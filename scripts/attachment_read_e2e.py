@@ -294,7 +294,7 @@ def main() -> int:
         # ── ② 注入段 ──────────────────────────────────────────────
         step(2, "② 带附件提问，检查注入进消息的是路径还是正文")
         mark = message_count(conn, sess)
-        q = f"这份文件里写的课程内部代号是什么？请原样给出那个代号。"
+        q = "这份文件里写的课程内部代号是什么？请原样给出那个代号。"
         if ask(sess, q, [att_id]) != 200:
             fails.append("② 带附件提问失败")
             raise SystemExit
@@ -352,47 +352,46 @@ def main() -> int:
         else:
             img_id = up_img["body"]["id"]
             att_ids.append(img_id)
-            img_row = attachment_row(conn, img_id)
-            if False:
-                skips.append("图片未物化 → 跳过 ⑤ 的读取部分")
-                print("    ⚠️ 图片未物化，跳过读取部分")
+            # 原来这里有个 `if False:` 的跳过分支（判图片是否物化），从提交进来那天
+            # 起条件就写死成 False、永远走 else，配套的 attachment_row() 查询结果也
+            # 没人用。等于是个没接上的开关，直接删掉——真要加回这个判断，重新写条件
+            # 比留一个永假分支清楚。
+            mark_i = message_count(conn, sess_img)
+            if ask(sess_img, "这张图上有什么？", [img_id]) != 200:
+                fails.append("⑤ 图片提问失败")
             else:
-                mark_i = message_count(conn, sess_img)
-                if ask(sess_img, "这张图上有什么？", [img_id]) != 200:
-                    fails.append("⑤ 图片提问失败")
-                else:
-                    gi = dissect(conn, sess_img, mark_i)
-                    # ⚠️ 只看**读这个附件的 Read** 的返回，不看全部 results。
-                    #
-                    # 模型进沙箱后可能自己去试 OCR、pip 装 pytesseract、cp 文件 ——
-                    # 那些是它的自由，输出里出现 "OCR"/"pytesseract" 是正常的。
-                    # 这条判据管的是 renderUpload（Read 读附件）说了什么，别把沙箱命令
-                    # 的输出也算进来（上一版就是这么误判的：⑤ 明明干净，却被 ls 输出里
-                    # 模型自己提的 OCR 拖挂）。
-                    #
-                    # renderUpload 的返回有稳定特征"没有文本层"，用它把那条 tool_result
-                    # 挑出来单独检查。
-                    read_returns = [r for r in gi["results"] if "没有文本层" in r]
-                    render_out = read_returns[0] if read_returns else ""
-                    print(f"    Read 调用: {gi['reads'] or '（无）'}")
-                    print(f"    附件 Read 返回: {render_out[:200]}")
-                    print(f"    回复: {gi['reply'][:150]}")
-                    if gi["reads"]:
-                        if not any(str(p.get("path", "")) == f"attachment:{img_id}" for p in gi["reads"]):
-                            fails.append("⑤ 图片没有通过 attachment:<id> 调用 Read")
-                        elif not render_out:
-                            fails.append(f"⑤ 图片的 Read 返回没说清'没有文本层'")
-                        else:
-                            print("    ✓ ⑤ 图片走 Read 得到了性质说明，不是报错")
-                        # 可配置项不能点名 —— 只查 renderUpload 的返回，不查沙箱输出
-                        named = [w for w in ("OCR", "PIL", "Pillow", "pytesseract")
-                                 if w in render_out]
-                        if named:
-                            fails.append(f"⑤ Read 返回点名了可配置项 {named}")
+                gi = dissect(conn, sess_img, mark_i)
+                # ⚠️ 只看**读这个附件的 Read** 的返回，不看全部 results。
+                #
+                # 模型进沙箱后可能自己去试 OCR、pip 装 pytesseract、cp 文件 ——
+                # 那些是它的自由，输出里出现 "OCR"/"pytesseract" 是正常的。
+                # 这条判据管的是 renderUpload（Read 读附件）说了什么，别把沙箱命令
+                # 的输出也算进来（上一版就是这么误判的：⑤ 明明干净，却被 ls 输出里
+                # 模型自己提的 OCR 拖挂）。
+                #
+                # renderUpload 的返回有稳定特征"没有文本层"，用它把那条 tool_result
+                # 挑出来单独检查。
+                read_returns = [r for r in gi["results"] if "没有文本层" in r]
+                render_out = read_returns[0] if read_returns else ""
+                print(f"    Read 调用: {gi['reads'] or '（无）'}")
+                print(f"    附件 Read 返回: {render_out[:200]}")
+                print(f"    回复: {gi['reply'][:150]}")
+                if gi["reads"]:
+                    if not any(str(p.get("path", "")) == f"attachment:{img_id}" for p in gi["reads"]):
+                        fails.append("⑤ 图片没有通过 attachment:<id> 调用 Read")
+                    elif not render_out:
+                        fails.append("⑤ 图片的 Read 返回没说清'没有文本层'")
                     else:
-                        # 图片不调 Read 是可接受的（模型可能直接说"我需要看图"），
-                        # 但要记下来 —— 它意味着图片这条路目前没有真正的出口。
-                        skips.append("⑤ 模型没对图片调 Read（可接受，但图片路径未被验证）")
+                        print("    ✓ ⑤ 图片走 Read 得到了性质说明，不是报错")
+                    # 可配置项不能点名 —— 只查 renderUpload 的返回，不查沙箱输出
+                    named = [w for w in ("OCR", "PIL", "Pillow", "pytesseract")
+                             if w in render_out]
+                    if named:
+                        fails.append(f"⑤ Read 返回点名了可配置项 {named}")
+                else:
+                    # 图片不调 Read 是可接受的（模型可能直接说"我需要看图"），
+                    # 但要记下来 —— 它意味着图片这条路目前没有真正的出口。
+                    skips.append("⑤ 模型没对图片调 Read（可接受，但图片路径未被验证）")
 
         # ── ⑥ 没物化的附件 ────────────────────────────────────────
         step(6, "⑥ 没物化的附件不该给路径")
@@ -455,7 +454,7 @@ def main() -> int:
                         "⑦ 进了沙箱但 staged_path 还是空 —— 物化没被触发或失败了。"
                         "查 lea-tools 日志的 stage 报错。")
                 else:
-                    print(f"    ✓ ⑦ 进沙箱触发了物化，staged_path 已回填")
+                    print("    ✓ ⑦ 进沙箱触发了物化，staged_path 已回填")
                     # host-mount 生效则沙箱里 ls /mnt/uploads 能看到物化的文件。
                     # 物化在建沙箱**之前**发生（见 file_tools.go ensureSandbox 顺序），
                     # 所以 bind-mount 挂的是已有文件的目录。

@@ -26,9 +26,9 @@ LLM 凭据，这也是为什么不能简单地给 `llm_providers` 加一套 CRUD
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends
+from lea_authkit import Actor, require_actor
 from sqlalchemy.orm import Session
 
-from lea_authkit import Actor, require_actor
 from lea_config.database import get_db
 from lea_config.models.llm_provider import (
     LLMProvider,

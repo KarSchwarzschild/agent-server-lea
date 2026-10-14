@@ -22,9 +22,6 @@ lea-tools 的 Tool 模型以前**没有 tenant_id**，而 name 是 unique=True�
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import create_engine, inspect
-from sqlalchemy.orm import sessionmaker
-
 from lea_tools.db import Base
 from lea_tools.db.models import (
     GLOBAL_TENANT_ID,
@@ -34,6 +31,8 @@ from lea_tools.db.models import (
 )
 from lea_tools.services import resolve_tool, visible_tools
 from lea_tools.services.registry import list_tools_for_session
+from sqlalchemy import create_engine, inspect
+from sqlalchemy.orm import sessionmaker
 
 T1, T2 = "tenant-a", "tenant-b"
 

@@ -174,9 +174,11 @@ def verify(conn, session_id: str) -> int:
 
     ok = True
     if not (lo <= covered < hi):
-        print(f"  ✗ covered_id 落在区间外"); ok = False
+        print("  ✗ covered_id 落在区间外")
+        ok = False
     if after <= 0:
-        print("  ✗ 摘要之后一条不剩 —— 下次 LoadHistory 会返回 [摘要 + 空]"); ok = False
+        print("  ✗ 摘要之后一条不剩 —— 下次 LoadHistory 会返回 [摘要 + 空]")
+        ok = False
 
     msg = json.loads(raw)
     text = "".join(b.get("text", "") for b in (msg.get("content") or [])

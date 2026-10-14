@@ -12,10 +12,10 @@ from __future__ import annotations
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from lea_authkit import Actor, require_actor
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from lea_authkit import Actor, require_actor
 from lea_rag.db.database import get_db
 from lea_rag.db.models import UserMemory
 

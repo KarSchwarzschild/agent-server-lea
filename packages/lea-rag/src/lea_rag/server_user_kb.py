@@ -9,12 +9,12 @@ from __future__ import annotations
 from datetime import datetime
 
 import structlog
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from lea_authkit import DELETE, READ, UPDATE, Actor, require, require_actor, scoped_filter
 from pydantic import BaseModel, Field
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
-from lea_authkit import READ, UPDATE, DELETE, Actor, require, require_actor, scoped_filter
 from lea_rag.db.database import get_db
 from lea_rag.db.models import Document, KnowledgeBase
 from lea_rag.services.kb_service import KBService
@@ -379,9 +379,8 @@ async def search_knowledge(
     actor: Actor = Depends(require_actor),
 ):
     """在指定 KB 中检索，复用 hybrid_v2 检索器（无 rerank，前端测试用）。"""
-    from lea_rag.retrieval.hybrid_v2 import HybridRetrieverV2
-
     from lea_rag.db.database import SessionLocal
+    from lea_rag.retrieval.hybrid_v2 import HybridRetrieverV2
     db = SessionLocal()
     try:
         kb = KBService(db).get_kb(kb_id)

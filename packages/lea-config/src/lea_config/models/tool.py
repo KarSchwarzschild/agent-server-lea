@@ -38,11 +38,11 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    and_,
     func,
+    or_,
     text,
 )
-
-from sqlalchemy import and_, or_
 
 from lea_config.database import (
     DEFAULT_TENANT_ID,

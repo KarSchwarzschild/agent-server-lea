@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
+from lea_authkit import Actor, require_actor
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from lea_authkit import Actor, require_actor
 from lea_config.database import DEFAULT_TENANT_ID, get_db
 from lea_config.models.agent import Agent
 from lea_config.models.mcp_server import MCPServer
@@ -17,10 +17,10 @@ from lea_config.services.publication import (
     RESOURCE_MCP_SERVER,
     RESOURCE_TOOL,
     cancel_request,
+    publication_request_dict,
     resource_scope,
     submit_resource_request,
 )
-from lea_config.services.publication import publication_request_dict
 
 router = APIRouter(tags=["publication-submissions"])
 
@@ -93,30 +93,63 @@ def _submit(resource_type: str, resource_id: int, body: ResourcePublicationBody,
 
 
 @router.post("/agents/{resource_id}/publication-requests", status_code=201)
-def submit_agent_publication(resource_id: int, body: ResourcePublicationBody, db: Session = Depends(get_db), actor: Actor = Depends(require_actor)):
+def submit_agent_publication(
+    resource_id: int,
+    body: ResourcePublicationBody,
+    db: Session = Depends(get_db),
+    actor: Actor = Depends(require_actor),
+):
     return publication_request_dict(_submit(RESOURCE_AGENT, resource_id, body, db, actor))
 
 
 @router.post("/agents/{resource_id}/publication-requests/{request_id}/cancel")
-def cancel_agent_publication(resource_id: int, request_id: int, body: ResourcePublicationCancelBody, db: Session = Depends(get_db), actor: Actor = Depends(require_actor)):
+def cancel_agent_publication(
+    resource_id: int,
+    request_id: int,
+    body: ResourcePublicationCancelBody,
+    db: Session = Depends(get_db),
+    actor: Actor = Depends(require_actor),
+):
     return publication_request_dict(_cancel(RESOURCE_AGENT, resource_id, request_id, body.note, db, actor))
 
 
 @router.post("/tools/{resource_id}/publication-requests", status_code=201)
-def submit_tool_publication(resource_id: int, body: ResourcePublicationBody, db: Session = Depends(get_db), actor: Actor = Depends(require_actor)):
+def submit_tool_publication(
+    resource_id: int,
+    body: ResourcePublicationBody,
+    db: Session = Depends(get_db),
+    actor: Actor = Depends(require_actor),
+):
     return publication_request_dict(_submit(RESOURCE_TOOL, resource_id, body, db, actor))
 
 
 @router.post("/tools/{resource_id}/publication-requests/{request_id}/cancel")
-def cancel_tool_publication(resource_id: int, request_id: int, body: ResourcePublicationCancelBody, db: Session = Depends(get_db), actor: Actor = Depends(require_actor)):
+def cancel_tool_publication(
+    resource_id: int,
+    request_id: int,
+    body: ResourcePublicationCancelBody,
+    db: Session = Depends(get_db),
+    actor: Actor = Depends(require_actor),
+):
     return publication_request_dict(_cancel(RESOURCE_TOOL, resource_id, request_id, body.note, db, actor))
 
 
 @router.post("/mcp-servers/{resource_id}/publication-requests", status_code=201)
-def submit_mcp_publication(resource_id: int, body: ResourcePublicationBody, db: Session = Depends(get_db), actor: Actor = Depends(require_actor)):
+def submit_mcp_publication(
+    resource_id: int,
+    body: ResourcePublicationBody,
+    db: Session = Depends(get_db),
+    actor: Actor = Depends(require_actor),
+):
     return publication_request_dict(_submit(RESOURCE_MCP_SERVER, resource_id, body, db, actor))
 
 
 @router.post("/mcp-servers/{resource_id}/publication-requests/{request_id}/cancel")
-def cancel_mcp_publication(resource_id: int, request_id: int, body: ResourcePublicationCancelBody, db: Session = Depends(get_db), actor: Actor = Depends(require_actor)):
+def cancel_mcp_publication(
+    resource_id: int,
+    request_id: int,
+    body: ResourcePublicationCancelBody,
+    db: Session = Depends(get_db),
+    actor: Actor = Depends(require_actor),
+):
     return publication_request_dict(_cancel(RESOURCE_MCP_SERVER, resource_id, request_id, body.note, db, actor))

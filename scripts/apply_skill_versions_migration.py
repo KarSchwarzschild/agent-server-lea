@@ -6,7 +6,6 @@ from pathlib import Path
 
 import pymysql
 
-
 sql = (Path(__file__).parent.parent / "migrations" / "015_skill_versions.sql").read_text(
     encoding="utf-8"
 )

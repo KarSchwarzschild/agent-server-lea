@@ -1,16 +1,17 @@
 """工具执行接口（含配额限流）。"""
 
+from typing import Any
+
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from typing import Any
 
 from lea_tools.db import get_db
 from lea_tools.db.models import ToolPermission
 from lea_tools.executor.router import ToolCall, execute
 from lea_tools.services import check_permission, resolve_tool
-from lea_tools.services.credential import get_credential_for_tool
 from lea_tools.services.cache import check_rate_limit
+from lea_tools.services.credential import get_credential_for_tool
 
 router = APIRouter(prefix="/tools", tags=["tools"])
 

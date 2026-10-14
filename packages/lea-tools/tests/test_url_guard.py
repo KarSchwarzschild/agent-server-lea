@@ -27,7 +27,6 @@ from __future__ import annotations
 import socket
 
 import pytest
-
 from lea_tools.executor.url_guard import check_outbound_url
 
 

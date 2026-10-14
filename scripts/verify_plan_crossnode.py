@@ -18,13 +18,12 @@ plan_mode=false 在副本 B 批准并加载计划（ActivatePlan + LoadActivePla
 
 from __future__ import annotations
 
+import argparse
 import json
-import os
 import subprocess
 import sys
 import time
 import uuid
-import argparse
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -133,7 +132,7 @@ def last_upstream(pattern: str) -> str:
             encoding='utf-8', errors='replace'
         )
         log = (result.stdout or "") + (result.stderr or "")
-        lines = [l for l in log.splitlines() if pattern in l]
+        lines = [ln for ln in log.splitlines() if pattern in ln]
         if not lines:
             return ""
         # upstream=172.18.0.X:8100
@@ -204,7 +203,7 @@ def stream_sse(url: str, body: dict, timeout: int = 180) -> SSEStream:
 # ── 主流程 ───────────────────────────────────────────────────────────────
 
 print(f"\n{'=' * 60}")
-print(f"  Plan 模式跨副本验证")
+print("  Plan 模式跨副本验证")
 print(f"  nginx: {BASE}")
 print(f"{'=' * 60}\n")
 
@@ -236,7 +235,10 @@ print("--- 2. plan_mode=true → 等待 agent 提交计划（AskUser） ---")
 
 plan_body = {
     "session_id": SID,
-    "message": "我要重构这个项目的认证模块。请先调研当前架构，然后用 AskUser 工具把重构计划提交给我审批。不要直接写计划文本——必须用 AskUser 工具。",
+    "message": (
+        "我要重构这个项目的认证模块。请先调研当前架构，然后用 AskUser 工具把重构计划"
+        "提交给我审批。不要直接写计划文本——必须用 AskUser 工具。"
+    ),
     "agent_id": 1,
     "plan_mode": True,
 }
@@ -265,7 +267,7 @@ else:
         print("  （模型没有使用 AskUser——直接生成了文本回复）")
         ok("模型回复了（但没用 AskUser——plan 持久化路径未走到）")
     elif plan_sse.got_error:
-        no(f"收到 error 事件")
+        no("收到 error 事件")
         print(f"  内容: {plan_sse.raw[-300:] if plan_sse.raw else '(空)'}")
     else:
         no("既没收到 ask_user 也没收到 result")

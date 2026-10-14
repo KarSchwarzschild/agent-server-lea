@@ -175,7 +175,13 @@ def _poll_batch_done(batch_id: str, token: str, timeout: int = 300) -> str:
         if not results:
             # v4 API 可能用 file_results 字段
             results = extract_data.get("file_results", [])
-        logger.info("mineru_poll", batch_id=batch_id, keys=list(extract_data.keys()), results_len=len(results), first=results[0] if results else None)
+        logger.info(
+            "mineru_poll",
+            batch_id=batch_id,
+            keys=list(extract_data.keys()),
+            results_len=len(results),
+            first=results[0] if results else None,
+        )
         if results and results[0].get("state") == "done":
             # v4 API 直接返回 full_zip_url，不需要二次请求
             zip_url = results[0].get("full_zip_url")

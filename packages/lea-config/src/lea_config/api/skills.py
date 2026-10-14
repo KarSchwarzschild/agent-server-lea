@@ -37,32 +37,41 @@ import os
 import re
 import zipfile
 from functools import lru_cache
-from typing import Optional
 
 import yaml
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from lea_authkit import Actor, require_actor
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from lea_authkit import Actor, require_actor
 from lea_config.database import (
     DEFAULT_TENANT_ID,
     OWNER_SCOPE_PLATFORM,
     OWNER_SCOPE_USER,
     get_db,
 )
-from lea_config.models.skill import Skill, SkillVersion
 from lea_config.models.binding import AgentSkillBinding
 from lea_config.models.publication import (
     PUBLICATION_APPROVED as PUBLISH_APPROVED,
+)
+from lea_config.models.publication import (
     PUBLICATION_PENDING as PUBLISH_PENDING,
+)
+from lea_config.models.publication import (
     PUBLICATION_REJECTED as PUBLISH_REJECTED,
+)
+from lea_config.models.publication import (
     PUBLICATION_TARGET_TENANT as PUBLISH_TARGET_TENANT,
+)
+from lea_config.models.publication import (
     PUBLICATION_TARGETS as PUBLISH_TARGETS,
+)
+from lea_config.models.publication import (
     PublicationRequest,
 )
+from lea_config.models.skill import Skill, SkillVersion
 from lea_config.models.tool import Tool
 from lea_config.services.publication import (
     RESOURCE_SKILL,
@@ -95,7 +104,7 @@ class SkillCreate(BaseModel):
     system_prompt: str = ""
     model_tier: str = "standard"
     required_tools: list = []
-    bundle_uri: Optional[str] = None
+    bundle_uri: str | None = None
     # 前端兼容字段（收下但不落库）
     allowed_tools: list[str] = []
     trigger_keywords: list[str] = []
@@ -107,19 +116,19 @@ class SkillCreate(BaseModel):
 
 
 class SkillUpdate(BaseModel):
-    display_name: Optional[str] = None
-    description: Optional[str] = None
-    category: Optional[str] = None
-    system_prompt: Optional[str] = None
-    model_tier: Optional[str] = None
-    required_tools: Optional[list] = None
-    enabled: Optional[bool] = None
+    display_name: str | None = None
+    description: str | None = None
+    category: str | None = None
+    system_prompt: str | None = None
+    model_tier: str | None = None
+    required_tools: list | None = None
+    enabled: bool | None = None
     # name 不给改：agent_skill_bindings 按 id 绑，但投递和披露都按 name
     # （sessions/<sid>/skills/<name>/ 和引擎的 skill.Skill.Name）。改名会让已投递的
     # 目录跟新名字对不上，而那个错要到模型去读 SKILL.md 时才显形。
-    allowed_tools: Optional[list[str]] = None
-    trigger_keywords: Optional[list[str]] = None
-    resources: Optional[dict] = None
+    allowed_tools: list[str] | None = None
+    trigger_keywords: list[str] | None = None
+    resources: dict | None = None
 
 
 class PublishRequestBody(BaseModel):

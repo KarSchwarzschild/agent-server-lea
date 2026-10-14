@@ -25,13 +25,12 @@ from __future__ import annotations
 
 import os
 from datetime import datetime
-from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from lea_authkit import Actor, internal_headers, require_actor
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from lea_authkit import Actor, internal_headers, require_actor
 from lea_config.api._auth_helpers import require_admin
 from lea_config.database import get_db
 from lea_config.models.mcp_server import (
@@ -58,20 +57,20 @@ class MCPServerCreate(BaseModel):
     # endpoint 必填。这是这轮修的核心：以前它压根不在创建契约里，于是**每一行建出来
     # 的 endpoint 都是 NULL**，而执行侧读的就是它 —— sync 和调用两条路一起断。
     endpoint: str = Field(min_length=1, max_length=500)
-    auth_config: Optional[dict] = None
-    tool_filter: Optional[list[str]] = None
+    auth_config: dict | None = None
+    tool_filter: list[str] | None = None
     enabled: bool = True
 
 
 class MCPServerUpdate(BaseModel):
-    name: Optional[str] = None
-    description: Optional[str] = None
-    category: Optional[str] = Field(None, min_length=1, max_length=50)
-    transport: Optional[str] = None
-    endpoint: Optional[str] = Field(None, min_length=1, max_length=500)
-    auth_config: Optional[dict] = None
-    tool_filter: Optional[list[str]] = None
-    enabled: Optional[bool] = None
+    name: str | None = None
+    description: str | None = None
+    category: str | None = Field(None, min_length=1, max_length=50)
+    transport: str | None = None
+    endpoint: str | None = Field(None, min_length=1, max_length=500)
+    auth_config: dict | None = None
+    tool_filter: list[str] | None = None
+    enabled: bool | None = None
 
 
 class MCPServerEnable(BaseModel):
@@ -245,9 +244,9 @@ async def _discover_remote_tools(s: MCPServer) -> dict:
 
 @router.get("")
 def list_servers(
-    transport: Optional[str] = Query(None),
-    enabled: Optional[bool] = Query(None),
-    search: Optional[str] = Query(None),
+    transport: str | None = Query(None),
+    enabled: bool | None = Query(None),
+    search: str | None = Query(None),
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),

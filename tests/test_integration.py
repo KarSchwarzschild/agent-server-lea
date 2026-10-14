@@ -16,10 +16,11 @@ import os
 import sys
 import tempfile
 
-import pytest
-
 # ── 环境设置 ──────────────────────────────────────────────────
 import tempfile as _tf
+
+import pytest
+
 _test_db_dir = _tf.mkdtemp(prefix="lea_integ_")
 os.environ["DB_HOST"] = "sqlite"
 os.environ["DB_NAME"] = os.path.join(_test_db_dir, "test")
@@ -59,9 +60,9 @@ class TestLeaConfig:
 
     @pytest.fixture(autouse=True)
     def setup(self):
-        from lea_config.server import app
-        from lea_config.database import Base, engine
         import lea_config.models  # noqa
+        from lea_config.database import Base, engine
+        from lea_config.server import app
         Base.metadata.create_all(bind=engine)
         from fastapi.testclient import TestClient
         self.client = TestClient(app)
@@ -192,9 +193,9 @@ class TestLeaParser:
 
     @pytest.fixture(autouse=True)
     def setup(self):
-        from lea_parser.server import app
-        from lea_parser.database import Base, engine
         import lea_parser.models  # noqa
+        from lea_parser.database import Base, engine
+        from lea_parser.server import app
         Base.metadata.create_all(bind=engine)
         from fastapi.testclient import TestClient
         self.client = TestClient(app)
@@ -289,9 +290,9 @@ class TestLeaTools:
     @pytest.fixture(autouse=True)
     def setup(self):
         try:
-            from lea_tools.server import app
-            from lea_tools.db import Base, engine
             import lea_tools.db.models  # noqa
+            from lea_tools.db import Base, engine
+            from lea_tools.server import app
             Base.metadata.create_all(bind=engine)
             from fastapi.testclient import TestClient
             self.client = TestClient(app)
@@ -340,9 +341,9 @@ class TestBusinessRequirements:
 
     def test_config_api_contract_for_go_engine(self):
         """Go 引擎需要的聚合接口字段完整性。"""
-        from lea_config.server import app
-        from lea_config.database import Base, engine
         import lea_config.models  # noqa
+        from lea_config.database import Base, engine
+        from lea_config.server import app
         Base.metadata.create_all(bind=engine)
         from fastapi.testclient import TestClient
         client = TestClient(app)
@@ -390,7 +391,7 @@ class TestBusinessRequirements:
 
     def test_parser_auth_and_quota_model(self):
         """验证 parser 有完整的鉴权+限流+计费模型。"""
-        from lea_parser.models import ParseTask, UsageRecord, TenantQuota, UserQuota
+        from lea_parser.models import ParseTask, TenantQuota, UsageRecord, UserQuota
         # 模型存在即可
         assert ParseTask.__tablename__ == "parse_tasks"
         assert UsageRecord.__tablename__ == "parser_usage_records"
@@ -399,7 +400,7 @@ class TestBusinessRequirements:
 
     def test_chunking_strategies_available(self):
         """两种分块策略都可用。"""
-        from lea_parser.chunking import chunk_sentence_window, chunk_recursive
+        from lea_parser.chunking import chunk_recursive, chunk_sentence_window
         blocks = [{"text": "测试内容。另一句话！", "page_idx": 0}]
         r1 = chunk_sentence_window(blocks, chunk_size=10)
         assert len(r1) > 0

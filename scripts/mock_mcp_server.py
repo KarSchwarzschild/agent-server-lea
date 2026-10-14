@@ -31,8 +31,8 @@ from __future__ import annotations
 
 import sys
 
-from fastapi import FastAPI, Request
 import uvicorn
+from fastapi import FastAPI, Request
 
 app = FastAPI()
 

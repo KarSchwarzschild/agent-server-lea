@@ -113,7 +113,7 @@ class QueryOptimizer:
             SystemMessage(content=_EXPAND_PROMPT.format(n=n)),
             HumanMessage(content=query),
         ])
-        lines = [l.strip() for l in resp.content.strip().splitlines() if l.strip()]
+        lines = [ln.strip() for ln in resp.content.strip().splitlines() if ln.strip()]
         result = lines[:n]
         self._set_cache("expand", query, result)
         return result

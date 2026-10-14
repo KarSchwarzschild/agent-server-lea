@@ -19,10 +19,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "packages" / "lea-p
 
 pptx = pytest.importorskip("pptx", reason="需要 python-pptx")
 
+from lea_parser.parsers.pptx_parser import parse_pptx  # noqa: E402
 from pptx import Presentation  # noqa: E402
 from pptx.util import Inches  # noqa: E402
-
-from lea_parser.parsers.pptx_parser import parse_pptx  # noqa: E402
 
 
 def _make_pptx(path: Path, slide_texts: list[str | None]) -> None:

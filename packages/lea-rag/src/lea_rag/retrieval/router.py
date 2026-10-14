@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, Awaitable
 
 import structlog
 from llama_index.core.schema import NodeWithScore
@@ -107,7 +107,7 @@ class RetrievalRouter:
         try:
             shadow_nodes = await asyncio.wait_for(shadow_task, timeout=10.0)
             shadow_latency = (time.perf_counter() - t0) * 1000
-        except (asyncio.TimeoutError, Exception):
+        except (TimeoutError, Exception):
             logger.warning("shadow_retrieval_failed", shadow=self._shadow)
 
         if shadow_nodes is not None:

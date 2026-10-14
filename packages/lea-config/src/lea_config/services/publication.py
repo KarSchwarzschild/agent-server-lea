@@ -4,18 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
 from fastapi import HTTPException
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Query, Session
-
 from lea_authkit import Actor, internal_headers
 from lea_config.database import DEFAULT_TENANT_ID, OWNER_SCOPE_PLATFORM
+from lea_config.models.agent import Agent
+from lea_config.models.mcp_server import MCPServer
 from lea_config.models.publication import (
-    AuditEvent,
     PUBLICATION_APPROVED,
     PUBLICATION_CANCELED,
     PUBLICATION_PENDING,
@@ -23,12 +21,13 @@ from lea_config.models.publication import (
     PUBLICATION_STATUSES,
     PUBLICATION_TARGET_GLOBAL,
     PUBLICATION_TARGET_TENANT,
+    AuditEvent,
     PublicationRequest,
 )
-from lea_config.models.agent import Agent
-from lea_config.models.mcp_server import MCPServer
 from lea_config.models.skill import Skill
 from lea_config.models.tool import Tool
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Query, Session
 
 RESOURCE_SKILL = "skill"
 RESOURCE_AGENT = "agent"
@@ -44,7 +43,7 @@ RESOURCE_MODELS = {
 
 
 def utcnow() -> datetime:
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 def actor_role(actor: Actor) -> str:

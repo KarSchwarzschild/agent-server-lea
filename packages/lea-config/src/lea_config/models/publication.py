@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import Column, DateTime, Index, Integer, JSON, String, Text, UniqueConstraint, func
+from sqlalchemy import JSON, Column, DateTime, Index, Integer, String, Text, UniqueConstraint, func
 
 from lea_config.database import Base
 

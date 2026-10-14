@@ -7,11 +7,11 @@ from contextlib import asynccontextmanager
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-
-from lea_config.database import Base, engine
 from lea_authkit import install_internal_auth
-from lea_config.metrics import MetricsMiddleware, metrics_endpoint
+
 import lea_config.models  # noqa: F401 — register all models with Base.metadata
+from lea_config.database import Base, engine
+from lea_config.metrics import MetricsMiddleware, metrics_endpoint
 
 
 @asynccontextmanager
@@ -41,10 +41,10 @@ from lea_config.api.internal_governance import router as internal_governance_rou
 from lea_config.api.llm_models import router as llm_models_router
 from lea_config.api.mcp_servers import router as mcp_servers_router
 from lea_config.api.models import router as models_router
+from lea_config.api.providers import router as providers_router
 from lea_config.api.publication_requests import router as publication_requests_router
 from lea_config.api.publication_resources import router as publication_resources_router
 from lea_config.api.publications import router as publications_router
-from lea_config.api.providers import router as providers_router
 from lea_config.api.resource_checks import router as resource_checks_router
 from lea_config.api.retrieval_models_public import router as retrieval_models_public_router
 from lea_config.api.skills import router as skills_router

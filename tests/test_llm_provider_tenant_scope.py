@@ -41,11 +41,10 @@ from __future__ import annotations
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from lea_config.database import DEFAULT_TENANT_ID, Base, get_db
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
-
-from lea_config.database import DEFAULT_TENANT_ID, Base, get_db
 
 T1, T2 = "scope-t1", "scope-t2"
 

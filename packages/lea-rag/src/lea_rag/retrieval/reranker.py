@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import httpx
 import structlog
-from pybreaker import CircuitBreaker, CircuitBreakerError
 from llama_index.core.schema import NodeWithScore
+from pybreaker import CircuitBreaker, CircuitBreakerError
 
 from lea_rag.config import RerankerSettings
 

@@ -44,7 +44,10 @@ def main() -> int:
         if in_sync():
             print("vendor/lea_authkit 与源码一致")
             return 0
-        print("vendor/lea_authkit 与 packages/lea-authkit 不一致，请运行 python scripts/sync_vendor.py", file=sys.stderr)
+        print(
+            "vendor/lea_authkit 与 packages/lea-authkit 不一致，请运行 python scripts/sync_vendor.py",
+            file=sys.stderr,
+        )
         return 1
     if DST.exists():
         shutil.rmtree(DST)

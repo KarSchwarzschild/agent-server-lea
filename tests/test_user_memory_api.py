@@ -5,15 +5,14 @@ from unittest.mock import AsyncMock
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
-
 from lea_authkit import Actor, require_actor
 from lea_rag.db.database import Base, get_db
 from lea_rag.db.models import UserMemory
 from lea_rag.memory.service import MemoryService
 from lea_rag.server_user_memory import router
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 
 @pytest.fixture

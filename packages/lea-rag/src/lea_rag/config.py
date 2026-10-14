@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import urllib.parse
 from functools import lru_cache
 from pathlib import Path

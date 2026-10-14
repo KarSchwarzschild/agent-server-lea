@@ -9,13 +9,12 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import random
-from typing import Any, Optional
 
-import structlog
 import redis.asyncio as aioredis
+import structlog
 
 log = structlog.get_logger()
 
@@ -83,7 +82,7 @@ async def get_retrieval_cache(
     kb_id: int,
     top_k: int,
     strategy: str
-) -> Optional[list]:
+) -> list | None:
     """获取向量检索结果缓存。
 
     Args:
@@ -178,7 +177,7 @@ async def set_retrieval_cache(
         _mark_unavailable()
 
 
-async def get_rerank_cache(query_text: str, doc_ids: list[str]) -> Optional[list]:
+async def get_rerank_cache(query_text: str, doc_ids: list[str]) -> list | None:
     """获取 Rerank 结果缓存。
 
     Args:
@@ -248,7 +247,7 @@ async def invalidate_kb_cache(kb_id: int):
 
     try:
         deleted = 0
-        pattern = f"lea-rag:retrieval:*"
+        pattern = "lea-rag:retrieval:*"
         async for key in redis.scan_iter(match=pattern, count=100):
             await redis.delete(key)
             deleted += 1
@@ -266,7 +265,7 @@ async def invalidate_all_retrieval_cache():
 
     try:
         deleted = 0
-        pattern = f"lea-rag:retrieval:*"
+        pattern = "lea-rag:retrieval:*"
         async for key in redis.scan_iter(match=pattern, count=100):
             await redis.delete(key)
             deleted += 1

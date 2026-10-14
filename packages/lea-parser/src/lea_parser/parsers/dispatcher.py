@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import structlog
 
-from lea_parser.parsers.pdf import parse_pdf
+from lea_parser.parsers.audio import parse_audio
 from lea_parser.parsers.docx import parse_docx
+from lea_parser.parsers.image import parse_image
+from lea_parser.parsers.pdf import parse_pdf
 from lea_parser.parsers.pptx_parser import parse_pptx
 from lea_parser.parsers.text import parse_text
-from lea_parser.parsers.image import parse_image
-from lea_parser.parsers.audio import parse_audio
 from lea_parser.parsers.video import parse_video
 
 logger = structlog.get_logger()

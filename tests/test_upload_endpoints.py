@@ -382,7 +382,7 @@ def test_read_staged_text_file_through_mount(client, obs, nfs):
     挂载点在那里必然越界。不跳的话会白跑一次注定失败的调用（异常被吞掉，所以
     症状是静默的性能损失，不是报错）。
     """
-    text = "# 讲义\n第一节 导论".encode("utf-8")
+    text = "# 讲义\n第一节 导论".encode()
     blob = _upload(client, name="讲义.md", data=text).json()
     client.post("/api/files/uploads/stage", json={
         "tenant_id": "tenant-1", "session_id": "sess-abc123",

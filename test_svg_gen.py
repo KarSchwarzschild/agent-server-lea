@@ -1,7 +1,6 @@
 """Test SVG generation with Bento Grid prompt."""
 import asyncio
 
-
 SVG_PROMPT = """作为精通信息架构与 SVG 编码的专家，将以下内容转化为一张高质量的 SVG 演示文稿页面。
 
 严格要求：

@@ -10,7 +10,6 @@ import sys
 import urllib.error
 import urllib.request
 
-
 DEFAULT_URL = "https://ai.ouchn.edu.cn/api/TenantUser/CurrUserTenants"
 
 

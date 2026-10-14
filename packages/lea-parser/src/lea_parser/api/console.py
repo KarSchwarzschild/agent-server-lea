@@ -9,10 +9,10 @@ from typing import Any
 import httpx
 import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException
+from lea_authkit import Actor, internal_headers, require_admin
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from lea_authkit import Actor, internal_headers, require_admin
 from lea_parser.database import get_db
 from lea_parser.models.quota import TenantQuota, UserQuota
 

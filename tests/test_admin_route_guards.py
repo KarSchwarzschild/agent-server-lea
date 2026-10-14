@@ -15,10 +15,9 @@
 from __future__ import annotations
 
 import pytest
-
+from fastapi import HTTPException
 from lea_authkit import Actor, require_admin
 from lea_authkit.authz import ROLE_ADMIN
-from fastapi import HTTPException
 
 alice = Actor("alice", "t1")
 admin = Actor("root", "t1", (ROLE_ADMIN,))

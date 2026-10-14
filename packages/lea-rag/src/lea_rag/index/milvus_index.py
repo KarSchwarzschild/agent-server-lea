@@ -10,15 +10,12 @@ from typing import Any
 
 import structlog
 from pymilvus import (
-    Collection,
     CollectionSchema,
     DataType,
     FieldSchema,
     Function,
     FunctionType,
     MilvusClient,
-    connections,
-    utility,
 )
 
 from lea_rag.config import MilvusSettings

@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass, field
+from datetime import UTC
 
 import httpx
 import structlog
@@ -236,8 +237,8 @@ def list_reapable_sandboxes(idle_timeout: float) -> list[dict]:
     if not isinstance(rows, list):
         return []
 
-    from datetime import datetime, timezone
-    now = datetime.now(timezone.utc)
+    from datetime import datetime
+    now = datetime.now(UTC)
     out = []
     for row in rows:
         meta = row.get("metadata") or {}

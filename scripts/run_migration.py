@@ -6,9 +6,10 @@
 
 # 需要 Python 的 pymysql 或者本地安装 mysql-client
 
-import pymysql
-import sys
 import io
+import sys
+
+import pymysql
 
 # Windows 终端 UTF-8 输出修复
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
@@ -27,10 +28,10 @@ def execute_migration(sql_file):
             charset='utf8mb4'
         )
 
-        print(f"[OK] Connected to database")
+        print("[OK] Connected to database")
 
         # 读取 SQL 文件
-        with open(sql_file, 'r', encoding='utf-8') as f:
+        with open(sql_file, encoding='utf-8') as f:
             sql_content = f.read()
 
         cursor = conn.cursor()
@@ -55,10 +56,10 @@ def execute_migration(sql_file):
                 result = cursor.fetchall()
                 if result:
                     print(f"Result: {result}")
-                print(f"[OK] Done")
+                print("[OK] Done")
 
         conn.commit()
-        print(f"\n[OK] Migration completed successfully")
+        print("\n[OK] Migration completed successfully")
 
         cursor.close()
         conn.close()

@@ -29,17 +29,17 @@ from contextlib import asynccontextmanager
 import structlog
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-
 from lea_authkit import install_internal_auth
+
 from lea_rag.metrics import MetricsMiddleware, metrics_endpoint
 from lea_rag.server_admin_kb import router as admin_kb_router
 from lea_rag.server_admin_memory import router as admin_memory_router
+from lea_rag.server_governance import internal_router as governance_internal_router
+from lea_rag.server_governance import router as governance_router
 from lea_rag.server_kb import router as kb_router
 from lea_rag.server_memory import router as memory_router
 from lea_rag.server_user_kb import router as user_kb_router
 from lea_rag.server_user_memory import router as user_memory_router
-from lea_rag.server_governance import internal_router as governance_internal_router
-from lea_rag.server_governance import router as governance_router
 
 logger = structlog.get_logger()
 
@@ -56,10 +56,15 @@ def _ensure_db_tables():
     """独立部署时确保 KB 相关表存在。"""
     try:
         from lea_rag.db import Base, engine
-        from lea_rag.db.models import (  # noqa: F401
-            Document, DocumentChunk, DocumentSection, KnowledgeBase, RetrievalModel,
+        from lea_rag.db.models import (  # noqa: F401  # noqa: F401
+            Document,
+            DocumentChunk,
+            DocumentSection,
+            KnowledgeBase,
+            RetrievalModel,
+            UserMemory,
+            UserProfile,
         )
-        from lea_rag.db.models import UserMemory, UserProfile  # noqa: F401
 
         Base.metadata.create_all(bind=engine)
         logger.info("db_tables_ensured")
@@ -70,9 +75,9 @@ def _ensure_db_tables():
 
 def _seed_default_models():
     """首次启动时种入默认模型（如果 retrieval_models 表为空）。"""
+    from lea_rag.config import EmbeddingSettings, RerankerSettings, get_tenant_api_key
     from lea_rag.db import SessionLocal
     from lea_rag.db.models import RetrievalModel
-    from lea_rag.config import EmbeddingSettings, RerankerSettings, get_tenant_api_key
 
     db = SessionLocal()
     try:
@@ -164,7 +169,10 @@ async def list_available_models(model_type: str | None = None):
 
     db = SessionLocal()
     try:
-        q = db.query(RetrievalModel).filter(RetrievalModel.enabled == True)
+        # noqa: E712 不能删。SQLAlchemy 的过滤条件里 `Column == True` 要生成 SQL
+        # `WHERE enabled = 1`；改成 linter 建议的 `filter(RetrievalModel.enabled)`
+        # 是把 Column 对象当布尔值用，条件会失效。本文件其余 E712 同理。
+        q = db.query(RetrievalModel).filter(RetrievalModel.enabled == True)  # noqa: E712
         if model_type:
             q = q.filter(RetrievalModel.model_type == model_type)
         models = q.order_by(RetrievalModel.model_type, RetrievalModel.name).all()

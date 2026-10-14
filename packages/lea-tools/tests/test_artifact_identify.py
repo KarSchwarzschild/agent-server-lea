@@ -18,9 +18,9 @@ import io
 import json
 import os
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
 
 # Windows 终端默认 GBK，强制 UTF-8 输出
 if sys.platform == "win32":
@@ -256,6 +256,9 @@ def strategy_all(files: list[str], manifest: dict | None) -> set[str]:
     return set(files)
 
 
+# 下面这段是整段发给模型的提示词，换行位置属于内容而不是排版 —— 为了凑 120 列去
+# 断行等于改提示词。E501 在 pyproject.toml 的 per-file-ignores 里对本文件整体豁免：
+# 超长那行结束在三引号字符串内部，行尾没地方挂逐行豁免注释。
 LLM_PROMPT = """You are an assistant that identifies which files in a sandbox workspace are FINAL DELIVERABLES for the end user versus intermediate/temporary files.
 
 The user asked: "{task}"
@@ -310,8 +313,9 @@ def _resolve_endpoint(model: str) -> tuple[str, str]:
 def strategy_llm_judge(files: list[str], manifest: dict | None,
                        scenario_id: int = 0, model: str = "qwen3-max") -> tuple[set[str], float]:
     """用 LLM 挑。真调 API。返回 (挑选集合, 耗时秒数)。失败返 (空集, 耗时)。"""
-    import httpx
     import time
+
+    import httpx
 
     api_base, api_key = _resolve_endpoint(model)
     if not api_base or not api_key:

@@ -16,11 +16,10 @@ from datetime import datetime
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from lea_config.database import OWNER_SCOPE_PLATFORM, OWNER_SCOPE_USER, Base, get_db
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
-
-from lea_config.database import OWNER_SCOPE_PLATFORM, OWNER_SCOPE_USER, Base, get_db
 
 
 @pytest.fixture
@@ -56,7 +55,9 @@ def mk(client, name, tenant, scope, owner=None):
     try:
         a = Agent(tenant_id=tenant, name=name, model="", enabled=True,
                   owner_scope=scope, owner_user_id=owner, created_by=owner or "sys")
-        db.add(a); db.commit(); return a.id
+        db.add(a)
+        db.commit()
+        return a.id
     finally:
         db.close()
 

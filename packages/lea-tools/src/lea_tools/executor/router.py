@@ -6,8 +6,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
-
 from lea_authkit import internal_headers
+
 from lea_tools.config import get_internal_service_settings
 
 

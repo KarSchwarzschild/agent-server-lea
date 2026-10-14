@@ -11,15 +11,13 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from lea_authkit import Actor, require_actor
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
-from lea_authkit import Actor, require_actor
-from lea_config.api._auth_helpers import require_admin
 from lea_config.database import (
     DEFAULT_TENANT_ID,
     OWNER_SCOPE_PLATFORM,
@@ -71,28 +69,28 @@ class AgentCreate(BaseModel):
 
 
 class AgentUpdate(BaseModel):
-    name: Optional[str] = None
-    description: Optional[str] = None
-    avatar: Optional[str] = None
-    welcome_message: Optional[str] = None
-    soul_prompt: Optional[str] = None
-    category: Optional[str] = None
-    example_questions: Optional[list] = None
-    sort_order: Optional[int] = None
-    model: Optional[str] = None
-    temperature: Optional[int] = None
-    max_turns: Optional[int] = None
-    max_tokens: Optional[int] = None
-    kb_mode: Optional[str] = None
-    memory_mode: Optional[str] = None
-    timeout_seconds: Optional[int] = None
-    enabled: Optional[bool] = None
+    name: str | None = None
+    description: str | None = None
+    avatar: str | None = None
+    welcome_message: str | None = None
+    soul_prompt: str | None = None
+    category: str | None = None
+    example_questions: list | None = None
+    sort_order: int | None = None
+    model: str | None = None
+    temperature: int | None = None
+    max_turns: int | None = None
+    max_tokens: int | None = None
+    kb_mode: str | None = None
+    memory_mode: str | None = None
+    timeout_seconds: int | None = None
+    enabled: bool | None = None
     # 乐观并发控制：前端读到这个 agent 时带出的 updated_at，原样传回来。
     # 省略=不检查（旧客户端兼容，行为等同于改之前那种"后写覆盖前写"）。
     # 带了就必须跟数据库当前值完全一致才允许更新——两个标签页同时打开同一个
     # agent 的编辑面板，先保存的那次会把 updated_at 往前推，后保存的那次
     # 这里核对不上，返回 409 而不是悄悄覆盖掉先保存的人的修改。
-    expected_updated_at: Optional[datetime] = None
+    expected_updated_at: datetime | None = None
 
 
 class DefaultAgentBody(BaseModel):
@@ -166,7 +164,7 @@ def _agent_to_dict(agent: Agent, actor: Actor) -> dict:
         "welcome_message": agent.welcome_message or "",
         "soul_prompt": agent.soul_prompt or "",
         "category": agent.category or "general",
-        "category_label": agent.category or "\u901a\u7528",
+        "category_label": agent.category or "通用",
         "is_system": bool(agent.is_system),
         "tenant_id": agent.tenant_id,
         "owner_scope": agent.owner_scope,
@@ -226,9 +224,9 @@ def _require_mine(agent: Agent, actor: Actor) -> None:
     if _is_admin(actor):
         return
     if agent.is_system:
-        raise HTTPException(403, "\u4e0d\u80fd\u64cd\u4f5c\u7cfb\u7edf Agent")
+        raise HTTPException(403, "不能操作系统 Agent")
     if agent.created_by != actor.user_id:
-        raise HTTPException(403, "\u53ea\u80fd\u64cd\u4f5c\u81ea\u5df1\u521b\u5efa\u7684 Agent")
+        raise HTTPException(403, "只能操作自己创建的 Agent")
 
 
 # ── Agent CRUD ─────────────────────────────────────────────
@@ -305,12 +303,12 @@ async def list_agents(
 
 @router.get("/categories")
 def get_categories(actor: Actor = Depends(require_actor)):
-    return {"general": "\u901a\u7528"}
+    return {"general": "通用"}
 
 
 @router.get("/super-agent-categories")
 def get_super_agent_categories(actor: Actor = Depends(require_actor)):
-    return {"general": "\u901a\u7528"}
+    return {"general": "通用"}
 
 
 @router.get("/default")
@@ -318,14 +316,14 @@ def get_default_agent(
     db: Session = Depends(get_db),
     actor: Actor = Depends(require_actor),
 ):
-    """\u5f53\u524d\u7528\u6237\u9ed8\u8ba4 agent \u2014 \u6682\u8fd4\u56de tenant super-agent\u3002"""
+    """当前用户默认 agent — 暂返回 tenant super-agent。"""
     super_agent = _resolve_super_agent(db, actor.tenant_id)
     return {"agent_id": super_agent.id if super_agent else None}
 
 
 @router.put("/default")
 def set_default_agent(body: DefaultAgentBody, actor: Actor = Depends(require_actor)):
-    """No-op\uff0c\u7b49 user_preferences \u8868\u3002"""
+    """No-op，等 user_preferences 表。"""
     return {"agent_id": body.agent_id}
 
 
@@ -340,7 +338,7 @@ def get_agent(
     db: Session = Depends(get_db),
     actor: Actor = Depends(require_actor),
 ):
-    """id=0 \u5151\u5e95 super-agent\uff08\u65e7\u524d\u7aef\u786c\u7f16\u7801\uff09\u3002"""
+    """id=0 兑底 super-agent（旧前端硬编码）。"""
     if agent_id == 0:
         agent = _resolve_super_agent(db, actor.tenant_id)
         if agent is None:
@@ -359,20 +357,20 @@ async def create_agent(
 ):
     from lea_config.services.cache import invalidate_agent_cache
 
-    # \u67e5\u91cd\u540d
+    # 查重名
     dup = (
         db.query(Agent)
         .filter(Agent.tenant_id == actor.tenant_id, Agent.name == body.name)
         .first()
     )
     if dup:
-        raise HTTPException(400, f"Agent \u540d\u79f0 '{body.name}' \u5df2\u5b58\u5728")
+        raise HTTPException(400, f"Agent 名称 '{body.name}' 已存在")
 
     is_adm = _is_admin(actor)
     data = body.model_dump()
 
     if not is_adm:
-        # \u666e\u901a\u7528\u6237\u5f3a\u5236\u7ea6\u675f
+        # 普通用户强制约束
         data["is_system"] = False
         data["enabled"] = True
 
@@ -387,7 +385,7 @@ async def create_agent(
     db.commit()
     db.refresh(agent)
 
-    # \u5931\u6548\u7f13\u5b58
+    # 失效缓存
     await invalidate_agent_cache(actor.tenant_id)
 
     return _agent_to_dict(agent, actor)
@@ -427,7 +425,7 @@ async def update_agent(
     db.commit()
     db.refresh(agent)
 
-    # \u5931\u6548\u7f13\u5b58
+    # 失效缓存
     await invalidate_agent_cache(actor.tenant_id)
 
     return _agent_to_dict(agent, actor)
@@ -447,10 +445,10 @@ async def delete_agent(
     db.delete(agent)
     db.commit()
 
-    # \u5931\u6548\u7f13\u5b58
+    # 失效缓存
     await invalidate_agent_cache(actor.tenant_id)
 
-    return {"message": "\u5df2\u5220\u9664"}
+    return {"message": "已删除"}
 
 
 # ── 共享 / 取消共享 ────────────────────────────────────────
@@ -797,7 +795,7 @@ def unbind_skill(
         raise HTTPException(404, "binding not found")
     db.delete(b)
     db.commit()
-    return {"message": "\u5df2\u89e3\u7ed1"}
+    return {"message": "已解绑"}
 
 
 # ── KB Bindings ────────────────────────────────────────────
@@ -843,9 +841,9 @@ def bind_kb(
 
     kb = db.query(KnowledgeBase).filter(KnowledgeBase.id == body.kb_id).first()
     if kb is None:
-        raise HTTPException(404, "\u77e5\u8bc6\u5e93\u4e0d\u5b58\u5728")
+        raise HTTPException(404, "知识库不存在")
     if kb.visibility == "private" and kb.owner != actor.user_id:
-        raise HTTPException(403, "\u65e0\u6743\u4f7f\u7528\u8be5\u77e5\u8bc6\u5e93")
+        raise HTTPException(403, "无权使用该知识库")
 
     existing = (
         db.query(AgentKbBinding)
@@ -892,7 +890,7 @@ def unbind_kb(
         raise HTTPException(404, "binding not found")
     db.delete(b)
     db.commit()
-    return {"message": "\u5df2\u89e3\u7ed1"}
+    return {"message": "已解绑"}
 
 
 # ── Tool Bindings (admin-only, 从旧 bindings.py 迁入) ────
@@ -977,14 +975,14 @@ def unbind_tool(
         raise HTTPException(404, "Binding not found")
     db.delete(b)
     db.commit()
-    return {"message": "\u5df2\u89e3\u7ed1"}
+    return {"message": "已解绑"}
 
 
 # -- MCP Server Bindings --
 #
-# \u7ed1\u4e00\u4e2a MCP server = \u7528\u5b83\u540c\u6b65\u51fa\u7684**\u5168\u90e8**\u5de5\u5177\u884c\uff0c\u7c92\u5ea6\u8ddf\u4f1a\u8bdd\u7ea7\u6302\u8f7d
-# \uff08session_attachments kind=mcp_server\uff09\u4e00\u81f4\u3002\u5c55\u5f00\u5728 internal.py \u7ec4\u88c5 agent-config \u65f6\u505a\uff0c
-# \u4e0e\u9010\u4e2a tool \u7ed1\uff08agent_tool_bindings\uff09\u7684\u7ed3\u679c\u6309 tool id \u53bb\u91cd\u5408\u5e76\u3002
+# 绑一个 MCP server = 用它同步出的**全部**工具行，粒度跟会话级挂载
+# （session_attachments kind=mcp_server）一致。展开在 internal.py 组装 agent-config 时做，
+# 与逐个 tool 绑（agent_tool_bindings）的结果按 tool id 去重合并。
 
 @router.post("/{agent_id}/mcp")
 def bind_mcp(
@@ -996,10 +994,10 @@ def bind_mcp(
     agent = _get_agent_or_404(db, agent_id, actor)
     _require_mine(agent, actor)
 
-    # \u53ef\u89c1\u6027\u8fc7\u6ee4\u8ddf bind_tool \u540c\u6e90\u540c\u7406 \u2014\u2014 \u7f3a\u4e86\u5b83\u5c31\u662f"\u731c\u4e2a id \u628a\u522b\u4eba\u7684 server \u7ed1\u5230\u81ea\u5df1
-    # agent \u4e0a"\uff0c\u800c server \u4e00\u7ed1\u5c31\u628a\u5b83\u540c\u6b65\u51fa\u7684\u5168\u90e8\u5de5\u5177\u540d/\u63cf\u8ff0/schema \u4e0b\u53d1\u3002\u4e09\u5c42\u53ef\u89c1\u6027
-    # \u53ea\u6709\u4e00\u4efd\u5b9e\u73b0\uff08models/mcp_server.py::visible_to\uff09\uff0c\u8ddf /internal/resolve-attachments
-    # \u6302 server \u90a3\u6761\u7528\u7684\u662f\u540c\u4e00\u6761\u89c4\u5219\u3002\u505c\u7528\u7684 server \u4e5f\u4e0d\u80fd\u7ed1\uff08\u7ed1\u4e0a\u4e5f\u4e0d\u4e0b\u53d1\uff09\u3002
+    # 可见性过滤跟 bind_tool 同源同理 —— 缺了它就是"猜个 id 把别人的 server 绑到自己
+    # agent 上"，而 server 一绑就把它同步出的全部工具名/描述/schema 下发。三层可见性
+    # 只有一份实现（models/mcp_server.py::visible_to），跟 /internal/resolve-attachments
+    # 挂 server 那条用的是同一条规则。停用的 server 也不能绑（绑上也不下发）。
     server = (
         db.query(MCPServer)
         .filter(
@@ -1010,7 +1008,7 @@ def bind_mcp(
         .first()
     )
     if server is None:
-        # 404 \u800c\u975e 403\uff1a\u4e0d\u786e\u8ba4"\u8fd9\u4e2a id \u5b58\u5728"\uff0c\u8ddf\u672c\u6587\u4ef6\u5176\u4ed6\u8de8\u5f52\u5c5e\u5206\u652f\u4e00\u81f4\u3002
+        # 404 而非 403：不确认"这个 id 存在"，跟本文件其他跨归属分支一致。
         raise HTTPException(404, "mcp server not found")
 
     existing = (
@@ -1050,7 +1048,7 @@ def unbind_mcp(
         raise HTTPException(404, "Binding not found")
     db.delete(b)
     db.commit()
-    return {"message": "\u5df2\u89e3\u7ed1"}
+    return {"message": "已解绑"}
 
 
 # ── All Bindings List (从旧 bindings.py 迁入) ────────────

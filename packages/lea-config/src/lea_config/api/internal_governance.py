@@ -5,10 +5,10 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
+from lea_authkit import Actor, require_actor
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from lea_authkit import Actor, require_actor
 from lea_config.database import get_db
 from lea_config.services.publication import (
     cancel_request,

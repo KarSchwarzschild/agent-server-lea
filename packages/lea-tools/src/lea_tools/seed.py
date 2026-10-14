@@ -7,7 +7,6 @@
 from lea_tools.db import SessionLocal
 from lea_tools.db.models import GLOBAL_TENANT_ID, Tool
 
-
 BUILTIN_TOOLS = [
     {
         "name": "kb_search",

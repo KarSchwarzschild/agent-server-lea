@@ -17,7 +17,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from fastapi import Depends
-
 from lea_authkit import Actor, require_actor
 
 

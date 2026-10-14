@@ -43,13 +43,11 @@ NetworkPolicy 挡着。是个**潜伏**的洞：谁哪天把这两个路由接�
 
 from __future__ import annotations
 
-from typing import Optional
-
 from fastapi import APIRouter, Depends, HTTPException, Query
+from lea_authkit import Actor, require_actor
 from pydantic import BaseModel
 from sqlalchemy.orm import Session, joinedload
 
-from lea_authkit import Actor, require_actor
 from lea_config.api._auth_helpers import require_admin
 from lea_config.database import get_db
 from lea_config.models.user import Role, User
@@ -64,10 +62,10 @@ router = users_router
 # ── Schemas ─────────────────────────────────────────────
 
 class UserUpdate(BaseModel):
-    email: Optional[str] = None
-    avatar: Optional[str] = None
-    phone: Optional[str] = None
-    is_active: Optional[bool] = None
+    email: str | None = None
+    avatar: str | None = None
+    phone: str | None = None
+    is_active: bool | None = None
 
 
 class AssignRoleRequest(BaseModel):
@@ -81,9 +79,9 @@ class RoleCreate(BaseModel):
 
 
 class RoleUpdate(BaseModel):
-    name: Optional[str] = None
-    description: Optional[str] = None
-    is_active: Optional[bool] = None
+    name: str | None = None
+    description: str | None = None
+    is_active: bool | None = None
 
 
 def _user_to_dict(u: User) -> dict:
@@ -108,8 +106,8 @@ def _user_to_dict(u: User) -> dict:
 def list_users(
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=200),
-    search: Optional[str] = None,
-    is_active: Optional[bool] = None,
+    search: str | None = None,
+    is_active: bool | None = None,
     db: Session = Depends(get_db),
     actor: Actor = Depends(require_actor),
 ):

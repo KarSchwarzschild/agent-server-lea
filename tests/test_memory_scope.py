@@ -134,8 +134,8 @@ class TestMemoryAPIContract:
         from lea_rag.memory.service import MemoryService
         Base.metadata.create_all(bind=engine)
         monkeypatch.setattr(MemoryService, "_sync_to_milvus", AsyncMock())
-        from lea_rag.server import app
         from fastapi.testclient import TestClient
+        from lea_rag.server import app
         self.client = TestClient(app)
         yield
         Base.metadata.drop_all(bind=engine)

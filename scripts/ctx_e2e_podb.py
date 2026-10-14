@@ -24,7 +24,7 @@ import time
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 import _dbconn as d
-from ctx_e2e_drive import TENANT, db_state, mint_token, send
+from ctx_e2e_drive import db_state, mint_token, send
 
 
 def main() -> int:

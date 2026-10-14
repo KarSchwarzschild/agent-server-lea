@@ -1,18 +1,14 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 生产就绪测试套件 — 验证 PRODUCTION_OPTIMIZATION_PLAN 所有功能
 """
 
 import asyncio
-import httpx
-import json
-import time
-import subprocess
 import sys
-import os
+import time
 from dataclasses import dataclass
-from typing import Optional
+
+import httpx
 
 # 强制 UTF-8 输出
 if sys.stdout.encoding != 'utf-8':

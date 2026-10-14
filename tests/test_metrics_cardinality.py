@@ -18,7 +18,6 @@ from __future__ import annotations
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-
 from lea_config.metrics import _endpoint_label as config_endpoint_label
 from lea_rag.metrics import _endpoint_label as rag_endpoint_label
 

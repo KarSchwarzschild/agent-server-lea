@@ -8,8 +8,8 @@ import structlog
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from lea_rag.llm import get_chat_model
 from lea_rag.evaluation.metrics import RAGMetrics
+from lea_rag.llm import get_chat_model
 
 logger = structlog.get_logger(__name__)
 

@@ -35,7 +35,7 @@ lea-config 那边校验过就跳过 —— 那边只挡 scheme，而且 DNS 可�
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -50,8 +50,8 @@ class DiscoverRequest(BaseModel):
     endpoint: str = Field(min_length=1, max_length=500)
     # auth_config 在服务间传一次（走 internal_auth，内网）。这是拆两跳的代价，
     # 记在设计文档 §4.6 里。
-    auth_config: Optional[dict] = None
-    transport: Optional[str] = None
+    auth_config: dict | None = None
+    transport: str | None = None
     # server_id 只用来构造 MCPSession（它拿这个做日志和前缀判断），**不查库**。
     # 给 0 也能跑 —— 这个端点不需要那一行存在。
     server_id: int = 0

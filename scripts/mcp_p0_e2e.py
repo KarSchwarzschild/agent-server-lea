@@ -43,9 +43,8 @@ import uuid
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-import requests
-
 import _dbconn as d
+import requests
 
 CONFIG = "http://127.0.0.1:8500"
 TOOLS = "http://127.0.0.1:8400"

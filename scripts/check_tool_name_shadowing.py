@@ -30,9 +30,8 @@ from collections import defaultdict
 
 sys.path[:0] = ["packages/lea-config/src", "packages/lea-authkit/src"]
 
-from sqlalchemy import text  # noqa: E402
-
 from lea_config.database import engine  # noqa: E402
+from sqlalchemy import text  # noqa: E402
 
 GLOBAL_TENANT = "default"
 

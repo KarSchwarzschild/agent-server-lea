@@ -86,7 +86,9 @@ class MilvusRAGIndex:
             from llama_index.core import Settings as LISettings
             if hasattr(LISettings, "embed_model") and hasattr(LISettings.embed_model, "dimensions"):
                 dim = LISettings.embed_model.dimensions
-            elif hasattr(LISettings.embed_model, "_model") and hasattr(LISettings.embed_model._model, "get_sentence_embedding_dimension"):
+            elif hasattr(LISettings.embed_model, "_model") and hasattr(
+                LISettings.embed_model._model, "get_sentence_embedding_dimension"
+            ):
                 dim = LISettings.embed_model._model.get_sentence_embedding_dimension()
         except Exception:
             pass

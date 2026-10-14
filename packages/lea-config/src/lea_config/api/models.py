@@ -5,13 +5,11 @@
 
 from __future__ import annotations
 
-from typing import Optional
-
 from fastapi import APIRouter, Depends, HTTPException, Query
+from lea_authkit import Actor, require_actor
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from lea_authkit import Actor, require_actor
 from lea_config.api._auth_helpers import require_admin
 from lea_config.database import get_db
 from lea_config.models.retrieval_model import RetrievalModel
@@ -27,7 +25,7 @@ class ModelCreate(BaseModel):
     api_base: str = Field(min_length=1)
     api_key: str = ""
     model_name: str = ""
-    dimension: Optional[int] = None
+    dimension: int | None = None
     supports: list[str] = []
     tags: list[str] = []
     enabled: bool = True
@@ -36,15 +34,15 @@ class ModelCreate(BaseModel):
 
 
 class ModelUpdate(BaseModel):
-    api_base: Optional[str] = None
-    api_key: Optional[str] = None
-    model_name: Optional[str] = None
-    dimension: Optional[int] = None
-    supports: Optional[list[str]] = None
-    tags: Optional[list[str]] = None
-    enabled: Optional[bool] = None
-    is_default: Optional[bool] = None
-    config: Optional[dict] = None
+    api_base: str | None = None
+    api_key: str | None = None
+    model_name: str | None = None
+    dimension: int | None = None
+    supports: list[str] | None = None
+    tags: list[str] | None = None
+    enabled: bool | None = None
+    is_default: bool | None = None
+    config: dict | None = None
 
 
 def _to_dict(m: RetrievalModel) -> dict:
@@ -64,9 +62,9 @@ def _to_dict(m: RetrievalModel) -> dict:
 
 @router.get("")
 def list_models(
-    model_type: Optional[str] = Query(None),
+    model_type: str | None = Query(None),
     enabled_only: bool = False,
-    tag: Optional[str] = None,
+    tag: str | None = None,
     db: Session = Depends(get_db),
     actor: Actor = Depends(require_actor),
 ):

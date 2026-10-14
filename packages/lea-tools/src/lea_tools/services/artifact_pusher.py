@@ -9,8 +9,6 @@ Bucket 布局：<bucket>/sessions/<session_id>/<rel_path>
 
 from __future__ import annotations
 
-import os
-
 import boto3
 import structlog
 from botocore.client import Config as BotoConfig

@@ -84,7 +84,7 @@ import pathlib
 import sys
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import jwt
 import requests
@@ -885,7 +885,7 @@ def main() -> int:
                     at = datetime.fromisoformat(raw.replace("Z", "+00:00"))
                 except ValueError:
                     return -1.0
-                return (at - datetime.now(timezone.utc)).total_seconds()
+                return (at - datetime.now(UTC)).total_seconds()
 
             # `pausing` 是过渡态，不是失败。
             #

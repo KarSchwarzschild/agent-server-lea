@@ -3,11 +3,10 @@ from __future__ import annotations
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from lea_config.database import OWNER_SCOPE_PLATFORM, OWNER_SCOPE_USER, Base, get_db
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
-
-from lea_config.database import OWNER_SCOPE_PLATFORM, OWNER_SCOPE_USER, Base, get_db
 
 T1, T2 = "publication-t1", "publication-t2"
 
@@ -18,13 +17,13 @@ def client(monkeypatch):
     monkeypatch.delenv("LEA_AUTHZ_ALLOW_UNTRUSTED_HEADERS", raising=False)
 
     import lea_config.models  # noqa: F401
+    from lea_config.api.audit_events import router as audit_router
+    from lea_config.api.internal_governance import router as internal_governance_router
+    from lea_config.api.providers import router as providers_router
     from lea_config.api.publication_requests import router as publication_router
     from lea_config.api.publication_resources import router as resource_publication_router
     from lea_config.api.publications import router as publications_router
     from lea_config.api.resource_checks import router as checks_router
-    from lea_config.api.internal_governance import router as internal_governance_router
-    from lea_config.api.audit_events import router as audit_router
-    from lea_config.api.providers import router as providers_router
     from lea_config.api.skills import router as skills_router
 
     engine = create_engine(
@@ -258,7 +257,8 @@ def test_deleting_resource_cancels_pending_request(client):
 def test_audit_events_are_role_scoped(client):
     first_id = seed_skill(client, "audit-one")
     second_id = seed_skill(client, "audit-two", owner="bob")
-    first_request = submit(client, first_id).json()["id"]
+    # 两条都只是铺数据：alice 的那条用来证明 actor_user_id=bob 的过滤真的排除了别人
+    submit(client, first_id)
     submit(client, second_id, user="bob")
 
     ordinary = client.get("/audit-events", headers=headers("alice"))

@@ -31,7 +31,8 @@ import requests
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from _dbconn import connect, env as load_env  # noqa: E402
+from _dbconn import connect  # noqa: E402
+from _dbconn import env as load_env
 
 GATEWAY = os.environ.get("LEA_AGENT_URL", "http://127.0.0.1:8080")
 
@@ -114,7 +115,7 @@ def _token() -> str:
     t = os.environ.get("LEA_ACCESS_TOKEN", "")
     if t:
         return t
-    from dev_gateway_stub import mint, _load_key  # noqa: PLC0415
+    from dev_gateway_stub import _load_key, mint  # noqa: PLC0415
     return mint(_load_key())
 
 

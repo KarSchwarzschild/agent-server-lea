@@ -42,11 +42,11 @@ migrations/016 删掉。
 from __future__ import annotations
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     Column,
     DateTime,
     Integer,
-    JSON,
     String,
     Text,
     UniqueConstraint,
@@ -64,7 +64,6 @@ from lea_config.database import (
     OwnerMixin,
     TenantMixin,
 )
-
 
 # 只剩一个取值。保留这个元组是因为接口层的校验和错误文案都基于它，而且以后真要加
 # 传输方式时，加在这里比在 if 里加一个 or 更难漏。

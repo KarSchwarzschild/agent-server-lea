@@ -2,15 +2,10 @@
 
 from __future__ import annotations
 
-import time
-
 import redis
 import structlog
-from sqlalchemy.orm import Session
 
 from lea_parser.config import get_redis_settings
-from lea_parser.models.quota import TenantQuota, UserQuota
-from lea_parser.models.usage import UsageRecord
 
 logger = structlog.get_logger()
 

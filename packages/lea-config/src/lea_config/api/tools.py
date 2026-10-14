@@ -24,15 +24,11 @@ IsConcurrencySafe() 硬编码 true（platform_tools.go），于是引擎会并�
 from __future__ import annotations
 
 import os
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 
 import httpx
 import structlog
-
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
-from sqlalchemy.orm import Session
-
 from lea_authkit import (
     DELETE,
     UPDATE,
@@ -41,6 +37,9 @@ from lea_authkit import (
     require_actor,
     scoped_filter,
 )
+from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
+
 from lea_config.database import (
     DEFAULT_TENANT_ID,
     OWNER_SCOPE_PLATFORM,
@@ -123,22 +122,22 @@ class ToolCreate(BaseModel):
     # 同名的 V1 遗留方法，直接用会 shadow 它并抛 UserWarning。所以走 alias：
     # 对外是 schema_json，对内是 tool_schema，model_dump(by_alias=True) 拿回列名。
     tool_schema: dict[str, Any] = Field(alias="schema_json")
-    endpoint: Optional[str] = None
-    http_adapter_config: Optional[dict] = None
-    mcp_server_id: Optional[int] = None
+    endpoint: str | None = None
+    http_adapter_config: dict | None = None
+    mcp_server_id: int | None = None
 
 
 class ToolUpdate(BaseModel):
     model_config = {"populate_by_name": True}
 
-    display_name: Optional[str] = None
-    description: Optional[str] = None
-    category: Optional[str] = None
-    execution_type: Optional[UserExecutionType] = None
-    tool_schema: Optional[dict[str, Any]] = Field(None, alias="schema_json")
-    endpoint: Optional[str] = None
-    http_adapter_config: Optional[dict] = None
-    enabled: Optional[bool] = None
+    display_name: str | None = None
+    description: str | None = None
+    category: str | None = None
+    execution_type: UserExecutionType | None = None
+    tool_schema: dict[str, Any] | None = Field(None, alias="schema_json")
+    endpoint: str | None = None
+    http_adapter_config: dict | None = None
+    enabled: bool | None = None
     # name 不给改：它是 agent 绑定里的引用键（按名字找工具，见 lea-tools 的
     # visible_tools），改了等于把已有绑定悄悄指向空。要改就删了重建。
 

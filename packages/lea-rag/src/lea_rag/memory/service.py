@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
 
 import structlog
 
@@ -98,7 +97,7 @@ class MemoryService:
         self, memory_id: int, content: str, user_id: str, tenant_id: str, category: str, scope: str = "global"
     ) -> None:
         """将单条记忆同步到 Milvus，并标记 embedding_synced。"""
-        from pymilvus import Collection, connections, utility
+        from pymilvus import Collection, connections
 
         vec = await self._get_embedding(content)
         settings = self._settings
@@ -308,6 +307,7 @@ class MemoryService:
 
     def _delete_from_milvus(self, memory_id: int) -> None:
         import os
+
         from pymilvus import Collection, connections
 
         conn_alias = "memory_del"
@@ -319,6 +319,7 @@ class MemoryService:
 
     def _delete_from_milvus_by_user(self, user_id: str, tenant_id: str) -> None:
         import os
+
         from pymilvus import Collection, connections
 
         conn_alias = "memory_del_all"

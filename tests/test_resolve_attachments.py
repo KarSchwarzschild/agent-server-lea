@@ -26,10 +26,6 @@ from __future__ import annotations
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
-
 from lea_config.database import (
     DEFAULT_TENANT_ID,
     OWNER_SCOPE_PLATFORM,
@@ -37,6 +33,9 @@ from lea_config.database import (
     Base,
     get_db,
 )
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 T1, T2 = "att-t1", "att-t2"
 ALICE, BOB = "alice", "bob"

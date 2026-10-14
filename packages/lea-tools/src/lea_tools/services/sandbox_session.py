@@ -298,7 +298,9 @@ class SandboxSessionManager:
             return
         self._cube_patched = True
 
-        import ssl, httpcore
+        import ssl
+
+        import httpcore
         _orig_conn = httpcore._backends.sync.SyncBackend.connect_tcp
         def _conn(self_, host, port, **kw):
             if isinstance(host, str) and host.endswith(".cube.app"):

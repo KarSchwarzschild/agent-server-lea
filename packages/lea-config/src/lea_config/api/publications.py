@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Query
+from lea_authkit import Actor, require_actor
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from lea_authkit import Actor, require_actor
 from lea_config.api._auth_helpers import require_admin
 from lea_config.database import get_db
 from lea_config.models.publication import ResourcePublication

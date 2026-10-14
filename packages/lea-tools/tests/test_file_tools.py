@@ -18,7 +18,6 @@ from __future__ import annotations
 import io
 import os
 import sys
-import tempfile
 import threading
 from pathlib import Path
 

@@ -1,7 +1,8 @@
 # 029 关键索引迁移（Python 控制幂等）
-import pymysql
-import sys
 import io
+import sys
+
+import pymysql
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')

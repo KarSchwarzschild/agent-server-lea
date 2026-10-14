@@ -1,5 +1,6 @@
 """插入一条测试专家，覆盖专家切换 / 人格 / 工具绑定等功能验收。"""
 import json
+
 import pymysql
 
 conn = pymysql.connect(

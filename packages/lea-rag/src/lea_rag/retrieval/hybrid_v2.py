@@ -6,13 +6,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import structlog
-from pymilvus import AnnSearchRequest, RRFRanker
 
-from lea_rag.config import MilvusSettings, RAGSettings, RerankerSettings
+from lea_rag.config import RAGSettings, RerankerSettings
 from lea_rag.embeddings.embedding_client import EmbeddingClient
 from lea_rag.index.milvus_index import MilvusKBIndex
 

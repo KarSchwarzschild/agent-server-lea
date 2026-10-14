@@ -111,7 +111,7 @@ def main() -> int:
             print(f"\n✓ {user_turns} 轮之后仍复述出暗号。")
             print(f"  改之前第 1 轮落在「最近 {OLD_TURN_CAP} 轮」之外，这里必然答不出来。")
             return 0
-        print(f"\n✗ 答不出暗号 —— 第 1 轮没被读回来。")
+        print("\n✗ 答不出暗号 —— 第 1 轮没被读回来。")
         return 1
     finally:
         conn.close()

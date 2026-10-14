@@ -1,10 +1,11 @@
 # 验收：P0-3 平台工具降级（真链路）
 # 判据：KB/Memory/Gateway 工具在服务不可达/异常时返回友好提示，不阻断对话
 
-import requests
+import io
 import json
 import sys
-import io
+
+import requests
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')

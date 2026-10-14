@@ -28,7 +28,6 @@ import socket
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-
 from lea_tools.api.internal_mcp import router
 
 

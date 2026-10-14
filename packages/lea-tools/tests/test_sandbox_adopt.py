@@ -17,9 +17,9 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC
 
 import pytest
-
 from lea_tools.services import sandbox_session as ss
 from lea_tools.services._cube_sandbox import SandboxLookupError
 
@@ -193,9 +193,10 @@ def _cube_rows(monkeypatch, rows):
 
 
 def _row(sandbox_id, state, paused_minutes_ago, session_id="sess-x"):
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta
+
     from lea_tools.services._cube_sandbox import META_SESSION
-    end_at = (datetime.now(timezone.utc)
+    end_at = (datetime.now(UTC)
               - timedelta(minutes=paused_minutes_ago)).isoformat().replace("+00:00", "Z")
     meta = {"cube.product": "cubebox"}
     if session_id:
@@ -234,7 +235,7 @@ def test_reaper_tolerates_malformed_rows(monkeypatch):
 
     崩了的话连句柄淘汰也一起停了 —— 一个回收 bug 会顺带废掉另一条清理路径。
     """
-    from lea_tools.services._cube_sandbox import list_reapable_sandboxes, META_SESSION
+    from lea_tools.services._cube_sandbox import META_SESSION, list_reapable_sandboxes
 
     _cube_rows(monkeypatch, [
         {"sandboxID": "a", "state": "paused", "metadata": {META_SESSION: "s"}},  # 无 endAt

@@ -3,17 +3,15 @@ Base validator with common validation logic for document files.
 """
 
 import re
+from functools import cache
 from pathlib import Path
 
 import defusedxml.minidom
-from functools import lru_cache
-
 import lxml.etree
-
 from helpers import safe_extract
 
 
-@lru_cache(maxsize=None)
+@cache
 def _load_schema(schema_path: str):
     with open(schema_path, "rb") as xsd_file:
         xsd_doc = lxml.etree.parse(
@@ -783,7 +781,7 @@ class BaseSchemaValidator:
         try:
             schema = _load_schema(str(schema_path))
 
-            with open(xml_file, "r") as f:
+            with open(xml_file) as f:
                 xml_doc = lxml.etree.parse(f)
 
             xml_doc, _ = self._remove_template_tags_from_text_nodes(xml_doc)

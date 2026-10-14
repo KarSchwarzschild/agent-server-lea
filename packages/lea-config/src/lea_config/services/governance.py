@@ -7,10 +7,7 @@ from typing import Any
 
 import httpx
 from fastapi import HTTPException
-from sqlalchemy.orm import Session
-
 from lea_authkit import Actor, internal_headers
-from lea_config.database import DEFAULT_TENANT_ID
 from lea_config.models.agent import Agent
 from lea_config.models.mcp_server import MCPServer
 from lea_config.models.publication import (
@@ -32,9 +29,9 @@ from lea_config.services.publication import (
     RESOURCE_SKILL,
     RESOURCE_TOOL,
     record_audit_event,
-    resource_scope,
     resource_snapshot,
 )
+from sqlalchemy.orm import Session
 
 LOCAL_MODELS = {
     RESOURCE_AGENT: Agent,

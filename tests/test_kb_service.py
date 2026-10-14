@@ -14,12 +14,11 @@
 from __future__ import annotations
 
 import pytest
+from lea_rag.db import models  # noqa: F401 — 注册所有表到 Base.metadata
+from lea_rag.db.database import Base
+from lea_rag.services.kb_service import KBService
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-
-from lea_rag.db.database import Base
-from lea_rag.db import models  # noqa: F401 — 注册所有表到 Base.metadata
-from lea_rag.services.kb_service import KBService
 
 T1 = "tenant-a"
 

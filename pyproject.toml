@@ -88,6 +88,49 @@ pythonpath = [
 [tool.ruff]
 target-version = "py311"
 line-length = 120
+# 上游 skill 包不是我们的源码：anthropic-pptx / anthropic-xlsx / skill-creator 是
+# 整包投放进沙箱的 bundle 载荷，改了它们在下次同步上游时会被覆盖掉。按我们的风格
+# 规范去 lint 别人的代码，只会产生永远修不完、也不该修的噪声。
+#
+# 三个 legacy 包同理，但原因不同：它们已经不在任何 compose / k8s 里跑了
+# （infra/k8s/README.md 明确写着"不要再作为运行服务接入"，alerts.yml 把
+# lea-apps-legacy 称作"归档代码"）。给不部署的代码改风格，是拿改动风险换零收益
+# ——而且这些包的测试覆盖远不如在跑的服务，改坏了也不一定有人发现。
+exclude = [
+    "packages/lea-tools/skills",
+    "packages/lea-server-legacy",
+    "packages/lea-apps-legacy",
+    "packages/lea-graph-legacy",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
+ignore = [
+    # UP042：不把 `class X(str, Enum)` 换成 `StrEnum`。两者的 str() 语义不同——
+    # (str, Enum) 的 str(X.A) 是 "X.A"，StrEnum 是 "a"。排除 legacy 之后还剩 6 个
+    # （lea-data 的 FeedbackType，lea-rag 的 PaperSource/PaperType/Strategy/
+    # RetrievalStrategy/RouteMode），都流向 API schema 和 DB 取值，换掉是拿序列化
+    # 行为换一个纯风格收益。(str, Enum) 本身是完全合法、能正常工作的写法。
+    "UP042",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# E402：这些脚本/测试必须先执行再 import，顺序是功能性的，不是风格问题：
+#   - scripts/*：`sys.stdout.reconfigure(encoding="utf-8")` 要在任何可能打印的
+#     模块被 import 之前跑掉，否则 Windows 控制台输出中文直接炸（见 CLAUDE.md）。
+#   - tests/test_integration.py：要先设 DB_HOST/JWT_SECRET 等环境变量、再往
+#     sys.path 插三个 package 的 src 目录，然后才能 import 被测模块。
+# 把 import 挪到顶部会让这些文件真的坏掉，所以按目录豁免，不逐行加 noqa。
+"scripts/*.py" = ["E402"]
+"tests/test_integration.py" = ["E402"]
+"packages/lea-tools/tests/test_e2e.py" = ["E402"]
+# 三个服务入口里的 router import 紧贴着对应的 include_router 调用，是刻意的
+# "import 挨着用处写"：17 组 import/注册一一对应，挪到文件顶部会把这个对应关系
+# 拆到 20 行开外。已确认 api 子模块没有 import 回 server（无循环依赖），所以这
+# 纯粹是排版约定，不是功能需要——但也没有理由为了消一条风格规则去改动在跑的入口。
+"packages/lea-config/src/lea_config/server.py" = ["E402"]
+"packages/lea-tools/src/lea_tools/server.py" = ["E402"]
+"packages/lea-parser/src/lea_parser/server.py" = ["E402"]
+# E501：这个文件里有一段整体发给模型的提示词（LLM_PROMPT），断行位置属于内容。
+# 超长那行结束在三引号字符串内部，行尾挂不上 noqa，所以在这里整文件豁免。
+"packages/lea-tools/tests/test_artifact_identify.py" = ["E501"]

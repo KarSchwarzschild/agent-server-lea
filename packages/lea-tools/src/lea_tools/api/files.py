@@ -11,8 +11,7 @@ from __future__ import annotations
 import hashlib
 import mimetypes
 import os
-from pathlib import Path
-from typing import Iterator
+from collections.abc import Iterator
 from urllib.parse import quote
 
 import boto3
@@ -33,8 +32,8 @@ from lea_tools.services.file_stager import (
 from lea_tools.services.file_store import (
     SKILL_MOUNT,
     UPLOADS_MOUNT,
-    Stat,
     StaleWriteError,
+    Stat,
     get_file_store,
 )
 
@@ -825,8 +824,7 @@ def download(
 
     def _stream() -> Iterator[bytes]:
         try:
-            for chunk in obj["Body"].iter_chunks(chunk_size=64 * 1024):
-                yield chunk
+            yield from obj["Body"].iter_chunks(chunk_size=64 * 1024)
         finally:
             obj["Body"].close()
 

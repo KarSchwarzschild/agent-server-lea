@@ -10,10 +10,10 @@ from typing import Any
 import httpx
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query
+from lea_authkit import Actor, internal_headers, require_actor, require_admin
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from lea_authkit import Actor, internal_headers, require_actor, require_admin
 from lea_rag.db.database import get_db
 from lea_rag.db.models import Document, DocumentChunk, DocumentSection, KnowledgeBase
 from lea_rag.tasks import celery_app

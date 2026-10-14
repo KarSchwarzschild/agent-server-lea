@@ -106,7 +106,7 @@ def main() -> int:
         if SECRET_WORD in answer:
             print(f"\n✓ 新进程复述出了暗号 {SECRET_WORD!r} —— raw 路径把历史完整读回来了。")
             return 0
-        print(f"\n✗ 没复述出暗号。历史没读回来，或者只读回了一部分。")
+        print("\n✗ 没复述出暗号。历史没读回来，或者只读回了一部分。")
         print("  （模型编不出这个词，所以答不出来就是历史没到它面前。）")
         return 1
     finally:

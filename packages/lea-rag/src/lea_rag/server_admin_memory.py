@@ -16,13 +16,11 @@
 
 from __future__ import annotations
 
-from typing import Optional
-
 from fastapi import APIRouter, Depends, HTTPException, Query
+from lea_authkit import Actor, require_actor, require_admin
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from lea_authkit import Actor, require_actor, require_admin
 from lea_rag.db.database import get_db
 from lea_rag.db.models import MemoryConfig, UserMemory
 
@@ -51,7 +49,7 @@ router = APIRouter(
 # ── Schemas ─────────────────────────────────────────────
 
 class MemoryConfigCreate(BaseModel):
-    agent_id: Optional[int] = None
+    agent_id: int | None = None
     enabled: bool = True
     max_memories: int = 200
     extract_enabled: bool = True
@@ -59,10 +57,10 @@ class MemoryConfigCreate(BaseModel):
 
 
 class MemoryConfigUpdate(BaseModel):
-    enabled: Optional[bool] = None
-    max_memories: Optional[int] = None
-    extract_enabled: Optional[bool] = None
-    categories: Optional[list[str]] = None
+    enabled: bool | None = None
+    max_memories: int | None = None
+    extract_enabled: bool | None = None
+    categories: list[str] | None = None
 
 
 def _mem_to_dict(m: UserMemory) -> dict:
@@ -100,8 +98,8 @@ def _cfg_to_dict(c: MemoryConfig) -> dict:
 
 @router.get("/memories")
 def list_memories(
-    user_id: Optional[str] = Query(None, description="不传则查本租户全部用户"),
-    category: Optional[str] = None,
+    user_id: str | None = Query(None, description="不传则查本租户全部用户"),
+    category: str | None = None,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=200),
     actor: Actor = Depends(require_actor),

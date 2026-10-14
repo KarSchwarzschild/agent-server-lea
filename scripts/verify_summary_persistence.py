@@ -24,14 +24,12 @@ covered_id 是拿 `ORDER BY id DESC LIMIT 1 OFFSET recentCount` 算的，前提�
 from __future__ import annotations
 
 import json
-import pathlib
 import sys
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-from sqlalchemy import text
-
 from lea_config.database import engine
+from sqlalchemy import text
 
 
 def main() -> int:

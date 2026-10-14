@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from sqlalchemy import Boolean, Column, DateTime, Integer, JSON, String, func
+from sqlalchemy import JSON, Boolean, Column, DateTime, Integer, String, func
 
 from lea_config.database import Base
 

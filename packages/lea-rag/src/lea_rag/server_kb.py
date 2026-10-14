@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field, model_validator
 
 logger = structlog.get_logger()
@@ -47,7 +47,7 @@ class SectionNode(BaseModel):
     title: str
     level: int
     page_start: int = 0
-    children: list["SectionNode"] = []
+    children: list[SectionNode] = []
 
 
 class SectionsRequest(BaseModel):
@@ -188,9 +188,9 @@ def _apply_metadata_filter(
 ) -> tuple[list[int] | None, list[int] | None]:
     """根据 metadata JSON 条件在 DB 层过滤 KB 和 Document。"""
     try:
-        from sqlalchemy import and_
+
         from lea_rag.db import SessionLocal
-        from lea_rag.db.models import KnowledgeBase, Document
+        from lea_rag.db.models import Document
 
         db = SessionLocal()
         try:
@@ -269,12 +269,19 @@ def _get_model_info(model_name: str) -> dict | None:
 
         db = SessionLocal()
         try:
+            # noqa: E712 不能删：SQLAlchemy 过滤条件里 `Column == True` 才会生成
+            # `WHERE enabled = 1`，换成裸属性是把 Column 当布尔值用，条件失效。
             m = db.query(RetrievalModel).filter(
                 RetrievalModel.name == model_name,
-                RetrievalModel.enabled == True,
+                RetrievalModel.enabled == True,  # noqa: E712
             ).first()
             if m:
-                return {"api_base": m.api_base, "model_name": m.model_name, "dimension": m.dimension, "api_key": m.api_key}
+                return {
+                    "api_base": m.api_base,
+                    "model_name": m.model_name,
+                    "dimension": m.dimension,
+                    "api_key": m.api_key,
+                }
         finally:
             db.close()
     except Exception:
@@ -292,8 +299,8 @@ def _get_default_embedding_model() -> str:
         try:
             m = db.query(RetrievalModel).filter(
                 RetrievalModel.model_type == "embedding",
-                RetrievalModel.is_default == True,
-                RetrievalModel.enabled == True,
+                RetrievalModel.is_default == True,  # noqa: E712
+                RetrievalModel.enabled == True,  # noqa: E712
             ).first()
             if m:
                 return m.name
@@ -545,6 +552,7 @@ async def upload_document(
 ):
     """上传文档到知识库并启动后台处理。"""
     import json as _json
+
     from lea_rag.db import SessionLocal
     from lea_rag.services.kb_service import KBService
     from lea_rag.services.object_storage import ObjectStorage
@@ -563,7 +571,11 @@ async def upload_document(
             raise HTTPException(404, "知识库不存在")
 
         file_ext = (file.filename or "file").rsplit(".", 1)[-1].lower()
-        allowed_ext = {"pdf", "txt", "md", "docx", "pptx", "png", "jpg", "jpeg", "webp", "gif", "bmp", "mp3", "wav", "m4a", "flac", "ogg"}
+        allowed_ext = {
+            "pdf", "txt", "md", "docx", "pptx",
+            "png", "jpg", "jpeg", "webp", "gif", "bmp",
+            "mp3", "wav", "m4a", "flac", "ogg",
+        }
         if file_ext not in allowed_ext:
             raise HTTPException(400, f"不支持的文件类型: {file_ext}")
 

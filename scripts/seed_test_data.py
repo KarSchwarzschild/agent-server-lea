@@ -28,12 +28,12 @@ from __future__ import annotations
 import argparse
 import sys
 
-from sqlalchemy import text
-
 # 两个服务各有自己的 engine / Base，但通常指向同一个 MySQL 库（不同表）。
 from lea_config.database import (
     OWNER_SCOPE_PLATFORM,
     OWNER_SCOPE_USER,
+)
+from lea_config.database import (
     SessionLocal as ConfigSession,
 )
 from lea_config.models.agent import Agent
@@ -41,6 +41,7 @@ from lea_config.models.mcp_server import MCPServer
 from lea_config.models.skill import Skill
 from lea_rag.db import SessionLocal as RagSession
 from lea_rag.db.models import KnowledgeBase, UserMemory
+from sqlalchemy import text
 
 TENANT_A = "seed-acme"
 TENANT_B = "seed-globex"

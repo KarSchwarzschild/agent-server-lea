@@ -3,12 +3,18 @@
 from datetime import datetime
 
 from sqlalchemy import (
-    Boolean, Column, DateTime, Enum, ForeignKey, Integer,
-    String, Text, JSON,
+    JSON,
+    Boolean,
+    Column,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
 )
 
 from lea_tools.db import Base
-
 
 # 平台级工具（seed.py 里的 BUILTIN_TOOLS）住在这个租户里，**所有租户都能用**。
 #

@@ -13,17 +13,15 @@ migrations/016 收口到 `endpoint`。下面的用例盯的是收口之后每一
 
 from __future__ import annotations
 
-import json
 import socket
 
 import pytest
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-
 from lea_tools.db import Base
 from lea_tools.db.models import OWNER_SCOPE_PLATFORM, MCPServer, Tool
 from lea_tools.executor.mcp_proxy import MCPSession, check_transport, remote_tool_name
 from lea_tools.executor.router import ToolCall
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 TENANT = "mcp-t1"
 
@@ -283,6 +281,7 @@ async def test_is_error_result_becomes_an_error(db, monkeypatch):
     monkeypatch.setattr("lea_tools.db.SessionLocal", lambda: db)
 
     from types import SimpleNamespace
+
     import lea_tools.executor.mcp_proxy as m
 
     class _FakeSession:

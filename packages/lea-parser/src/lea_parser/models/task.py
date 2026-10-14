@@ -1,6 +1,6 @@
 """解析任务跟踪。"""
 
-from sqlalchemy import Column, DateTime, Integer, JSON, String, Text, func
+from sqlalchemy import JSON, Column, DateTime, Integer, String, Text, func
 
 from lea_parser.database import Base, TenantMixin
 

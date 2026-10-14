@@ -16,11 +16,10 @@ from __future__ import annotations
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from lea_config.database import OWNER_SCOPE_PLATFORM, Base, get_db
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
-
-from lea_config.database import OWNER_SCOPE_PLATFORM, Base, get_db
 
 TENANT = "mcp-bind-t1"
 
@@ -117,9 +116,11 @@ def test_direct_and_server_binding_dedup(client):
     db = client.Session()
     try:
         agent = Agent(tenant_id=TENANT, name="a", model="", owner_scope=OWNER_SCOPE_PLATFORM)
-        db.add(agent); db.flush()
+        db.add(agent)
+        db.flush()
         srv = MCPServer(tenant_id=TENANT, name="github", owner_scope=OWNER_SCOPE_PLATFORM)
-        db.add(srv); db.flush()
+        db.add(srv)
+        db.flush()
         tid = _mcp_tool(db, srv.id, "gh_search")
         # 既逐个绑这个工具，又绑整个 server
         db.add(AgentToolBinding(agent_id=agent.id, tool_id=tid, enabled=True))

@@ -16,7 +16,6 @@
 from __future__ import annotations
 
 import pytest
-
 from lea_config.api.internal import _context_window_of
 from lea_config.models.llm_provider import LLMProvider
 

@@ -16,11 +16,13 @@ from lea_parser.auth import CurrentUser, get_current_user
 from lea_parser.chunking import chunk_recursive, chunk_sentence_window
 from lea_parser.config import get_parser_settings
 from lea_parser.database import get_db
-from lea_parser.models.task import ParseTask
 from lea_parser.parsers import parse_document
 from lea_parser.parsers.dispatcher import SUPPORTED_FORMATS
 from lea_parser.services.quota import (
-    QuotaError, check_file_size, check_rate_limit, record_usage,
+    QuotaError,
+    check_file_size,
+    check_rate_limit,
+    record_usage,
 )
 
 logger = structlog.get_logger()

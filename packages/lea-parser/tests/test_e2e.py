@@ -12,11 +12,10 @@ os.environ.setdefault("DB_HOST", "sqlite")
 os.environ.setdefault("DB_NAME", "test_parser")
 os.environ.setdefault("JWT_SECRET", "test-secret")
 
-from jose import jwt
 from fastapi.testclient import TestClient
-
-from lea_parser.server import app
+from jose import jwt
 from lea_parser.database import Base, engine
+from lea_parser.server import app
 
 TOKEN = jwt.encode(
     {"sub": "user1", "tenant_id": "t1", "role": "admin"},

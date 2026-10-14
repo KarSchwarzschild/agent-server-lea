@@ -1,8 +1,8 @@
 """工具可见性 + 解析 + 权限校验。"""
 
+import structlog
 from sqlalchemy import and_, case, or_
 from sqlalchemy.orm import Session
-import structlog
 
 from lea_tools.db.models import (
     GLOBAL_TENANT_ID,

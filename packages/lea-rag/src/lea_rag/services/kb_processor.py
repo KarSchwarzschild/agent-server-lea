@@ -125,11 +125,15 @@ class DocumentProcessor:
         """解析文档，复用 Notebook 的 parser 逻辑。"""
         from lea_rag.parsers.parser import parse_document
 
-        if file_type in ("pdf", "docx", "pptx", "png", "jpg", "jpeg", "webp", "gif", "bmp", "mp3", "wav", "m4a", "flac", "ogg"):
+        if file_type in (
+            "pdf", "docx", "pptx",
+            "png", "jpg", "jpeg", "webp", "gif", "bmp",
+            "mp3", "wav", "m4a", "flac", "ogg",
+        ):
             return parse_document(file_path, parser="mineru")
 
         from lea_rag.parsers.parser import _chunk_md_fallback
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+        with open(file_path, encoding="utf-8", errors="ignore") as f:
             content = f.read()
         chunks = _chunk_md_fallback(content)
         return {"md_content": content, "text_chunks": chunks, "image_items": []}
@@ -293,22 +297,25 @@ class DocumentProcessor:
 
     def _get_embedder(self, kb: KnowledgeBase):
         """根据 KB 配置从模型注册表获取 embedding 客户端。"""
-        from lea_rag.embeddings.embedding_client import EmbeddingClient
         from lea_rag.db.models import RetrievalModel
+        from lea_rag.embeddings.embedding_client import EmbeddingClient
 
         model_name = kb.embedding_model
         if model_name:
+            # noqa: E712 不能删：SQLAlchemy 过滤条件里 `Column == True` 才会生成
+            # `WHERE enabled = 1`，换成裸属性是把 Column 当布尔值用，条件失效。
+            # 本文件其余 E712 同理。
             m = self.db.query(RetrievalModel).filter(
                 RetrievalModel.name == model_name,
-                RetrievalModel.enabled == True,
+                RetrievalModel.enabled == True,  # noqa: E712
             ).first()
             if m:
                 return EmbeddingClient(api_base=m.api_base, model=m.model_name or m.name, api_key=m.api_key)
 
         m = self.db.query(RetrievalModel).filter(
             RetrievalModel.model_type == "embedding",
-            RetrievalModel.is_default == True,
-            RetrievalModel.enabled == True,
+            RetrievalModel.is_default == True,  # noqa: E712
+            RetrievalModel.enabled == True,  # noqa: E712
         ).first()
         if m:
             return EmbeddingClient(api_base=m.api_base, model=m.model_name or m.name, api_key=m.api_key)
@@ -318,20 +325,22 @@ class DocumentProcessor:
     def _vlm_caption(self, kb: KnowledgeBase, img_bytes: bytes) -> str:
         """调用 VLM 模型生成图片描述。"""
         import base64
+
         import httpx
+
         from lea_rag.db.models import RetrievalModel
 
         vlm_name = getattr(kb, "vlm_model", "") or ""
         if not vlm_name:
             m = self.db.query(RetrievalModel).filter(
                 RetrievalModel.model_type == "vlm",
-                RetrievalModel.is_default == True,
-                RetrievalModel.enabled == True,
+                RetrievalModel.is_default == True,  # noqa: E712
+                RetrievalModel.enabled == True,  # noqa: E712
             ).first()
         else:
             m = self.db.query(RetrievalModel).filter(
                 RetrievalModel.name == vlm_name,
-                RetrievalModel.enabled == True,
+                RetrievalModel.enabled == True,  # noqa: E712
             ).first()
 
         if not m:
@@ -374,7 +383,7 @@ class DocumentProcessor:
 
         m = self.db.query(RetrievalModel).filter(
             RetrievalModel.model_type == "asr",
-            RetrievalModel.enabled == True,
+            RetrievalModel.enabled == True,  # noqa: E712
         ).first()
         if not m:
             logger.warning("asr_not_configured", document_id=doc.id)

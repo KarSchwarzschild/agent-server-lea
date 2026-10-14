@@ -13,9 +13,9 @@
 """
 
 import os
+import signal
 import subprocess
 import sys
-import signal
 import time
 from pathlib import Path
 

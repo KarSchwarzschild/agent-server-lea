@@ -10,13 +10,12 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import random
-from typing import Any, Optional
 
-import structlog
 import redis.asyncio as aioredis
+import structlog
 
 log = structlog.get_logger()
 
@@ -74,7 +73,7 @@ def _cache_key(prefix: str, **kwargs) -> str:
     return f"lea-config:{prefix}:{h}"
 
 
-async def get_cached(prefix: str, ttl: int, **kwargs) -> Optional[dict | list]:
+async def get_cached(prefix: str, ttl: int, **kwargs) -> dict | list | None:
     """从缓存读取 JSON 数据。
 
     Args:
@@ -181,7 +180,7 @@ async def invalidate_pattern(pattern: str):
 
 # ── 便捷函数：按资源类型缓存 ────────────────────────────────────────
 
-async def get_agent_list_cache(tenant_id: str, user_id: str) -> Optional[list]:
+async def get_agent_list_cache(tenant_id: str, user_id: str) -> list | None:
     """获取用户可见的 Agent 列表缓存。"""
     return await get_cached("agent-list", CACHE_TTL_AGENT, tenant_id=tenant_id, user_id=user_id)
 
@@ -191,7 +190,7 @@ async def set_agent_list_cache(tenant_id: str, user_id: str, agents: list):
     await set_cached("agent-list", CACHE_TTL_AGENT, agents, tenant_id=tenant_id, user_id=user_id)
 
 
-async def get_agent_detail_cache(agent_id: int) -> Optional[dict]:
+async def get_agent_detail_cache(agent_id: int) -> dict | None:
     """获取单个 Agent 详情缓存（包括绑定关系）。"""
     return await get_cached("agent-detail", CACHE_TTL_AGENT, agent_id=agent_id)
 
@@ -206,11 +205,11 @@ async def invalidate_agent_cache(tenant_id: str):
 
     删除该租户下所有 agent-list 和 agent-detail 缓存。
     """
-    await invalidate_pattern(f"lea-config:agent-list:*")
-    await invalidate_pattern(f"lea-config:agent-detail:*")
+    await invalidate_pattern("lea-config:agent-list:*")
+    await invalidate_pattern("lea-config:agent-detail:*")
 
 
-async def get_skill_list_cache(tenant_id: str, user_id: str) -> Optional[list]:
+async def get_skill_list_cache(tenant_id: str, user_id: str) -> list | None:
     """获取 Skill 列表缓存。"""
     return await get_cached("skill-list", CACHE_TTL_SKILL, tenant_id=tenant_id, user_id=user_id)
 
@@ -222,10 +221,10 @@ async def set_skill_list_cache(tenant_id: str, user_id: str, skills: list):
 
 async def invalidate_skill_cache():
     """Skill 变更时清除所有 skill-list 缓存。"""
-    await invalidate_pattern(f"lea-config:skill-list:*")
+    await invalidate_pattern("lea-config:skill-list:*")
 
 
-async def get_tool_list_cache(tenant_id: str, user_id: str) -> Optional[list]:
+async def get_tool_list_cache(tenant_id: str, user_id: str) -> list | None:
     """获取 Tool 列表缓存。"""
     return await get_cached("tool-list", CACHE_TTL_TOOL, tenant_id=tenant_id, user_id=user_id)
 
@@ -237,10 +236,10 @@ async def set_tool_list_cache(tenant_id: str, user_id: str, tools: list):
 
 async def invalidate_tool_cache():
     """Tool 变更时清除所有 tool-list 缓存。"""
-    await invalidate_pattern(f"lea-config:tool-list:*")
+    await invalidate_pattern("lea-config:tool-list:*")
 
 
-async def get_mcp_list_cache(tenant_id: str, user_id: str) -> Optional[list]:
+async def get_mcp_list_cache(tenant_id: str, user_id: str) -> list | None:
     """获取 MCP Server 列表缓存。"""
     return await get_cached("mcp-list", CACHE_TTL_MCP, tenant_id=tenant_id, user_id=user_id)
 
@@ -252,10 +251,10 @@ async def set_mcp_list_cache(tenant_id: str, user_id: str, mcps: list):
 
 async def invalidate_mcp_cache():
     """MCP Server 变更时清除所有 mcp-list 缓存。"""
-    await invalidate_pattern(f"lea-config:mcp-list:*")
+    await invalidate_pattern("lea-config:mcp-list:*")
 
 
-async def get_team_cache(team_id: int) -> Optional[dict]:
+async def get_team_cache(team_id: int) -> dict | None:
     """获取 Team 配置缓存。"""
     return await get_cached("team", CACHE_TTL_TEAM, team_id=team_id)
 

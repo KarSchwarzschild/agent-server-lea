@@ -13,13 +13,11 @@
 
 from __future__ import annotations
 
-from typing import Optional
-
 from fastapi import APIRouter, Depends, HTTPException, Query
+from lea_authkit import Actor, require_actor, require_admin
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from lea_authkit import Actor, require_actor, require_admin
 from lea_rag.db.database import get_db
 from lea_rag.db.models import KnowledgeBase
 from lea_rag.services.kb_service import KBService
@@ -28,19 +26,19 @@ router = APIRouter(prefix="/admin/knowledge-bases", tags=["admin-knowledge"])
 
 
 class KBUpdateRequest(BaseModel):
-    name: Optional[str] = None
-    description: Optional[str] = None
-    enabled: Optional[bool] = None
-    visibility: Optional[str] = None
-    retrieval_mode: Optional[str] = None
-    retrieval_top_k: Optional[int] = None
-    score_threshold: Optional[float] = None
-    embedding_model: Optional[str] = None
-    reranker_model: Optional[str] = None
-    reranker_enabled: Optional[bool] = None
-    vlm_model: Optional[str] = None
-    vlm_enabled: Optional[bool] = None
-    multimodal: Optional[bool] = None
+    name: str | None = None
+    description: str | None = None
+    enabled: bool | None = None
+    visibility: str | None = None
+    retrieval_mode: str | None = None
+    retrieval_top_k: int | None = None
+    score_threshold: float | None = None
+    embedding_model: str | None = None
+    reranker_model: str | None = None
+    reranker_enabled: bool | None = None
+    vlm_model: str | None = None
+    vlm_enabled: bool | None = None
+    multimodal: bool | None = None
 
 
 def _kb_to_dict(kb: KnowledgeBase) -> dict:
@@ -71,8 +69,8 @@ def _kb_to_dict(kb: KnowledgeBase) -> dict:
 def list_all_kbs(
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=200),
-    enabled: Optional[bool] = None,
-    search: Optional[str] = None,
+    enabled: bool | None = None,
+    search: str | None = None,
     db: Session = Depends(get_db),
     actor: Actor = Depends(require_actor),
 ):

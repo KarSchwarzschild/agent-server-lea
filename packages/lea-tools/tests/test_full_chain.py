@@ -7,14 +7,10 @@
 4. 发 /debug/trace 请求触发 code_interpreter
 """
 
-import json
 import os
 import signal
 import subprocess
 import sys
-import time
-
-import httpx
 
 # ─── 配置 ───
 CUBE_API_URL = "http://10.192.241.137:3000"

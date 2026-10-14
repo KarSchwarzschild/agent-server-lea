@@ -20,9 +20,8 @@ import re
 import sys
 from pathlib import Path
 
-from sqlalchemy import text
-
 from lea_config.database import engine
+from sqlalchemy import text
 
 # 这两类错误意味着"这条 DDL 之前跑过了"，跳过是对的。
 ALREADY_APPLIED = re.compile(

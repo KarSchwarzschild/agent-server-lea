@@ -39,7 +39,9 @@ def _mock_object_storage(monkeypatch):
 async def _collect_events(pipeline, message, llm_content, **kwargs):
     """跑 pipeline 收集所有 SkillEvent。"""
     fake_llm = _FakeLLM(llm_content)
-    llm_factory = lambda purpose="chat": fake_llm
+
+    def llm_factory(purpose="chat"):
+        return fake_llm
 
     events = []
     async for ev in pipeline.run(

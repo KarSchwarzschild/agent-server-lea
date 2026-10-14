@@ -1,6 +1,6 @@
 """Agent 模型。"""
 
-from sqlalchemy import Boolean, Column, DateTime, Integer, JSON, String, Text, UniqueConstraint, and_, func, or_
+from sqlalchemy import JSON, Boolean, Column, DateTime, Integer, String, Text, UniqueConstraint, and_, func, or_
 
 from lea_config.database import (
     DEFAULT_TENANT_ID,

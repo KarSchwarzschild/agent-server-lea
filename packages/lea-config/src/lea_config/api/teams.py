@@ -6,14 +6,13 @@ AgentTeam 无 TenantMixin，通过 agent.tenant_id 间接约束。
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from lea_authkit import Actor, require_actor
 from pydantic import BaseModel
 from sqlalchemy import and_
 from sqlalchemy.orm import Session
 
-from lea_authkit import Actor, require_actor
 from lea_config.database import get_db
 from lea_config.models.agent import Agent
 from lea_config.models.agent import visible_to as agent_visible_to
@@ -33,13 +32,13 @@ class TeamCreate(BaseModel):
 
 
 class TeamUpdate(BaseModel):
-    strategy: Optional[str] = None
-    decomposer_prompt: Optional[str] = None
-    synthesizer_prompt: Optional[str] = None
-    max_subtasks: Optional[int] = None
+    strategy: str | None = None
+    decomposer_prompt: str | None = None
+    synthesizer_prompt: str | None = None
+    max_subtasks: int | None = None
     # 乐观并发控制：跟 lea-config 的 agents.py、lea-rag 的 server_user_kb.py
     # 同一个模式，那边有完整说明。省略=不检查（旧客户端兼容）。
-    expected_updated_at: Optional[datetime] = None
+    expected_updated_at: datetime | None = None
 
 
 class MemberCreate(BaseModel):

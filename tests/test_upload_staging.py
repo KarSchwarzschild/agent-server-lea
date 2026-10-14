@@ -28,7 +28,6 @@ from lea_tools.services.file_store import (  # noqa: E402
     SandboxFileStore,
 )
 
-
 # ── 挂载点常量必须跨服务一致 ──────────────────────────────────────
 
 def test_uploads_mount_matches_go_side():
@@ -251,6 +250,7 @@ def test_sandbox_store_blocks_uploads_escape():
 def test_host_mount_includes_uploads_readonly(monkeypatch):
     """沙箱必须挂到 uploads,而且是 RO。少了这一条,"改文件"整条路不通。"""
     import json
+
     from lea_tools.services import nfs_provisioner
 
     monkeypatch.setenv("NFS_ROOT", "/data/lea")
@@ -275,6 +275,7 @@ def test_uploads_is_sibling_of_workspace(monkeypatch):
     同一份字节存两遍,而且污染文件抽屉（用户看到自己刚传的文件出现在"AI 生成的产物"里）。
     """
     import json
+
     from lea_tools.services import nfs_provisioner
 
     monkeypatch.setenv("NFS_ROOT", "/data/lea")

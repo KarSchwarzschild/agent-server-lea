@@ -10,8 +10,8 @@ HTTP（/kb/create, /kb/{id}/upload, /kb/search），因为知识库这条链路�
 """
 import json
 import time
-import urllib.request
 import urllib.error
+import urllib.request
 
 RAG_BASE = "http://localhost:8300"
 INTERNAL_TOKEN = "local-dev-internal-token"

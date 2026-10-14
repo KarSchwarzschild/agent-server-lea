@@ -129,7 +129,7 @@ def main() -> int:
             if d.exists():
                 # ignore_errors 会把失败吞掉，所以自己确认一次 —— 否则这个脚本
                 # 会报告"释放了 3GB"而磁盘一个字节都没少。
-                print(f"    ✗ 删除失败，目录还在（权限？有进程占着？）")
+                print("    ✗ 删除失败，目录还在（权限？有进程占着？）")
                 freed -= size
 
     print()

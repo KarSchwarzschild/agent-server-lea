@@ -12,9 +12,6 @@ from __future__ import annotations
 
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import Column, Integer, String, create_engine
-from sqlalchemy.orm import DeclarativeBase, sessionmaker
-
 from lea_authkit.authz import (
     DELETE,
     OWNER_SCOPE_PLATFORM,
@@ -29,6 +26,8 @@ from lea_authkit.authz import (
     require,
     scoped_filter,
 )
+from sqlalchemy import Column, Integer, String, create_engine
+from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 T1, T2 = "tenant-a", "tenant-b"
 
@@ -308,7 +307,6 @@ def _actor_from_headers(**headers):
     """
     from fastapi import Depends, FastAPI
     from fastapi.testclient import TestClient
-
     from lea_authkit import require_actor
 
     app = FastAPI()

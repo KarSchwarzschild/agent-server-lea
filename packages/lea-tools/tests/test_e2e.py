@@ -3,7 +3,6 @@ Tool Gateway E2E 测试 — 覆盖所有 executor + 权限 + 配额。
 使用 mock backend 模拟 lea-rag / 外部 API / E2B / MCP Server。
 """
 
-import asyncio
 import json
 import threading
 import time
@@ -31,7 +30,7 @@ async def mock_kb_search(request: Request):
 
 @mock_app.post("/memory/search")
 async def mock_memory_search(request: Request):
-    body = await request.json()
+    await request.json()  # 读掉请求体（固定返回，不依赖入参）
     return {"memories": [{"text": "user prefers dark mode", "relevance": 0.8}]}
 
 
@@ -51,7 +50,7 @@ async def mock_external_search(request: Request):
     auth = request.headers.get("authorization", "")
     if not auth.startswith("Bearer "):
         return {"error": "unauthorized"}, 401
-    body = await request.json()
+    await request.json()  # 读掉请求体（固定返回，不依赖入参）
     return {
         "data": {
             "items": [
@@ -71,8 +70,16 @@ async def mock_mcp_server(request: Request):
             "jsonrpc": "2.0", "id": body["id"],
             "result": {
                 "tools": [
-                    {"name": "get_weather", "description": "Get weather", "inputSchema": {"type": "object", "properties": {"city": {"type": "string"}}}},
-                    {"name": "get_stock", "description": "Get stock price", "inputSchema": {"type": "object", "properties": {"symbol": {"type": "string"}}}},
+                    {
+                        "name": "get_weather",
+                        "description": "Get weather",
+                        "inputSchema": {"type": "object", "properties": {"city": {"type": "string"}}},
+                    },
+                    {
+                        "name": "get_stock",
+                        "description": "Get stock price",
+                        "inputSchema": {"type": "object", "properties": {"symbol": {"type": "string"}}},
+                    },
                 ]
             }
         }
@@ -91,6 +98,7 @@ async def mock_mcp_server(request: Request):
 # ============================================================
 
 import os
+
 os.environ["DB_HOST"] = "sqlite"
 os.environ["DB_NAME"] = "test_e2e"
 os.environ["LEA_RAG_URL"] = "http://127.0.0.1:9900"
@@ -365,8 +373,11 @@ def main():
 
     # --- 7. Execute: sandbox (code_exec) ---
     print("\n[7] Execute: Sandbox (code_exec)")
-    r = client.post("/tools/execute", json={"tool_name": "code_exec", "params": {"code": "print('hello')", "language": "python"}},
-                    headers={"X-Tenant-ID": "t1", "X-User-ID": USER, "X-User-Role": "user"})
+    r = client.post(
+        "/tools/execute",
+        json={"tool_name": "code_exec", "params": {"code": "print('hello')", "language": "python"}},
+        headers={"X-Tenant-ID": "t1", "X-User-ID": USER, "X-User-Role": "user"},
+    )
     data = r.json()
     check("sandbox exec success", data["status"] == "success", data.get("error", ""))
     check("sandbox has stdout", "stdout" in (data.get("result") or {}))

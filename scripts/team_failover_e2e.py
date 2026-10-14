@@ -22,21 +22,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import subprocess
 import sys
 import time
-from contextlib import contextmanager
 from typing import Any
-
-import os
 
 import requests
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from _dbconn import connect, env as load_env  # noqa: E402
+from _dbconn import connect  # noqa: E402
+from _dbconn import env as load_env
 
 GATEWAY = os.environ.get("LEA_AGENT_URL", "http://127.0.0.1:8080")
 AGENT_1 = "lea-agent-1"
@@ -236,7 +235,7 @@ def _token() -> str:
     t = os.environ.get("LEA_ACCESS_TOKEN", "")
     if t:
         return t
-    from dev_gateway_stub import mint, _load_key  # noqa: PLC0415
+    from dev_gateway_stub import _load_key, mint  # noqa: PLC0415
     return mint(_load_key())
 
 
@@ -344,7 +343,7 @@ def run_failover(
         f"请你（或让你的成员）用 Bash 工具把字符串 {marker} 写入文件 {sandbox_file}，"
         f"并把这个 marker 原样输出在你的回复里。"
     )
-    print(f"\n[1] 发第一条消息（含 Bash 工具调用请求）...")
+    print("\n[1] 发第一条消息（含 Bash 工具调用请求）...")
     try:
         reply1, events1 = chat(session_id, leader_id, msg1)
     except Exception as exc:
@@ -371,8 +370,8 @@ def run_failover(
     time.sleep(5)
 
     # ── Step 3 ───────────────────────────────────────────────────────────────
-    msg2 = f"你刚才的回复里有一个 marker，请原样告诉我那个 marker 是什么。"
-    print(f"\n[3] 发追问消息（应由 agent-2 处理）...")
+    msg2 = "你刚才的回复里有一个 marker，请原样告诉我那个 marker 是什么。"
+    print("\n[3] 发追问消息（应由 agent-2 处理）...")
     try:
         reply2, events2 = chat(session_id, leader_id, msg2)
     except Exception as exc:

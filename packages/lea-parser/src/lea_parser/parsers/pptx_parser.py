@@ -35,7 +35,7 @@ def parse_pptx(file_path: str) -> dict:
                 rows = [" | ".join(c.text.strip() for c in row.cells)
                         for row in shape.table.rows]
                 if any(rows):
-                    slide_texts.append(f"表格：\n" + "\n".join(rows))
+                    slide_texts.append("表格：\n" + "\n".join(rows))
         if slide_texts:
             text_blocks.append({"text": "\n".join(slide_texts), "page_idx": slide_idx})
 

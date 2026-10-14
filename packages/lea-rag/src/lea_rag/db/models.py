@@ -3,8 +3,16 @@
 from __future__ import annotations
 
 from sqlalchemy import (
-    Boolean, Column, DateTime, Float, ForeignKey,
-    Integer, JSON, String, Text, func,
+    JSON,
+    Boolean,
+    Column,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    func,
 )
 
 from lea_rag.db.database import Base

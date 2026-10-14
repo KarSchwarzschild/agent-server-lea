@@ -195,8 +195,8 @@ def test_checkpointer_cross_instance(token: str | None):
         }, headers=headers, timeout=30)
 
         lines_a = r1.text.split("\n")
-        events_a = [l for l in lines_a if l.startswith("data: ")]
-        got_done_a = any("event: done" in l for l in lines_a) or any('"status": "completed"' in e for e in events_a)
+        events_a = [ln for ln in lines_a if ln.startswith("data: ")]
+        got_done_a = any("event: done" in ln for ln in lines_a) or any('"status": "completed"' in e for e in events_a)
 
         time.sleep(1)
 
@@ -205,8 +205,8 @@ def test_checkpointer_cross_instance(token: str | None):
         }, headers=headers, timeout=30)
 
         lines_b = r2.text.split("\n")
-        events_b = [l for l in lines_b if l.startswith("data: ")]
-        got_done_b = any("event: done" in l for l in lines_b) or any('"status": "completed"' in e for e in events_b)
+        events_b = [ln for ln in lines_b if ln.startswith("data: ")]
+        got_done_b = any("event: done" in ln for ln in lines_b) or any('"status": "completed"' in e for e in events_b)
 
         ok = r1.status_code == 200 and r2.status_code == 200 and got_done_a and got_done_b
         report(
@@ -221,7 +221,7 @@ def test_checkpointer_cross_instance(token: str | None):
 
 def main():
     print(f"\n{'=' * 50}")
-    print(f"  LEA Platform 分布式集成测试")
+    print("  LEA Platform 分布式集成测试")
     print(f"  实例 A: {BASE_A}   实例 B: {BASE_B}")
     print(f"{'=' * 50}\n")
 

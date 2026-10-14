@@ -4,9 +4,6 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-
 from lea_authkit import Actor
 from lea_rag.db.database import Base
 from lea_rag.db.models import Document, DocumentChunk, DocumentSection, KnowledgeBase
@@ -17,6 +14,8 @@ from lea_rag.server_governance import (
     cancel_document_job,
     retry_document_job,
 )
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 
 @pytest.fixture

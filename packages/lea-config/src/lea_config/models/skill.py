@@ -15,7 +15,20 @@
 因为 upload 的默认参数没人传）。
 """
 
-from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint, and_, func, or_
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    Column,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    and_,
+    func,
+    or_,
+)
 
 from lea_config.database import (
     DEFAULT_TENANT_ID,

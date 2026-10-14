@@ -1,8 +1,8 @@
 """Current administration-console identity and capabilities."""
 
 from fastapi import APIRouter, Depends
-
 from lea_authkit import Actor, require_actor
+
 from lea_config.api._auth_helpers import require_admin
 
 router = APIRouter(prefix="/console-context", tags=["console-context"])

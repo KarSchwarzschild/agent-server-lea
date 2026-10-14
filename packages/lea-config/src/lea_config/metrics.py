@@ -1,9 +1,9 @@
 """Prometheus 监控指标"""
 import time
-from typing import Callable
+from collections.abc import Callable
 
-from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 from fastapi import Request, Response
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 from starlette.middleware.base import BaseHTTPMiddleware
 
 # HTTP 请求总数

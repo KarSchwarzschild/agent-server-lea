@@ -9,8 +9,7 @@ from __future__ import annotations
 from typing import Any
 
 import structlog
-from sqlalchemy import or_, and_
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
 from lea_rag.db.models import Document, DocumentChunk, KnowledgeBase
@@ -135,8 +134,9 @@ class KBService:
         if kb:
             return kb
 
-        import redis as redis_lib
         import os
+
+        import redis as redis_lib
         redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
         r = redis_lib.from_url(redis_url)
         lock_key = f"lea:kb:personal_lock:{user_id}"

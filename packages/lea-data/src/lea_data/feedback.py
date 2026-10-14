@@ -9,13 +9,13 @@
 from __future__ import annotations
 
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
 
 import structlog
 from pydantic import BaseModel, Field
-from sqlalchemy import Column, DateTime, Integer, String, Text, Float, func
+from sqlalchemy import Column, DateTime, Float, Integer, String, Text, func
 from sqlalchemy.orm import DeclarativeBase
 
 logger = structlog.get_logger(__name__)
@@ -50,7 +50,7 @@ class FeedbackRecord(BaseModel):
     tags: list[str] = Field(default_factory=list)
     score: float | None = None
     evaluated: bool = False
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 # ── SQLAlchemy Model ─────────────────────────────────────
@@ -157,7 +157,7 @@ class FeedbackCollector:
         session = self._db_factory()
         try:
             from datetime import timedelta
-            since = datetime.now(timezone.utc) - timedelta(days=days)
+            since = datetime.now(UTC) - timedelta(days=days)
             likes = (
                 session.query(func.count(FeedbackModel.id))
                 .filter(

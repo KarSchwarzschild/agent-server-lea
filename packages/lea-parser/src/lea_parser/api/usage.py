@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Header, Query
+from lea_authkit import require_admin
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from lea_authkit import require_admin
 from lea_parser.api.console import console_actor_from_headers
 from lea_parser.auth import CurrentUser, get_current_user
 from lea_parser.database import get_db

@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import random
 
-import structlog
 import redis.asyncio as aioredis
+import structlog
 
 from lea_tools.config import get_redis_settings
 
@@ -127,7 +127,14 @@ async def set_cached_capabilities(
             # 正常值加抖动 TTL（防雪崩）
             actual_ttl = _ttl_with_jitter(ttl)
             await r.setex(key, actual_ttl, json.dumps(tools, ensure_ascii=False))
-            log.debug("capabilities cache set", tenant_id=tenant_id, user_id=user_id, role=role, tool_count=len(tools), ttl=actual_ttl)
+            log.debug(
+                "capabilities cache set",
+                tenant_id=tenant_id,
+                user_id=user_id,
+                role=role,
+                tool_count=len(tools),
+                ttl=actual_ttl,
+            )
     except Exception as e:
         log.warning("capabilities cache write failed", error=str(e))
         _mark_unavailable()

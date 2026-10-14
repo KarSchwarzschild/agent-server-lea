@@ -64,9 +64,8 @@ import uuid
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-import requests
-
 import _dbconn as d
+import requests
 
 AGENT_URL = os.getenv("LEA_AGENT_URL", "http://127.0.0.1:8100")
 # 假 server 从容器里看是 host.docker.internal，跟 mock_stock_api 那套一致

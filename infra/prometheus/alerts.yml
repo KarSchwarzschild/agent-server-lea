@@ -1,3 +1,20 @@
+# 真实覆盖：21 条规则里 15 条的指标有真实数据，6 条是哑炮（2026-10-15 实测）。
+#
+# 那 6 条引用的指标在 /metrics 上永远没数，原因不是名字写错，而是**埋点没接**：
+# lea-config / lea-rag / lea-tools 三个 metrics.py 里的 10 个 record_* 函数全部
+# 只有定义、零调用点。受影响的告警：
+#   CacheInvalidationRateHigh   <- record_agent_config_load
+#   DBQueryLatencyP95High       <- record_db_query
+#   KBSearchHighLatency         <- record_kb_search
+#   EmbeddingHighLatency        <- record_embedding
+#   ToolExecutionHighErrorRate  <- record_tool_execution
+#   SandboxExecutionTimeout     <- record_sandbox_execution
+#
+# 这些规则**没有删**：要告警的事情都是真该告警的，缺的是把 record_* 接进业务
+# 代码。删了等于把需求也删了。scripts/check_alert_metrics.py 每次 CI 都会把这
+# 份名单打出来；接通之后设 LEA_STRICT_INSTRUMENTATION=1 让它转为阻塞。
+#
+# 别把"21 条规则"当成"21 条覆盖"。
 groups:
   - name: lea-platform-critical
     interval: 30s
@@ -168,6 +185,12 @@ groups:
       #
       # 阈值 10s：这个项目的 activity 执行动辄几十秒，但**排队**不该排这么久。
       # for: 10m 是为了避开上传高峰那种短时堆积。
+      #
+      # 这条**刻意不写 sum by (le)**，跟下面几条 histogram_quantile 不一样：不聚合的
+      # 话 Prometheus 按剩余标签逐组合算分位数，于是能看出是**哪类 activity** 在堆
+      # 积（activity_type / workflow_type 分开），这正是排查时要的第一个信息。
+      # 其他几条（DB 查询、KB 检索、向量化、HTTP）要的是服务整体健康，所以聚合。
+      # 标签基数核过，都是有界的常量集合，不会因为不聚合而把序列数顶上去。
       - alert: AgentWorkerQueueLatencyHigh
         expr: |
           histogram_quantile(0.95,
@@ -227,8 +250,14 @@ groups:
 
       # ========== 数据库告警 ==========
 
+      # 补了 _bucket + rate（2026-10-15）。原来是
+      #   histogram_quantile(0.95, lea_config_db_query_duration_seconds) > 1
+      # 少 _bucket 的后果见 SlowHTTPResponse 那条的注释：永远 0 条，不会报警。
       - alert: DBQueryLatencyP95High
-        expr: histogram_quantile(0.95, lea_config_db_query_duration_seconds) > 1
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(lea_config_db_query_duration_seconds_bucket[5m]))
+          ) > 1
         for: 5m
         labels:
           severity: warning
@@ -259,8 +288,12 @@ groups:
 
       # ========== KB/RAG 告警 ==========
 
+      # 补了 _bucket + rate（2026-10-15），同 SlowHTTPResponse。
       - alert: KBSearchHighLatency
-        expr: histogram_quantile(0.95, lea_rag_kb_search_duration_seconds) > 1
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(lea_rag_kb_search_duration_seconds_bucket[5m]))
+          ) > 1
         for: 5m
         labels:
           severity: warning
@@ -271,8 +304,12 @@ groups:
             P95 延迟: {{ $value | humanizeDuration }}
             Instance: {{ $labels.instance }}
 
+      # 补了 _bucket + rate（2026-10-15），同 SlowHTTPResponse。
       - alert: EmbeddingHighLatency
-        expr: histogram_quantile(0.95, lea_rag_embedding_duration_seconds) > 2
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le) (rate(lea_rag_embedding_duration_seconds_bucket[5m]))
+          ) > 2
         for: 5m
         labels:
           severity: warning
@@ -381,26 +418,52 @@ groups:
     rules:
       # ========== 低优先级告警 ==========
 
+      # 两处都修过（2026-10-15），原来是：
+      #   histogram_quantile(0.99, lea_agent_http_request_duration_seconds) > 5
+      #
+      # 1) 少了 _bucket。histogram_quantile 要的是带 le 标签的 bucket 序列，直接喂
+      #    指标名匹配不到任何东西 —— 规则语法合法、加载正常、**永远返回 0 条**。
+      #    实测过：换成 _bucket + rate 之后同一时刻有数（P99 ≈ 10ms）。
+      #    注意这种哑炮躲过了 scripts/check_alert_metrics.py，因为那个脚本只校验
+      #    指标**名**存在，而 lea_agent_http_request_duration_seconds 确实是
+      #    _bucket/_sum/_count 的共同前缀，在源码里搜得到。
+      #
+      # 2) 必须排掉流式端点。SSE 的 duration 记的是**整条连接的存活时长**，不是
+      #    响应速度：一次正常对话挂 12 秒很常见，挂几分钟也正常。不排除的话用户
+      #    一聊天这条就响，而它想抓的是"接口变慢了"。
+      #    POST /api/chat/stream 和 GET /api/chat/stream/:session_id 都是 SSE
+      #    （见 internal/router/routes.go:38,42）。
       - alert: SlowHTTPResponse
-        expr: histogram_quantile(0.99, lea_agent_http_request_duration_seconds) > 5
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le) (
+              rate(lea_agent_http_request_duration_seconds_bucket{
+                endpoint!~"/api/chat/stream.*"
+              }[5m])
+            )
+          ) > 5
         for: 10m
         labels:
           severity: info
         annotations:
-          summary: "HTTP 请求 P99 延迟 > 5 秒"
+          summary: "HTTP 请求 P99 延迟 > 5 秒（已排除 SSE 流式端点）"
           description: |
             P99 延迟: {{ $value | humanizeDuration }}
             Instance: {{ $labels.instance }}
 
-      # CeleryTaskQueueLarge 删掉了（2026-10-13）。两个理由叠在一起：
-      # lea_rag_celery_queue_size 这个指标不存在，而且 **Celery 本身已经不在调用
-      # 链里**了 —— 现在只剩在 packages/lea-apps-legacy（归档代码）。异步执行走的
-      # 是 Temporal（lea-agent-worker + Task Queue）。
+      # CeleryTaskQueueLarge 删掉了（2026-10-13）。
       #
-      # "队列堆积"仍然是该告警的事，但对象变了：要看的是 Temporal 的 Task Queue
-      # backlog。Temporal 自己导 Prometheus 指标（server 侧的
-      # temporal_task_queue_* 之类），路子是把 Temporal 加成一个 scrape 目标，
-      # 而不是在 lea-rag 里加埋点。
+      # 更正（2026-10-15）：原来这里写的第二个理由"Celery 已经不在调用链里、只剩
+      # 归档代码"是**错的** —— lea-rag 里有三个活跃的 .delay() 派发点，
+      # retrieval-worker 容器一直在真干活。删掉这条规则的唯一正确理由是第一个：
+      # lea_rag_celery_queue_size 这个指标名在代码里从来不存在，规则永不触发。
+      #
+      # 队列堆积现在有真埋点了：lea_rag_celery_queue_depth（在 API 进程里后台采样
+      # Redis 的 LLEN，见 lea_rag/metrics.py），告警是本文件里的
+      # RetrievalQueueBacklog。Temporal 那条队列走 SDK 侧的
+      # temporal_activity_schedule_to_start_latency（见 AgentWorkerQueueLatencyHigh）。
+      # Temporal server 侧的 temporal_task_queue_* 还没开（auto-setup 容器没配
+      # 指标监听），那是另一个口子，不是这条的替代。
 
       - alert: SessionMemoryHigh
         # 指标名是 lea_agent_active_sessions（metrics.go:99），原来写的

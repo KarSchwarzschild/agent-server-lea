@@ -157,6 +157,49 @@ groups:
             依赖的是外部租户接口（TENANT_MEMBERSHIP_URL），先确认对方是否可达。
             表现在用户侧是"选了租户还是 403"。
 
+      # ========== agent-worker（Temporal 异步执行）==========
+      #
+      # 这几条用的是 Temporal SDK 自带的指标（internal/temporalrun/Dial() 里挂了
+      # MetricsHandler 就有），不是我们埋的点。
+      #
+      # schedule_to_start 是"活排进队列到被 worker 接走"的时间，官方把它当作判断
+      # worker 够不够的首选信号。它涨说明 worker 不够用或者卡住了 —— 跟 activity
+      # 自己执行慢（LLM 本来就慢）是两件事，别混。
+      #
+      # 阈值 10s：这个项目的 activity 执行动辄几十秒，但**排队**不该排这么久。
+      # for: 10m 是为了避开上传高峰那种短时堆积。
+      - alert: AgentWorkerQueueLatencyHigh
+        expr: |
+          histogram_quantile(0.95,
+            rate(temporal_activity_schedule_to_start_latency_bucket[10m])
+          ) > 10
+        for: 10m
+        labels:
+          severity: warning
+          service: lea-agent-worker
+        annotations:
+          summary: "agent-worker 活排队 P95 超过 10s"
+          description: |
+            P95 排队延迟: {{ $value }}s
+            活已经排进队列但 worker 迟迟接不走。要么 worker 不够用（加副本），
+            要么它卡住了。注意这跟 activity 执行慢是两件事 —— 执行慢看
+            temporal_activity_execution_latency。
+
+      # activity 持续失败。failure_reason 是 6 个固定取值之一，按它分组能分清
+      # 是业务错（ActivityError）还是消息体过大（PayloadsTooLarge）这类系统问题。
+      - alert: AgentWorkerActivityFailing
+        expr: rate(temporal_activity_execution_failed[10m]) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+          service: lea-agent-worker
+        annotations:
+          summary: "agent-worker activity 持续失败"
+          description: |
+            失败速率: {{ $value }}/s
+            按 failure_reason 分组看 temporal_activity_execution_failed。
+            用户侧的表现是消息发出去没有回复（或者回复到一半断掉）。
+
       # ========== 缓存告警 ==========
 
       - alert: CacheInvalidationRateHigh

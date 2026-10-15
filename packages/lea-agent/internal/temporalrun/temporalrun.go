@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/metrics"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/persistence"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/session"
 	enumspb "go.temporal.io/api/enums/v1"
@@ -65,7 +66,21 @@ func Dial() (*Coordinator, error) {
 	if taskQueue == "" {
 		taskQueue = DefaultTaskQueue
 	}
-	c, err := client.Dial(client.Options{HostPort: hostPort, Namespace: namespace})
+	// MetricsHandler 一挂，SDK 就开始出 temporal_* 那批指标（排队延迟、任务
+	// 成败、poller 状态等），不需要在业务代码里埋任何点。
+	//
+	// 这里给 server 和 worker 都挂上，因为两边都持有 Temporal 客户端：server 负责
+	// 派发（RunDispatcher），worker 负责干活。server 已经有 /metrics 能把它们暴露
+	// 出去；worker 的 listener 见 cmd/worker/main.go。
+	//
+	// 开销：单次记录是一次 map 读 + 一次原子加（纳秒级），而这里测的是秒级的
+	// 工作流和 activity。标签全集已核对过是有界的，没有 workflow_id / run_id。
+	// 详见 internal/metrics/temporal.go 顶部。
+	c, err := client.Dial(client.Options{
+		HostPort:       hostPort,
+		Namespace:      namespace,
+		MetricsHandler: metrics.NewTemporalHandler(),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("dial temporal: %w", err)
 	}

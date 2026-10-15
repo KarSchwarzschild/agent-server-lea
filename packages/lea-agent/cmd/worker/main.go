@@ -2,14 +2,17 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/eventlog"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/persistence"
@@ -32,6 +35,17 @@ func main() {
 		log.Fatalf("temporal init failed: %v", err)
 	}
 	defer coordinator.Close()
+
+	// 指标 + 健康检查端口。
+	//
+	// 这个进程在这之前**完全没有可观测性**：不监听任何端口，compose 里
+	// healthcheck 也是 disable。于是它卡死（Temporal 连接断了但进程没退）的表现
+	// 是容器 Running、日志不滚、用户消息一直没回复，而面板全绿。
+	//
+	// temporalrun.Dial() 已经给客户端挂了 MetricsHandler，所以 SDK 的 temporal_*
+	// 指标此刻正在往默认 registry 里写；这里只是把 registry 暴露出去 + 给
+	// healthcheck 一个能打的端点。
+	startObservabilityServer()
 
 	mgr := session.NewManager()
 	defer mgr.Close()
@@ -61,6 +75,48 @@ func main() {
 	stop()
 	log.Printf("lea-agent-worker stopping")
 	w.Stop()
+}
+
+// startObservabilityServer 起一个只有 /metrics 和 /health 的 HTTP server。
+//
+// 端口默认 9109（网关的指标口是 9108，错开一位好认）。这个口**不需要发布到宿主**
+// —— Prometheus 在同一个 compose 网络里，docker 的 healthcheck 也是在容器内执行。
+//
+// /health 只回 200，不去 ping Temporal。为什么够用：worker 的失败形态是整个
+// 进程卡住（goroutine 全阻塞在某处），那时这个 handler 也响应不了，探针一样会
+// 失败。反过来如果只是 Temporal 临时抖一下，不该把容器判成 unhealthy 然后重启
+// —— SDK 自己会重连，重启只会把正在跑的 activity 全打断。
+//
+// "worker 接不上 Temporal"这件事由指标回答（temporal_poll_no_task、
+// temporal_request_failure 那几条），不该由健康检查回答。
+func startObservabilityServer() {
+	port := env("LEA_AGENT_WORKER_METRICS_PORT", "9109")
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok","service":"lea-agent-worker"}`))
+	})
+	server := &http.Server{
+		Addr:              ":" + port,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	go func() {
+		log.Printf("lea-agent-worker observability listening on :%s", port)
+		// 这个口起不来不该拖垮 worker：活照干，只是没指标。所以是 Printf 不是 Fatal。
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("lea-agent-worker observability server stopped: %v", err)
+		}
+	}()
+}
+
+func env(key, fallback string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		return v
+	}
+	return fallback
 }
 
 func initCache() error {

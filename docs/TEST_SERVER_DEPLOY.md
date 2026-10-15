@@ -234,8 +234,8 @@ docker tag  docker.1ms.run/prom/prometheus:v3.1.0 prom/prometheus:v3.1.0
 
 ### 当前采集到什么
 
-6 个目标：`lea-agent`、`lea-config`、`lea-rag`、`lea-tools`、`lea-gateway`、
-`prometheus` 自身。18 条告警规则。
+7 个目标：`lea-agent`、`lea-config`、`lea-rag`、`lea-tools`、`lea-gateway`、`lea-agent-worker`、
+`prometheus` 自身。21 条告警规则。
 
 #### ⚠️ lea-gateway 的指标在 9108，不是业务端口
 
@@ -256,12 +256,37 @@ compose 的 `ports:` 里加这一行。
 | `lea_gateway_auth_rejections_total{reason}` | 鉴权拒绝。`reason` 只有 `missing_token` / `invalid_token` 两种取值。比例飙到过半 = JWKS 拉不到 / issuer 配错 / 时钟偏移，不是个别用户 token 过期 |
 | `lea_gateway_tenant_resolve_failures_total` | 租户归属解析失败，403 的主因。依赖**外部**接口（`TENANT_MEMBERSHIP_URL`），对方挂了这边全员 403 |
 
-**两个服务还没有指标端点**，所以没配 job（配了只会得到永远 down 的目标，而永远
+#### 两个 worker 的监控
+
+这两个容器原来都是 `healthcheck: disable: true` 且没有任何指标。那种状态下它们
+挂掉的表现是**容器 Running、日志不滚、面板全绿**，只能靠用户来报：
+
+| worker | 挂了的用户可见症状 |
+|---|---|
+| `agent-worker` | 消息发出去没有回复，或者回复到一半断掉 |
+| `retrieval-worker` | 上传接口正常返回 `processing`，然后文档永远停在 processing、知识库搜不到 |
+
+现在各自有了:
+
+| worker | 指标 | 健康检查 |
+|---|---|---|
+| `agent-worker` | 容器内 `9109`（不发布到宿主）。`temporal_*` 由 Temporal SDK 自带，不是我们埋的 | `wget /health` |
+| `retrieval-worker` | 队列深度由 **lea-rag API 进程**量 broker 得到（`lea_rag_celery_queue_depth`），worker 自己不出指标 | `celery inspect ping` |
+
+`agent-worker` 最该看的是 `temporal_activity_schedule_to_start_latency` —— 活排进
+队列到被接走的时间，这是判断 **worker 够不够**的首选信号。注意它跟 activity 执行
+慢是两件事:执行慢看 `temporal_activity_execution_latency`（LLM 调用本来就几十秒）。
+
+`agent-worker` 的 `/health` **刻意不去 ping Temporal**。worker 真正的失败形态是整个
+进程卡住，那时这个端点也答不了、探针照样失败；而 Temporal 临时抖一下不该把容器判成
+unhealthy 然后重启 —— SDK 自己会重连，重启只会把正在跑的 activity 全打断。"连不上
+Temporal"由指标回答（`temporal_poll_no_task`），不由健康检查回答。
+
+**还有一个服务没有指标端点**，所以没配 job（配了只会得到永远 down 的目标，而永远
 down 的目标会训练人忽略面板）：
 
 | 服务 | 情况 | 影响 |
 |---|---|---|
-| `lea-agent-worker` | 不监听任何 HTTP 端口 | 排队执行那条链路完全没有可观测性 —— 长任务卡住、重试风暴、Task Queue 堆积都看不见 |
 | `lea-parser` | `/metrics` 返 404 | 解析服务无指标 |
 
 另外 Redis 和 MySQL 需要各自的 exporter，现在没部署（`prometheus.yml` 里留了注释

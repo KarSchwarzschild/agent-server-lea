@@ -73,6 +73,23 @@ ruff:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH
 
+# 告警引用的指标必须真的存在。
+#
+# 哑炮告警比没有告警更糟：规则能加载、永远不触发，而面板上显示"这块已覆盖"。
+# 本仓库踩过一次 —— CeleryTaskQueueLarge 引用的 lea_rag_celery_queue_size 从来
+# 没在代码里存在过，而它在库里躺了很久没人发现。
+#
+# 不装 go 也能跑（拿不到 GOMODCACHE 就跳过 temporal_* 那部分，只核 lea_*），
+# 所以放在 lint 阶段用 uv 镜像，不依赖 go-test。
+alert-metrics:
+  stage: lint
+  image: ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+  script:
+    - uv run --with pyyaml python scripts/check_alert_metrics.py
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
 # ── test ───────────────────────────────────────────────────────────────────
 
 pytest:

@@ -116,16 +116,40 @@ scrape_configs:
       - target_label: service
         replacement: 'lea-gateway'
 
-  # ── 下面两个服务没有配 job，因为它们压根没有指标端点（实测 2026-10-13）──────
+  # lea-agent-worker：Temporal worker，真正跑 agent run 的地方
+  #
+  # 9109 是 worker 自己起的可观测性端口（跟网关的 9108 错开一位），**不发布到
+  # 宿主**，只在 compose 网络内可达。
+  #
+  # 这里的 temporal_* 指标不是我们埋的，是 Temporal SDK 自带的 —— 在
+  # internal/temporalrun/Dial() 里挂了 MetricsHandler 就开始出数。最该看的几条：
+  #
+  #   temporal_activity_schedule_to_start_latency  活排队多久才被接走。这是判断
+  #       **worker 够不够**的首选信号，也是官方推荐的自动扩缩依据。
+  #   temporal_workflow_task_schedule_to_start_latency  同上，workflow 侧。
+  #   temporal_activity_execution_failed  / temporal_workflow_task_execution_failed
+  #       失败计数，带 failure_reason（6 个固定取值）。
+  #   temporal_poll_no_task  poller 空转。连不上 Temporal 时这条会变化，比健康
+  #       检查更早反映问题（/health 刻意不 ping Temporal，见 compose 里的注释）。
+  #
+  # 注意 lea_agent_* 那批（HTTP、LLM、工具调用）在这个端口上**基本没有数** ——
+  # 它们是 cmd/server 的埋点，worker 不走那条路。别把两边的指标混着查。
+  - job_name: 'lea-agent-worker'
+    static_configs:
+      - targets: ['agent-worker:9109']
+    metrics_path: '/metrics'
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+      - target_label: service
+        replacement: 'lea-agent-worker'
+
+  # ── 下面这个服务没有配 job，因为它压根没有指标端点（实测 2026-10-13）────────
   #
   # 不配**永远 down 的目标**是有意的：那种目标会训练人忽略告警面板，比没有更糟。
   # 等补上埋点之后再把 job 加回来。
-  #
-  #   lea-agent-worker 不监听任何 HTTP 端口（cmd/worker/main.go 里没有 http.Server）。
-  #                   它的主职是从 Temporal Task Queue 取活。于是**排队执行的那条
-  #                   链路完全没有可观测性** —— 长任务卡住、重试风暴、Task Queue
-  #                   堆积，全都看不见。补法：给 worker 起一个只服务 /metrics 的
-  #                   HTTP server。
   #
   #   lea-parser      /metrics 返 404（带不带内部 token 都一样）。
 

@@ -195,8 +195,20 @@ services:
     image: lea-agent:test
     container_name: lea-agent-worker-test
     entrypoint: ["/usr/local/bin/lea-agent-worker"]
+    # 原来是 healthcheck: disable: true —— 进程卡死（goroutine 全阻塞）的表现是
+    # 容器 Running、日志不滚、用户消息一直没回复，而 docker ps 一片绿。
+    #
+    # 现在 worker 自己起了个只有 /metrics 和 /health 的 listener（9109，不发布到
+    # 宿主）。/health 只回 200、不去 ping Temporal，这是刻意的：worker 真正的失败
+    # 形态是整个进程卡住，那时这个 handler 也答不了，探针照样失败；而 Temporal
+    # 临时抖一下不该把容器判成 unhealthy 然后重启 —— SDK 自己会重连，重启只会把
+    # 正在跑的 activity 全打断。"连不上 Temporal"由指标回答，不由健康检查回答。
     healthcheck:
-      disable: true
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9109/health"]
+      interval: 15s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
     env_file:
       - ../.env
     environment:

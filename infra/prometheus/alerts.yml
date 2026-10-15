@@ -89,6 +89,74 @@ groups:
             5xx 错误率: {{ $value | humanizePercentage }}
             Instance: {{ $labels.instance }}
 
+      # ========== 网关告警 ==========
+      #
+      # 网关是所有请求的必经之路，所以它的错误率是**唯一能反映"用户到底能不能用"
+      # 的指标** —— 下游某个服务挂了，这里一定也会红；反过来这里红了但下游都绿，
+      # 说明问题在网关自己（鉴权、租户解析、路由表漏注册）。
+
+      - alert: HighErrorRateGateway
+        expr: |
+          (
+            sum by (instance) (rate(lea_gateway_http_requests_total{job="lea-gateway",status="5xx"}[5m]))
+            /
+            sum by (instance) (rate(lea_gateway_http_requests_total{job="lea-gateway"}[5m]))
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+          service: lea-gateway
+        annotations:
+          summary: "lea-gateway 5xx 错误率超过 5%"
+          description: |
+            5xx 错误率: {{ $value | humanizePercentage }}
+            Instance: {{ $labels.instance }}
+            网关的 5xx 多半是反代上游失败（502）。先看下游各服务的 up 和错误率，
+            全绿的话再查网关自己。
+
+      # 鉴权大面积拒绝 —— 这条抓的是"登录整体坏了"，不是个别用户 token 过期。
+      #
+      # 用比例而不是绝对速率：绝对值跟流量相关，低峰期永远不触发，高峰期又会被
+      # 正常的过期 token 噪声打扰。而 JWKS 拉不到 / issuer 配错 / 时钟偏移这几种
+      # 真故障的表现都是**几乎所有请求都被拒**，比例一定飙到接近 1。
+      #
+      # 0.5 这个阈值的含义：一半以上的请求连鉴权都过不了，不可能是正常业务形态。
+      - alert: GatewayAuthRejectionSpike
+        expr: |
+          (
+            sum by (instance) (rate(lea_gateway_auth_rejections_total{job="lea-gateway"}[5m]))
+            /
+            sum by (instance) (rate(lea_gateway_http_requests_total{job="lea-gateway"}[5m]))
+          ) > 0.5
+        for: 5m
+        labels:
+          severity: critical
+          service: lea-gateway
+        annotations:
+          summary: "lea-gateway 过半请求被鉴权拒绝"
+          description: |
+            拒绝比例: {{ $value | humanizePercentage }}
+            按 reason 分组看 lea_gateway_auth_rejections_total：
+              invalid_token 占多数 → JWKS 拉不到、issuer 配错、或者时钟偏移；
+              missing_token 占多数 → 前端没带 Authorization，多半是前端发版问题。
+            网关日志里 gateway_auth_rejected 那行有具体原因。
+
+      # 租户归属解析失败。这是 403 的主因，而且依赖的是**外部**接口
+      # （TENANT_MEMBERSHIP_URL，默认 ai.ouchn.edu.cn），对方挂了这边全员 403。
+      # 跟鉴权失败分开告警，就是为了一眼区分"登录坏了"还是"租户服务坏了"。
+      - alert: GatewayTenantResolveFailing
+        expr: rate(lea_gateway_tenant_resolve_failures_total{job="lea-gateway"}[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: critical
+          service: lea-gateway
+        annotations:
+          summary: "lea-gateway 租户归属解析持续失败"
+          description: |
+            失败速率: {{ $value }}/s
+            依赖的是外部租户接口（TENANT_MEMBERSHIP_URL），先确认对方是否可达。
+            表现在用户侧是"选了租户还是 403"。
+
       # ========== 缓存告警 ==========
 
       - alert: CacheInvalidationRateHigh

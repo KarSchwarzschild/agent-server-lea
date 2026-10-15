@@ -22,6 +22,10 @@ rule_files:
 #      不支持自定义请求头，所以靠把 /metrics 加进 lea_authkit 的 EXEMPT_PATHS 解决
 #      （理由和 /health 同构：采集器带不了自定义头）。
 #
+# ⚠️ lea-gateway 是唯一一个**不走业务端口**的目标（9108 而不是 8080）。它对公网，
+# 所以指标单独开了一个不发布到宿主的 listener，详见那个 job 上面的说明。别"顺手
+# 统一"成业务端口。
+#
 # 上线前记得按环境核对一遍：k8s 里的目标应该换成 Service 名或者改用
 # kubernetes_sd_configs 自动发现，不要照抄这份 compose 的服务名。
 
@@ -84,17 +88,38 @@ scrape_configs:
       - target_label: service
         replacement: 'lea-tools'
 
-  # ── 下面三个服务没有配 job，因为它们压根没有指标端点（实测 2026-10-13）──────
+  # lea-gateway：公网入口，所有请求的必经之路
+  #
+  # ⚠️ 端口是 9108 而**不是**业务端口 8080，这是故意的。
+  #
+  # 网关是唯一对公网的服务（compose 里 8840:8080 发布到宿主，这台机器有公网 IP）。
+  # 在 8080 上放行 /metrics 等于把请求量、各端点错误率、全部端点名、鉴权拒绝次数
+  # 公开到互联网 —— 那些正好是侦察一个系统最想要的东西。所以指标走第二个 listener，
+  # 9108 **不在 compose 里 publish**，只有同一个 compose 网络里的容器能访问。
+  #
+  # 也正因为走内网，不需要给 Prometheus 配凭据（scrape_configs 不支持自定义请求头，
+  # 只有 Basic/Bearer/mTLS，而网关认的是 RS256 OIDC token，Prometheus 签不出来）。
+  #
+  # 独有的两个指标（其他服务没有、也只有网关能看到）：
+  #   lea_gateway_auth_rejections_total{reason}      鉴权拒绝，reason 只有
+  #                                                  missing_token / invalid_token
+  #   lea_gateway_tenant_resolve_failures_total      租户归属解析失败（403 主因）
+  - job_name: 'lea-gateway'
+    static_configs:
+      - targets: ['gateway:9108']
+    metrics_path: '/metrics'
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+      - target_label: service
+        replacement: 'lea-gateway'
+
+  # ── 下面两个服务没有配 job，因为它们压根没有指标端点（实测 2026-10-13）──────
   #
   # 不配**永远 down 的目标**是有意的：那种目标会训练人忽略告警面板，比没有更糟。
   # 等补上埋点之后再把 job 加回来。
-  #
-  #   lea-gateway     没有 /metrics。main.go 里没有 promhttp，访问那个路径得到的
-  #                   401 是鉴权中间件挡在未注册路由上，不是鉴权问题。
-  #                   **这个缺口最该先补** —— 网关是所有请求的必经之路，也是唯一
-  #                   对公网的服务。它没有指标，等于"整体 QPS / 错误率 / 延迟"这
-  #                   三个最基本的问题都答不了。补法：引 promhttp，在鉴权中间件
-  #                   之前注册 /metrics（跟 /health 一样放行）。
   #
   #   lea-agent-worker 不监听任何 HTTP 端口（cmd/worker/main.go 里没有 http.Server）。
   #                   它的主职是从 Temporal Task Queue 取活。于是**排队执行的那条

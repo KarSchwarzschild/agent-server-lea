@@ -21,6 +21,9 @@
 ssh 端口转发。这是有意的：minio 用的是 `.env` 里那套口令，暴露出去等于把对象
 存储和向量库送人。
 
+网关的指标端口（容器内 `9108`）**完全不发布到宿主**，连 `127.0.0.1` 都不绑 ——
+只有同一个 compose 网络里的容器能访问。理由见下面监控那节。
+
 ## 服务和镜像的对应关系
 
 **14 个容器，但只有 7 个镜像由本仓库构建。**最容易踩的坑是两对服务共用镜像 ——
@@ -231,15 +234,33 @@ docker tag  docker.1ms.run/prom/prometheus:v3.1.0 prom/prometheus:v3.1.0
 
 ### 当前采集到什么
 
-5 个目标全 up：`lea-agent`、`lea-config`、`lea-rag`、`lea-tools`、`prometheus`
-自身。15 条告警规则加载正常。
+6 个目标：`lea-agent`、`lea-config`、`lea-rag`、`lea-tools`、`lea-gateway`、
+`prometheus` 自身。18 条告警规则。
 
-**三个服务没有指标端点**，所以没配 job（配了只会得到永远 down 的目标，而永远 down
-的目标会训练人忽略面板）：
+#### ⚠️ lea-gateway 的指标在 9108，不是业务端口
+
+网关是唯一对公网的服务（宿主 8840 → 容器 8080，而这台机器有公网 IP）。在业务端口
+上放行 `/metrics` 等于把全部端点名、各端点请求量、鉴权拒绝次数公开到互联网 ——
+那些正好是侦察一个系统最想要的东西。
+
+所以它的指标走第二个 listener：容器内 `9108`，**不发布到宿主**，Prometheus 在同一
+个 compose 网络里访问 `gateway:9108`。要在宿主上看就用 ssh 端口转发，不要往
+compose 的 `ports:` 里加这一行。
+
+在业务端口上打 `/metrics` 会得到 401（被鉴权中间件挡掉），这是预期行为。
+
+网关独有的两个指标，别的服务看不到：
+
+| 指标 | 用途 |
+|---|---|
+| `lea_gateway_auth_rejections_total{reason}` | 鉴权拒绝。`reason` 只有 `missing_token` / `invalid_token` 两种取值。比例飙到过半 = JWKS 拉不到 / issuer 配错 / 时钟偏移，不是个别用户 token 过期 |
+| `lea_gateway_tenant_resolve_failures_total` | 租户归属解析失败，403 的主因。依赖**外部**接口（`TENANT_MEMBERSHIP_URL`），对方挂了这边全员 403 |
+
+**两个服务还没有指标端点**，所以没配 job（配了只会得到永远 down 的目标，而永远
+down 的目标会训练人忽略面板）：
 
 | 服务 | 情况 | 影响 |
 |---|---|---|
-| `lea-gateway` | 没有 `/metrics`（main.go 里没引 promhttp） | **最该先补**。网关是所有请求的必经之路和唯一对公网的服务，没有指标等于整体 QPS / 错误率 / 延迟三个最基本的问题都答不了 |
 | `lea-agent-worker` | 不监听任何 HTTP 端口 | 排队执行那条链路完全没有可观测性 —— 长任务卡住、重试风暴、Task Queue 堆积都看不见 |
 | `lea-parser` | `/metrics` 返 404 | 解析服务无指标 |
 

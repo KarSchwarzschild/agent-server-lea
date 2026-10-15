@@ -65,9 +65,17 @@ func main() {
 		parser: parser,
 	}
 
+	// 指标在独立端口，不挂在这张业务路由表上 —— 网关是公网入口，原因见
+	// metrics.go 顶部那段。
+	startMetricsServer()
+
+	// mux 要单独拿出来：observe 需要它查「这个请求匹配到哪条 pattern」，用来当
+	// endpoint 标签（直接用 URL.Path 会把 Prometheus 打爆，见 metrics.go）。
+	mux := g.routes()
 	server := &http.Server{
-		Addr:              ":" + env("LEA_GATEWAY_PORT", "8080"),
-		Handler:           g.cors(g.auth(g.routes())),
+		Addr: ":" + env("LEA_GATEWAY_PORT", "8080"),
+		// observe 在 auth 外面，所以 401/403 也会被统计到。
+		Handler:           g.cors(g.observe(mux, g.auth(mux))),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	log.Printf("lea-gateway listening on %s", server.Addr)
@@ -205,11 +213,15 @@ func (g *gateway) auth(next http.Handler) http.Handler {
 		}
 		token := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
 		if token == "" {
+			authRejectionsTotal.WithLabelValues("missing_token").Inc()
 			http.Error(w, `{"error":"missing token"}`, http.StatusUnauthorized)
 			return
 		}
 		c, err := g.parseClaims(token)
 		if err != nil {
+			// 日志里带具体原因（过期 / 签名不对 / issuer 不对），指标只记归类后的
+			// 固定值 —— jwt 库的 error 文本是无界的，当标签就是基数炸弹。
+			authRejectionsTotal.WithLabelValues("invalid_token").Inc()
 			log.Printf("gateway_auth_rejected reason=%v", err)
 			http.Error(w, `{"error":"invalid token"}`, http.StatusUnauthorized)
 			return
@@ -271,6 +283,7 @@ func (g *gateway) trustedRoute(w http.ResponseWriter, r *http.Request, proxy *ht
 	selectedTenant := strings.TrimSpace(r.Header.Get("X-Selected-Tenant-ID"))
 	role, err := g.tenantClient.resolve(r.Context(), r.Header.Get("Authorization"), c.UserID, selectedTenant)
 	if err != nil {
+		tenantResolveFailuresTotal.Inc()
 		http.Error(w, `{"error":"selected tenant is invalid"}`, http.StatusForbidden)
 		return
 	}
@@ -296,6 +309,7 @@ func (g *gateway) agentRoute(w http.ResponseWriter, r *http.Request) {
 	selectedTenant := strings.TrimSpace(r.Header.Get("X-Selected-Tenant-ID"))
 	role, err := g.tenantClient.resolve(r.Context(), r.Header.Get("Authorization"), c.UserID, selectedTenant)
 	if err != nil {
+		tenantResolveFailuresTotal.Inc()
 		http.Error(w, `{"error":"selected tenant is invalid"}`, http.StatusForbidden)
 		return
 	}

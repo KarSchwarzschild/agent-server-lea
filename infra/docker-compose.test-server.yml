@@ -105,6 +105,11 @@ services:
       dockerfile: packages/lea-gateway/Dockerfile
     image: lea-gateway:test
     container_name: lea-gateway-test
+    # ⚠️ 只发布 8080。指标在容器内的 9108，**故意不发布到宿主**：网关是唯一对
+    # 公网的服务，而 /metrics 里有全部端点名、各端点请求量和鉴权拒绝数 —— 那些
+    # 正好是侦察一个系统最想要的东西。Prometheus 在同一个 compose 网络里，直接
+    # 访问 gateway:9108 即可（见 infra/prometheus/prometheus.yml 的 lea-gateway job）。
+    # 要在宿主上看，用 ssh 端口转发，别往这里加一行。
     ports:
       - "8840:8080"
     env_file:

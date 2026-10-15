@@ -703,6 +703,450 @@
       ],
       "title": "整体 QPS 趋势",
       "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.5
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 3,
+        "w": 3,
+        "x": 15,
+        "y": 0
+      },
+      "id": 20,
+      "options": {
+        "orientation": "auto",
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true
+      },
+      "targets": [
+        {
+          "expr": "up{job=\"lea-gateway\"}",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ],
+      "title": "lea-gateway 在线",
+      "type": "gauge"
+    },
+    {
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.5
+              },
+              {
+                "color": "green",
+                "value": 1
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 3,
+        "w": 3,
+        "x": 18,
+        "y": 0
+      },
+      "id": 21,
+      "options": {
+        "orientation": "auto",
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true
+      },
+      "targets": [
+        {
+          "expr": "up{job=\"lea-agent-worker\"}",
+          "legendFormat": "",
+          "refId": "A"
+        }
+      ],
+      "title": "agent-worker 在线",
+      "type": "gauge"
+    },
+    {
+      "datasource": "Prometheus",
+      "description": "网关是唯一入口，这里的 QPS 是全平台对外流量。endpoint 标签取的是路由模板，未匹配的路径统一归到 unmatched（防扫描器把序列数顶爆）。",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 19
+      },
+      "id": 22,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(lea_gateway_http_requests_total[5m]))",
+          "legendFormat": "总 QPS",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(lea_gateway_http_requests_total{status=\"5xx\"}[5m])) or vector(0)",
+          "legendFormat": "5xx QPS",
+          "refId": "B"
+        }
+      ],
+      "title": "网关 QPS 与 5xx 占比",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "description": "排掉 /api/chat/stream：SSE 的 duration 是整条连接的存活时长（一次正常对话实测 12 秒），混进来 P99 会被流式带跑。",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ms"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 19
+      },
+      "id": 23,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(lea_gateway_http_request_duration_seconds_bucket{endpoint!~\"/api/chat/stream.*\"}[5m]))) * 1000",
+          "legendFormat": "P95",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(lea_gateway_http_request_duration_seconds_bucket{endpoint!~\"/api/chat/stream.*\"}[5m]))) * 1000",
+          "legendFormat": "P99",
+          "refId": "B"
+        }
+      ],
+      "title": "网关延迟 P95/P99（已排除 SSE）",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "description": "活排进队列到被 worker 接走的时间 —— 官方判断 worker 够不够的首选信号。它涨说明 worker 不够用或卡住了，**跟 activity 执行慢是两件事**（执行慢是 LLM 本来就慢，看旁边那张）。告警阈值 10s。",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 27
+      },
+      "id": 24,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, rate(temporal_activity_schedule_to_start_latency_bucket[10m]))",
+          "legendFormat": "{{activity_type}}",
+          "refId": "A"
+        }
+      ],
+      "title": "活排队延迟 schedule_to_start P95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "description": "已用贴着上限跑说明该加副本了。这是比 CPU 更直接的扩容依据 —— worker 的瓶颈通常是并发槽位，不是算力（活大多在等 LLM 返回）。",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 27
+      },
+      "id": 25,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(temporal_worker_task_slots_used) by (worker_type)",
+          "legendFormat": "已用 {{worker_type}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(temporal_worker_task_slots_available) by (worker_type)",
+          "legendFormat": "可用 {{worker_type}}",
+          "refId": "B"
+        }
+      ],
+      "title": "worker 任务槽位（已用 / 可用）",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "description": "在 lea-rag API 进程里后台每 15s 采样 Redis 的 LLEN 得来（含优先级子队列）。采不到时**不写 0** —— 0 的含义是队列空了，和没测到必须能区分。所以这条线断了就是 Redis 连不上，不是队列空。",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 35
+      },
+      "id": 26,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "lea_rag_celery_queue_depth",
+          "legendFormat": "{{queue}}",
+          "refId": "A"
+        }
+      ],
+      "title": "检索队列深度（Celery / Redis）",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "description": "reason 只有 missing_token / invalid_token 两个取值（有界，不会被外部输入顶爆）。突然上涨要么是前端没带 token，要么有人在扫。租户解析失败单独一条：那通常是上游 passport / 成员接口出问题。",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {},
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 35
+      },
+      "id": 27,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(lea_gateway_auth_rejections_total[5m])) by (reason)",
+          "legendFormat": "拒绝 {{reason}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(lea_gateway_tenant_resolve_failures_total[5m]))",
+          "legendFormat": "租户解析失败",
+          "refId": "B"
+        }
+      ],
+      "title": "网关鉴权拒绝与租户解析失败",
+      "type": "timeseries"
     }
   ],
   "refresh": "30s",

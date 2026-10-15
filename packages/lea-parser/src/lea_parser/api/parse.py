@@ -16,6 +16,7 @@ from lea_parser.auth import CurrentUser, get_current_user
 from lea_parser.chunking import chunk_recursive, chunk_sentence_window
 from lea_parser.config import get_parser_settings
 from lea_parser.database import get_db
+from lea_parser.metrics import record_parse, record_quota_rejection
 from lea_parser.parsers import parse_document
 from lea_parser.parsers.dispatcher import SUPPORTED_FORMATS
 from lea_parser.services.quota import (
@@ -58,6 +59,7 @@ def parse_file(
     try:
         check_rate_limit(user.tenant_id, user.user_id, db)
     except QuotaError as e:
+        record_quota_rejection("rate_limit")
         raise HTTPException(429, detail=e.message)
 
     ext = (file.filename or "").rsplit(".", 1)[-1].lower()
@@ -73,6 +75,7 @@ def parse_file(
     try:
         check_file_size(user.tenant_id, user.user_id, file_size, db)
     except QuotaError as e:
+        record_quota_rejection("file_size")
         raise HTTPException(413, detail=e.message)
 
     suffix = f".{ext}" if ext else ""
@@ -97,6 +100,9 @@ def parse_file(
         duration_ms = int((time.time() - start) * 1000)
         chunks_count = len(result.get("chunks", []))
 
+        # 跟 record_usage 用同一个 duration（含分块），两边数字对得上。
+        record_parse(ext, "success", duration_ms / 1000)
+
         record_usage(
             db, user.tenant_id, user.user_id, task_id,
             file.filename or "", ext, file_size, chunks_count, duration_ms,
@@ -116,6 +122,11 @@ def parse_file(
             "page_count": result.get("page_count", 0),
             "duration_ms": duration_ms,
         }
+    except Exception:
+        # 只记一笔失败就原样抛出 —— 不改变现有错误语义（上层靠异常类型决定
+        # 响应码），这里只是让"解析失败率"这件事在指标里有数。
+        record_parse(ext, "error", time.time() - start)
+        raise
     finally:
         os.unlink(tmp_path)
 

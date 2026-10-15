@@ -146,12 +146,28 @@ scrape_configs:
       - target_label: service
         replacement: 'lea-agent-worker'
 
-  # ── 下面这个服务没有配 job，因为它压根没有指标端点（实测 2026-10-13）────────
+  # lea-parser：文件解析 + 分块 + 配额计费
   #
-  # 不配**永远 down 的目标**是有意的：那种目标会训练人忽略告警面板，比没有更糟。
-  # 等补上埋点之后再把 job 加回来。
+  # 2026-10-13 这里记着"它压根没有指标端点，/metrics 返 404，所以不配 job"。
+  # 2026-10-15 补上了埋点（packages/lea-parser/src/lea_parser/metrics.py），
+  # 所以 job 加回来。
   #
-  #   lea-parser      /metrics 返 404（带不带内部 token 都一样）。
+  # 指标挂在**业务端口 8600** 上，跟 gateway / agent-worker 的做法不同 ——
+  # parser 在 docker-compose.test-server.yml 里没有 ports: 段，8600 只在 compose
+  # 网络内可达，不发布到宿主。而 gateway 的业务端口确实对外发布了，/metrics 公开
+  # 等于把端点清单、各端点流量、错误率、鉴权拒绝数一起交出去，所以它才单开一个
+  # 不发布的 9108。将来给 parser 加 ports: 或挂公网 Ingress，这条也要跟着挪。
+  - job_name: 'lea-parser'
+    static_configs:
+      - targets: ['parser:8600']
+    metrics_path: '/metrics'
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+      - target_label: service
+        replacement: 'lea-parser'
 
   # Prometheus 自己。自监控很便宜，而且"采集器是不是还活着"这个问题得有人答。
   - job_name: 'prometheus'

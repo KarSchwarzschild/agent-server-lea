@@ -278,6 +278,36 @@ groups:
             超时率: {{ $value }}/s
             Instance: {{ $labels.instance }}
 
+      # ========== retrieval-worker（异步文档处理）==========
+      #
+      # 这条是之前那条 CeleryTaskQueueLarge 的替代。删掉它的时候我给的理由是
+      # "Celery 已经不在调用链里"，那是**错的** —— 文档上传的三个入口
+      # （server_kb.py:546 / server_user_kb.py / server_governance.py）都在往
+      # retrieval 队列投任务。真实原因是另一个：它引用的 lea_rag_celery_queue_size
+      # 在代码里从来不存在，所以是条永不触发的哑炮，而面板上显示"队列堆积已覆盖"。
+      # 现在埋了 lea_rag_celery_queue_depth，才把告警加回来。
+      #
+      # ⚠️ 必须用 max() 不能用 sum()：这个 gauge 是在 **lea-rag API 进程**里量
+      # broker 得到的，多副本时每个副本都报同一个值，sum() 会按副本数翻倍。
+      #
+      # 为什么这条值得有：retrieval-worker 的 healthcheck 是 disable 的、进程里
+      # 没有任何埋点。它挂掉的表现是上传接口照常返回 status="processing"，然后
+      # 文档永远停在 processing、知识库里搜不到内容 —— 没有这条告警，这件事只能
+      # 靠用户来报。
+      - alert: RetrievalQueueBacklog
+        expr: max(lea_rag_celery_queue_depth{queue="retrieval"}) > 100
+        for: 15m
+        labels:
+          severity: warning
+          service: lea-rag
+        annotations:
+          summary: "文档处理队列堆积 > 100（持续 15 分钟）"
+          description: |
+            当前深度: {{ $value }}
+            要么 retrieval-worker 没在干活（容器 Running 但进程卡死也是这个表现，
+            它没有健康检查），要么上传量超过了处理能力。
+            先 docker logs lea-rag-retrieval-worker-test 看日志还在不在滚。
+
       # ========== 可观测性本身的告警 ==========
 
       - alert: PrometheusScrapeFailed

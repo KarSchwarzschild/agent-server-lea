@@ -24,6 +24,9 @@ API 总览：
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import os
 from contextlib import asynccontextmanager
 
 import structlog
@@ -31,7 +34,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from lea_authkit import install_internal_auth
 
-from lea_rag.metrics import MetricsMiddleware, metrics_endpoint
+from lea_rag.metrics import MetricsMiddleware, metrics_endpoint, sample_celery_queue_depth
 from lea_rag.server_admin_kb import router as admin_kb_router
 from lea_rag.server_admin_memory import router as admin_memory_router
 from lea_rag.server_governance import internal_router as governance_internal_router
@@ -48,15 +51,46 @@ logger = structlog.get_logger()
 async def lifespan(app: FastAPI):
     logger.info("retrieval_service_starting")
     _ensure_db_tables()
-    yield
-    logger.info("retrieval_service_shutdown")
+    queue_sampler = asyncio.create_task(_sample_queue_depth_forever())
+    try:
+        yield
+    finally:
+        queue_sampler.cancel()
+        # 等它真的收尾。不 await 的话进程退出时会留下 "Task was destroyed but it
+        # is pending" 的噪声日志，排查别的问题时很容易被误当成线索。
+        with contextlib.suppress(asyncio.CancelledError):
+            await queue_sampler
+        logger.info("retrieval_service_shutdown")
+
+
+async def _sample_queue_depth_forever():
+    """周期性把 Celery 队列深度写进 gauge。
+
+    为什么不在 /metrics 被抓取时现查：那会把 Redis 的延迟接到采集请求上，Redis 慢
+    一下 /metrics 就跟着慢甚至超时，等于用监控把监控自己弄挂。后台定时写、采集时
+    只读内存里的值，是 prometheus_client 这类库的常规用法。
+
+    间隔默认 15s，跟 prometheus.yml 的 scrape_interval 对齐 —— 采得比写得快只会
+    反复读到同一个值，没有意义。
+    """
+    interval = float(os.getenv("LEA_RAG_QUEUE_SAMPLE_INTERVAL", "15"))
+    while True:
+        try:
+            await sample_celery_queue_depth()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # 采样失败不能让这个循环死掉 —— 它一死，gauge 就永远停在最后一个值，
+            # 而那个值看起来是"正常的队列深度"，比没有数据更误导。
+            logger.warning("celery_queue_sample_failed", error=str(exc))
+        await asyncio.sleep(interval)
 
 
 def _ensure_db_tables():
     """独立部署时确保 KB 相关表存在。"""
     try:
         from lea_rag.db import Base, engine
-        from lea_rag.db.models import (  # noqa: F401  # noqa: F401
+        from lea_rag.db.models import (  # noqa: F401
             Document,
             DocumentChunk,
             DocumentSection,

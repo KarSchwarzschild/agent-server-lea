@@ -250,8 +250,18 @@ services:
     image: lea-rag:test
     container_name: lea-rag-retrieval-worker-test
     entrypoint: ["celery", "-A", "lea_rag.tasks", "worker", "--loglevel=info", "--pool=solo", "--concurrency=2", "-Q", "retrieval"]
+    # 原来是 healthcheck: disable: true —— 于是进程卡死（Temporal/Redis 连接断了
+    # 但进程没退）的表现是容器 Running、日志不滚、文档永远停在 processing，而
+    # docker ps 一片绿。celery inspect ping 是走 broker 问 worker "你还在吗"，
+    # 答得上来才算活着，比"进程存在"强。
+    #
+    # -d 限定只问本节点，--timeout 要短于 interval，否则探针自己会堆积。
     healthcheck:
-      disable: true
+      test: ["CMD-SHELL", "celery -A lea_rag.tasks inspect ping -d celery@$$HOSTNAME --timeout 5 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
     env_file:
       - ../.env
     environment:

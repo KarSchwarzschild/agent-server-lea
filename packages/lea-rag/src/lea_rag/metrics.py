@@ -3,7 +3,7 @@ import time
 from collections.abc import Callable
 
 from fastapi import Request, Response
-from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 from starlette.middleware.base import BaseHTTPMiddleware
 
 # HTTP 请求总数
@@ -77,6 +77,23 @@ vector_db_query_duration = Histogram(
     'Vector database query duration in seconds',
     ['operation'],
     buckets=[.001, .005, .01, .05, .1, .5, 1]
+)
+
+# Celery 队列深度 —— retrieval-worker 唯一的可观测性入口
+#
+# 为什么重要：文档上传（POST /{kb_id}/upload 等三处）走 celery_app.send_task 投到
+# retrieval 队列，解析→分块→向量化→入库全在 retrieval-worker 里跑。那个容器
+# healthcheck 是 disable 的、也没有任何指标，所以它挂掉的表现是：上传接口正常返回
+# status="processing"，然后文档永远停在 processing，知识库里搜不到内容 —— 而面板
+# 全绿。这个 gauge 是目前唯一能看见那件事的东西（队列只涨不消 = worker 没在干活）。
+#
+# ⚠️ 这是在 **API 进程**里量 broker，不是在 worker 里埋点。好处是 worker 死了这个数
+# 照样准（反而正是它该报警的时候）；代价是**多副本时每个副本都会报同一个值**。
+# 所以告警表达式必须用 max()，用 sum() 会按副本数翻倍。
+celery_queue_depth = Gauge(
+    'lea_rag_celery_queue_depth',
+    'Number of pending tasks in the Celery queue (measured on the Redis broker)',
+    ['queue']
 )
 
 
@@ -170,3 +187,48 @@ def record_vector_db_query(operation: str, duration: float):
     """记录向量库查询指标"""
     vector_db_queries_total.labels(operation=operation).inc()
     vector_db_query_duration.labels(operation=operation).observe(duration)
+
+
+# ── Celery 队列深度采样 ─────────────────────────────────────────────────────
+
+# Celery 的 Redis broker 把每个队列存成一个 **Redis list**，key 就是队列名，
+# 所以 LLEN retrieval 就是待处理任务数。
+#
+# 开了优先级之后一个逻辑队列会被 kombu 拆成多个 key：retrieval、
+# retrieval\x06\x163、retrieval\x06\x166、retrieval\x06\x169（默认
+# priority_steps=[0,3,6,9]，sep="\x06\x16"）。本项目**现在没开**优先级
+# （tasks.py 里没有 broker_transport_options），所以只有基础 key 有数。
+#
+# 但这里仍然把四个 key 都加起来：LLEN 打在不存在的 key 上返回 0，代价为零，
+# 而将来谁加了优先级配置，这个 gauge 不会静默少报一部分积压。
+_PRIORITY_SEP = "\x06\x16"
+_PRIORITY_STEPS = (0, 3, 6, 9)
+
+
+def _queue_keys(queue: str) -> list[str]:
+    """一个逻辑队列对应的全部 Redis key（基础 key + 各优先级分片）。"""
+    keys = [queue]
+    keys.extend(f"{queue}{_PRIORITY_SEP}{step}" for step in _PRIORITY_STEPS if step)
+    return keys
+
+
+async def sample_celery_queue_depth(queue: str = "retrieval") -> int | None:
+    """量一次队列深度并写进 gauge。Redis 不可用时返回 None 且不动 gauge。
+
+    返回 None 而不是 0 是刻意的：0 的含义是"队列空了"，拿它表示"没量到"会让
+    worker 挂掉和队列正常清空长得一模一样。
+    """
+    from lea_rag.services.cache import get_redis
+
+    client = get_redis()
+    if client is None:
+        return None
+    try:
+        total = 0
+        for key in _queue_keys(queue):
+            total += await client.llen(key)
+    except Exception:
+        # broker 读不到不该影响主链路，也不要把上一次的值留在 gauge 里假装还准。
+        return None
+    celery_queue_depth.labels(queue=queue).set(total)
+    return total

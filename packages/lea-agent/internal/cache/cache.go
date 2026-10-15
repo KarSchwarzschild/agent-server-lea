@@ -51,9 +51,9 @@ func New(client *redis.Client, config Config) *Cache {
 // GetOrLoad 缓存未命中时调用 loader 加载数据
 //
 // 防护措施：
-//  - 雪崩：TTL 加随机抖动
-//  - 击穿：分布式锁（同一个 key 只有一个 loader 在跑）
-//  - 穿透：NULL 值标记（loader 返回 nil 也缓存）
+//   - 雪崩：TTL 加随机抖动
+//   - 击穿：分布式锁（同一个 key 只有一个 loader 在跑）
+//   - 穿透：NULL 值标记（loader 返回 nil 也缓存）
 func (c *Cache) GetOrLoad(ctx context.Context, key string, loader func(context.Context) ([]byte, error)) ([]byte, error) {
 	// 降级保护：Redis 不可用时直接回源
 	if c.client == nil {

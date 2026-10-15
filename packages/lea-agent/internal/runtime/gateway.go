@@ -9,12 +9,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sony/gobreaker"
 	engine "gitlab.ouc-online.com.cn/aibase/agentloop"
 	"gitlab.ouc-online.com.cn/aibase/agentloop/tool"
 	"gitlab.ouc-online.com.cn/aibase/agentloop/tools/askuser"
 	"gitlab.ouc-online.com.cn/aibase/agentloop/tools/webfetch"
 	"gitlab.ouc-online.com.cn/aibase/agentloop/tools/websearch"
-	"github.com/sony/gobreaker"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/breaker"
 	"gitlab.ouc-online.com.cn/aibase/lea-agent/internal/metrics"
 )

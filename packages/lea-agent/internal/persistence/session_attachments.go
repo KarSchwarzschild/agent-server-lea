@@ -81,7 +81,6 @@ func Fingerprint(rows []SessionAttachment) string {
 	return strings.Join(parts, ",")
 }
 
-//
 // 表上那列是 VARCHAR 而不是 ENUM（见 migrations/017），所以库里可能出现这一版还不认识
 // 的值 —— 那是故意留的：加一种新资源不该要求先改所有读端再排序部署。读到不认识的照常
 // 传给 lea-config，由它决定丢弃，**这里不过滤**：过滤了就等于把"未知 kind"变成一个

@@ -35,8 +35,8 @@ func NewMessageCache(
 		cache:             cacheLayer,
 		db:                db,
 		client:            redisClient,
-		maxCachedMessages: 100,      // 每个会话最多缓存 100 条
-		contextSize:       10,       // 上下文用最近 10 条
+		maxCachedMessages: 100, // 每个会话最多缓存 100 条
+		contextSize:       10,  // 上下文用最近 10 条
 		contextTTL:        1 * time.Hour,
 		messagesTTL:       24 * time.Hour,
 	}
@@ -158,9 +158,9 @@ func (mc *MessageCache) GetSessionContext(
 // SaveMessageAndUpdateCache 保存消息并更新缓存
 //
 // 流程：
-//   1. 写入 MySQL（事务）
-//   2. 更新 Redis 缓存
-//   3. 发布 PubSub 事件（多副本同步）
+//  1. 写入 MySQL（事务）
+//  2. 更新 Redis 缓存
+//  3. 发布 PubSub 事件（多副本同步）
 func (mc *MessageCache) SaveMessageAndUpdateCache(
 	ctx context.Context,
 	sessionID string,
@@ -307,12 +307,12 @@ func (mc *MessageCache) InvalidateSessionCache(
 
 // GetCacheStats 获取缓存统计信息（用于监控）
 type CacheStats struct {
-	SessionID        string
-	CachedMessages   int
-	ContextMessages  int
-	LastCacheUpdate  time.Time
-	CacheHitRate     float64
-	AverageLoadTime  int64 // 单位: 毫秒
+	SessionID       string
+	CachedMessages  int
+	ContextMessages int
+	LastCacheUpdate time.Time
+	CacheHitRate    float64
+	AverageLoadTime int64 // 单位: 毫秒
 }
 
 // GetCacheStatsForSession 获取某个会话的缓存统计

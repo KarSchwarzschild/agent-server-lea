@@ -1,4 +1,5 @@
 """Prometheus 监控指标"""
+import re
 import time
 from collections.abc import Callable
 
@@ -153,6 +154,25 @@ _KNOWN_OPS = frozenset({"SELECT", "INSERT", "UPDATE", "DELETE"})
 _seen_tables: set[str] = set()
 
 
+# 表名的提取用正则而不是字面量 marker。
+#
+# 第一版写的是 `for marker in (" from ", " into ", "update ")` + str.find()，
+# 即**用空格当分隔符**。在真服务上验的时候发现所有 ORM 查询的 table 都是 other，
+# 查下去是 SQLAlchemy 生成的 SQL 在 FROM 前面放的是换行：
+#
+#     'SELECT agents.id, ..., agents.tenant_id \nFROM agents\n LIMIT :param_1'
+#
+# 于是 " from " 永远失配 —— 而 ORM 查询是这个服务的绝大多数流量。表现是指标
+# "看起来接上了"（序列在、计数在涨），但维度全是 other，拿不到任何信息。
+#
+# 我的单元测试放过了这个 bug，因为测试里的 SQL 是手写的、用空格分隔 —— 测试编码
+# 了我的假设而不是真实情况。现在测试改成用 SQLAlchemy 真正生成的语句。
+_TABLE_RE = re.compile(
+    r"\b(?:from|into|update)\s+([`\"\[]?[\w.]+[`\"\]]?)",
+    re.IGNORECASE,
+)
+
+
 def _parse_sql(sql: str) -> tuple[str, str]:
     """从 SQL 文本里取 (operation, table)，两个都收敛到有界集合。"""
     stripped = sql.lstrip()
@@ -161,20 +181,14 @@ def _parse_sql(sql: str) -> tuple[str, str]:
 
     table = "other"
     if op != "other":
-        # SELECT ... FROM x / INSERT INTO x / UPDATE x / DELETE FROM x
-        lowered = stripped.lower()
-        for marker in (" from ", " into ", "update "):
-            idx = lowered.find(marker)
-            if idx < 0:
-                continue
-            rest = stripped[idx + len(marker):].lstrip()
-            name = rest.split()[0] if rest.split() else ""
-            name = name.strip('`"\'();,').split(".")[-1]
+        m = _TABLE_RE.search(stripped)
+        if m:
+            # 去掉引号/方括号，再取最后一段（剥掉 schema 前缀 main.agents）
+            name = m.group(1).strip('`"[];,()').split(".")[-1]
             if name and name.replace("_", "").isalnum():
                 if name in _seen_tables or len(_seen_tables) < _MAX_TABLES:
                     _seen_tables.add(name)
                     table = name
-                break
     return op, table
 
 

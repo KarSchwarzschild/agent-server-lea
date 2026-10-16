@@ -147,6 +147,53 @@ def test_sql_injection_like_text_does_not_create_weird_label():
         assert table == "agents", f"{sql!r} 解析出 {table!r}"
 
 
+def test_parses_real_sqlalchemy_generated_sql(eng):
+    """用 **SQLAlchemy 真正生成的** SQL 测，不要手写。
+
+    这条是补一个真实 bug 的：第一版 _parse_sql 用 `" from "`（**空格**分隔的字面
+    量）去找表名，手写的 "SELECT * FROM agents" 能过，而 ORM 生成的是
+
+        'SELECT agents.id, ..., agents.tenant_id \\nFROM agents\\n LIMIT :param_1'
+
+    FROM 前面是**换行**。于是真服务上所有 ORM 查询的 table 都落到 other —— 指标
+    看起来接上了（序列在、计数在涨），但维度全是 other，拿不到任何信息。
+
+    原来的单元测试放过了它，因为测试里的 SQL 是我手写的：测试编码了我的假设，
+    而不是真实情况。所以这里必须让 SQLAlchemy 自己生成语句。
+    """
+    from sqlalchemy import Column, Integer, String, select
+    from sqlalchemy.orm import DeclarativeBase
+
+    class _Base(DeclarativeBase):
+        pass
+
+    class _Agent(_Base):
+        __tablename__ = "agents"
+        id = Column(Integer, primary_key=True)
+        name = Column(String(50))
+
+    sql = str(select(_Agent).limit(3).compile(eng))
+    assert "\nFROM" in sql, "SQLAlchemy 的换行格式变了，这条测试的前提要重新确认"
+
+    op, table = _parse_sql(sql)
+    assert op == "SELECT"
+    assert table == "agents", f"ORM 生成的 SQL 解析出 {table!r}（应该是 agents）"
+
+
+def test_parses_sql_with_newlines_before_keyword():
+    """换行/制表符/多空格分隔的关键字都要认 —— 不同 SQL 构造器格式不一样。"""
+    cases = [
+        ("SELECT a\nFROM agents\nWHERE id=1", "agents"),
+        ("SELECT a\n\tFROM  agents", "agents"),
+        ("INSERT\nINTO agents (name)\nVALUES ('x')", "agents"),
+        ("UPDATE\n  agents\nSET name='y'", "agents"),
+        ("DELETE\nFROM agents\nWHERE id=1", "agents"),
+    ]
+    for sql, want in cases:
+        _op, table = _parse_sql(sql)
+        assert table == want, f"{sql!r} 解析出 {table!r}"
+
+
 # ── 出错时计时栈不泄漏 ──────────────────────────────────────────────────────
 
 def test_failed_query_does_not_leak_timing_stack(eng):

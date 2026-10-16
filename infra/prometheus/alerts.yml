@@ -1,20 +1,25 @@
-# 真实覆盖：21 条规则里 15 条的指标有真实数据，6 条是哑炮（2026-10-15 实测）。
+# 真实覆盖：21 条规则，引用的指标**全部有埋点**（2026-10-15 收口）。
 #
-# 那 6 条引用的指标在 /metrics 上永远没数，原因不是名字写错，而是**埋点没接**：
-# lea-config / lea-rag / lea-tools 三个 metrics.py 里的 10 个 record_* 函数全部
-# 只有定义、零调用点。受影响的告警：
-#   CacheInvalidationRateHigh   <- record_agent_config_load
-#   DBQueryLatencyP95High       <- record_db_query
-#   KBSearchHighLatency         <- record_kb_search
-#   EmbeddingHighLatency        <- record_embedding
-#   ToolExecutionHighErrorRate  <- record_tool_execution
-#   SandboxExecutionTimeout     <- record_sandbox_execution
+# 这里原来记着"15 条有数、6 条是哑炮"。那 6 条引用的指标在 /metrics 上永远没数，
+# 原因不是名字写错，而是埋点没接 —— lea-config / lea-rag / lea-tools 三个
+# metrics.py 里的 10 个 record_* 函数全部只有定义、零调用点。现在都接上了：
+#   CacheInvalidationRateHigh   <- record_agent_config_load  → api/agents.py
+#   DBQueryLatencyP95High       <- record_db_query           → 挂在 SQLAlchemy 引擎上
+#   KBSearchHighLatency         <- record_kb_search          → server_kb.py
+#   EmbeddingHighLatency        <- record_embedding          → EmbeddingClient._post/_apost
+#   ToolExecutionHighErrorRate  <- record_tool_execution     → executor/router.py
+#   SandboxExecutionTimeout     <- record_sandbox_execution  → api/sandbox.py
 #
-# 这些规则**没有删**：要告警的事情都是真该告警的，缺的是把 record_* 接进业务
-# 代码。删了等于把需求也删了。scripts/check_alert_metrics.py 每次 CI 都会把这
-# 份名单打出来；接通之后设 LEA_STRICT_INSTRUMENTATION=1 让它转为阻塞。
+# 当时没有删这些规则是对的：要告警的事情都是真该告警的，缺的是埋点，删了等于把
+# 需求也删了。
 #
-# 别把"21 条规则"当成"21 条覆盖"。
+# scripts/check_alert_metrics.py 现在在 CI 里以 LEA_STRICT_INSTRUMENTATION=1 跑
+# （.gitlab-ci.yml 的 alert-metrics job），所以再出现死埋点会直接拦在门口。
+#
+# ⚠️ "有埋点"不等于"有数"。指标要等**对应的代码路径真的被走过**才会出现序列：
+# 比如 SandboxExecutionTimeout 要等有人真在沙箱里跑代码。所以 Prometheus 里查到
+# 0 条时先想想那条路径这段时间有没有流量，别急着当成哑炮 —— 区别在于现在它**会**
+# 在有流量时出数，而以前永远不会。
 groups:
   - name: lea-platform-critical
     interval: 30s

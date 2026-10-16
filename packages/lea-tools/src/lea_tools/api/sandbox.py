@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -105,15 +106,38 @@ class ExecRequest(BaseModel):
 
 @router.post("/{session_id}/exec")
 async def exec_code(session_id: str, req: ExecRequest):
+    from lea_tools.metrics import record_sandbox_execution
+
     mgr = get_sandbox_manager()
+    started = time.perf_counter()
     try:
         result = await mgr.execute(
             session_id, req.code, req.language, req.timeout
         )
     except SandboxLookupError:
+        # 沙箱后端不可用（SANDBOX_BACKEND 没配成真后端、envd 连不上）。
+        # 跟"代码跑错了"分开 —— 这个是基础设施问题，不是用户代码问题。
+        record_sandbox_execution(req.language, "unavailable", time.perf_counter() - started)
         raise HTTPException(503, _UNAVAILABLE)
     except KeyError:
+        # 会话不存在（过期被回收了，或者 id 写错）。也不是代码问题。
+        record_sandbox_execution(req.language, "no_session", time.perf_counter() - started)
         raise HTTPException(404, _NOT_FOUND)
+
+    # exit_code 非 0 = 用户代码跑失败。**这条路径接口返回 200** —— 执行失败是
+    # 正常的业务结果，不是 HTTP 错误。所以 5xx 那条 HTTP 指标抓不到它，
+    # 这里是唯一能看见"沙箱里的代码在大面积报错"的地方。
+    #
+    # exit_code == 2 是两个后端对"语言不支持"的统一约定（见 _cube_sandbox.py:365
+    # 和 _mock_sandbox.py:40），单独记 —— 那是调用方发错了 language，不是代码错。
+    exit_code = result.get("exit_code", 0)
+    if exit_code == 0:
+        status = "success"
+    elif exit_code == 2:
+        status = "unsupported_language"
+    else:
+        status = "error"
+    record_sandbox_execution(req.language, status, time.perf_counter() - started)
     return result
 
 
@@ -125,30 +149,48 @@ class UploadRequest(BaseModel):
 @router.post("/{session_id}/upload")
 async def upload_file(session_id: str, req: UploadRequest):
     import base64
+
+    from lea_tools.metrics import record_file_operation
+
     mgr = get_sandbox_manager()
+    started = time.perf_counter()
     try:
         await mgr.upload_file(
             session_id, req.path, base64.b64decode(req.data_base64)
         )
     except SandboxLookupError:
+        record_file_operation("upload", "unavailable", time.perf_counter() - started)
         raise HTTPException(503, _UNAVAILABLE)
     except KeyError:
+        record_file_operation("upload", "no_session", time.perf_counter() - started)
         raise HTTPException(404, _NOT_FOUND)
+    record_file_operation("upload", "success", time.perf_counter() - started)
     return {"status": "ok"}
 
 
 @router.get("/{session_id}/download")
 async def download_file(session_id: str, path: str):
     import base64
+
+    from lea_tools.metrics import record_file_operation
+
     mgr = get_sandbox_manager()
+    started = time.perf_counter()
     try:
         data = await mgr.download_file(session_id, path)
     except SandboxLookupError:
+        record_file_operation("download", "unavailable", time.perf_counter() - started)
         raise HTTPException(503, _UNAVAILABLE)
     except KeyError:
+        record_file_operation("download", "no_session", time.perf_counter() - started)
         raise HTTPException(404, _NOT_FOUND)
     except (FileNotFoundError, ValueError):
+        # 文件不存在跟会话不存在分开：前者是调用方要的路径不对（很常见，模型猜
+        # 文件名），后者说明沙箱被回收了。混在一起会让"沙箱过期"这件事被日常的
+        # 找不到文件淹掉。
+        record_file_operation("download", "not_found", time.perf_counter() - started)
         raise HTTPException(404, f"file not found: {path}")
+    record_file_operation("download", "success", time.perf_counter() - started)
     return {"path": path, "data_base64": base64.b64encode(data).decode()}
 
 

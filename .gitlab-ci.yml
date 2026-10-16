@@ -81,9 +81,17 @@ ruff:
 #
 # 不装 go 也能跑（拿不到 GOMODCACHE 就跳过 temporal_* 那部分，只核 lea_*），
 # 所以放在 lint 阶段用 uv 镜像，不依赖 go-test。
+#
+# LEA_STRICT_INSTRUMENTATION=1 从 2026-10-15 起打开：三个服务的 10 个 record_*
+# 全部接进业务代码之后，"埋点没接"这件事可以转为阻塞了。
+#
+# 之前它默认只报告不拦，是因为接 10 个埋点是一整块活，不该让这个检查把流水线卡
+# 在一个存量问题上。现在存量清零，再出现死埋点就是新引入的 —— 那种就该拦在门口。
 alert-metrics:
   stage: lint
   image: ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+  variables:
+    LEA_STRICT_INSTRUMENTATION: "1"
   script:
     - uv run --with pyyaml python scripts/check_alert_metrics.py
   rules:

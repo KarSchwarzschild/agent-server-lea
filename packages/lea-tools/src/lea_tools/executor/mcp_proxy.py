@@ -33,6 +33,7 @@
 
 from __future__ import annotations
 
+import time
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -338,29 +339,47 @@ async def mcp_call(call: ToolCall, credential: dict | None) -> ToolResult:
         marker = call.endpoint
         # 在 session 关掉之前算出来 —— 之后 server 就是个游离对象了。
         remote_name = remote_tool_name(call.tool_name, server.id)
+        # 指标标签也要在这里取。db.close() 之后 server 是游离对象，读 .name 会
+        # 触发 DetachedInstanceError（如果那列还没加载过）。
+        # server.name 是管理员注册的，取值有界。
+        server_label = server.name or f"id-{server.id}"
     finally:
         db.close()
 
+    from lea_tools.metrics import record_mcp_call
+
+    rpc_started = time.perf_counter()
     try:
         # resources 分支：这两个"工具"是我们合成的，远端没有同名 tool，不能走 call_tool
         # （见 admin_mcp._sync_resource_tools）。改调 MCP 的 resources/* 方法。
         if marker == MCP_RESOURCE_LIST:
             resources = await session.list_resources()
+            record_mcp_call(server_label, "success", time.perf_counter() - rpc_started)
             return ToolResult(output={"content": _render_resource_catalog(resources)})
         if marker == MCP_RESOURCE_READ:
             uri = (call.params or {}).get("uri")
             if not uri:
+                # 参数缺失是调用方的问题，不是远端的 —— 单独一个状态，否则会把
+                # "MCP 服务不可用"的错误率推高，而远端其实好得很。
+                record_mcp_call(server_label, "bad_request", time.perf_counter() - rpc_started)
                 return ToolResult(status="error", error="read_resource 需要 uri 参数")
             contents = await session.read_resource(uri)
+            record_mcp_call(server_label, "success", time.perf_counter() - rpc_started)
             return ToolResult(output={"content": _render_resource_contents(contents)})
         # 发**远端认识的**名字，不是我们加了前缀的那个。见 remote_tool_name。
         result = await session.call_tool(remote_name, call.params)
+        record_mcp_call(server_label, "success", time.perf_counter() - rpc_started)
         return ToolResult(output=result.get("content", result))
     except MCPError as e:
+        record_mcp_call(server_label, "error", time.perf_counter() - rpc_started)
         return ToolResult(status="error", error=str(e))
     except httpx.ConnectError as e:
+        # 连不上和"连上了但返回错误码"分开：前者是服务挂了/网络不通，后者是远端
+        # 活着但这次调用失败。排查方向完全不同。
+        record_mcp_call(server_label, "unreachable", time.perf_counter() - rpc_started)
         return ToolResult(status="error", error=f"MCP server unreachable: {e}")
     except httpx.HTTPStatusError as e:
+        record_mcp_call(server_label, "http_error", time.perf_counter() - rpc_started)
         return ToolResult(
             status="error",
             error=f"MCP server returned {e.response.status_code}: {e.response.text[:200]}",

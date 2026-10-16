@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -52,17 +53,46 @@ def _get_http_pool() -> httpx.AsyncClient:
 
 
 async def execute(call: ToolCall, credential: dict | None) -> ToolResult:
-    match call.execution_type:
-        case "api":
-            return await _execute_http_adapter(call, credential)
-        case "internal":
-            return await _execute_internal(call, credential)
-        case "sandbox":
-            return await _execute_sandbox(call, credential)
-        case "mcp":
-            return await _execute_mcp(call, credential)
-        case _:
-            return ToolResult(status="error", error=f"unknown type: {call.execution_type}")
+    """四种执行类型的分发口 —— 也是工具执行指标的埋点位置。
+
+    埋在这里而不是 api/execute.py 的路由里：这是唯一的分发口，所有执行类型都从
+    这里过，而路由只是其中一个调用方。
+
+    ⚠️ **必须读 result.status，不能只靠 try/except**。下面四个 _execute_* 函数
+    失败时返回的是 ToolResult(status="error", ...)，**不抛异常** —— 只包
+    try/except 的话所有失败都会被记成 success，指标全绿而工具链其实在报错。
+    ToolExecutionHighErrorRate 那条告警就永远不会响。
+    """
+    from lea_tools.metrics import record_tool_execution
+
+    started = time.perf_counter()
+    try:
+        match call.execution_type:
+            case "api":
+                result = await _execute_http_adapter(call, credential)
+            case "internal":
+                result = await _execute_internal(call, credential)
+            case "sandbox":
+                result = await _execute_sandbox(call, credential)
+            case "mcp":
+                result = await _execute_mcp(call, credential)
+            case _:
+                result = ToolResult(
+                    status="error", error=f"unknown type: {call.execution_type}"
+                )
+    except Exception:
+        # 处理函数自己兜不住的异常（比如适配器里的编程错误）。这条路上不返回
+        # ToolResult，所以上面那句 result.status 读不到，得单独记一笔。
+        record_tool_execution(call.tool_name, "error", time.perf_counter() - started)
+        raise
+
+    # status 的取值由 ToolResult 决定（success / error，超时也归 error）。
+    # tool_name 取 call.tool_name —— 那是库里的裸名（管理员注册的），有界；
+    # **不是** req.tool_name（模型发来的暴露名，带 my__ 前缀的用户私有工具）。
+    record_tool_execution(
+        call.tool_name, result.status or "success", time.perf_counter() - started
+    )
+    return result
 
 
 INTERNAL_ROUTES: dict[str, str] = {

@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import time
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -242,8 +243,10 @@ async def list_agents(
     db: Session = Depends(get_db),
     actor: Actor = Depends(require_actor),
 ):
+    from lea_config.metrics import record_agent_config_load
     from lea_config.services.cache import get_agent_list_cache, set_agent_list_cache
 
+    started = time.perf_counter()
     is_adm = _is_admin(actor)
 
     # 只缓存普通用户的简单查询（scope=all, 无过滤条件）
@@ -253,6 +256,13 @@ async def list_agents(
     if use_cache:
         cached = await get_agent_list_cache(actor.tenant_id, f"{actor.user_id}:{cache_key_params}")
         if cached is not None:
+            # cache_hit / cache_miss 只在 use_cache 为真时记。
+            #
+            # 为什么不给 use_cache=False 的请求也记一笔：那些请求（管理员、带搜索
+            # 或分页条件的）**压根没查缓存**，把它们算成 miss 会把
+            # CacheInvalidationRateHigh 的分母和分子一起污染 —— 管理员多点几次
+            # 列表页就能把失效率顶过 10%，而 Redis 其实好得很。
+            record_agent_config_load("cache_hit", time.perf_counter() - started)
             return cached
 
     # 可见性用 agent 自己的 visible_to（本租户 + 全局平台层 default），不用 authkit 的
@@ -297,6 +307,8 @@ async def list_agents(
     # 缓存普通用户的简单查询结果
     if use_cache:
         await set_agent_list_cache(actor.tenant_id, f"{actor.user_id}:{cache_key_params}", result)
+        # 走到这里说明上面查缓存没命中（命中的那条路径已经 return 了）。
+        record_agent_config_load("cache_miss", time.perf_counter() - started)
 
     return result
 

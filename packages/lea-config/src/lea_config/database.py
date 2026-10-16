@@ -11,6 +11,8 @@ from pydantic_settings import BaseSettings
 from sqlalchemy import Column, String, create_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
+from lea_config.metrics import install_db_metrics
+
 load_dotenv(Path(__file__).parent.parent.parent.parent.parent / ".env")
 
 DEFAULT_TENANT_ID = "default"
@@ -98,6 +100,11 @@ def get_settings() -> DatabaseSettings:
 _settings = get_settings()
 engine = create_engine(_settings.url, pool_pre_ping=True, pool_recycle=3600)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+
+# DB 查询指标。挂在引擎上，所有走这个 engine 的 SQL 自动计时 —— 包括将来新加的。
+# 手动在每个查询点调 record_db_query 的话，漏一处不会报错，就是一个静默的覆盖
+# 缺口（lea_config_db_query_duration_seconds 这个指标此前就是这么空了半年的）。
+install_db_metrics(engine)
 
 
 def get_db():

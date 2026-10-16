@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import structlog
@@ -70,9 +71,11 @@ async def search_kb(body: KBSearchRequest):
 
     metadata_filter: 按 KB/Document 的 metadata JSON 字段过滤。
     """
+    from lea_rag.metrics import record_kb_search
     from lea_rag.retrieval.hybrid_v2 import HybridRetrieverV2
     from lea_rag.services.cache import get_retrieval_cache, set_retrieval_cache
 
+    search_started = time.perf_counter()
     effective_kb_ids = body.kb_ids
     effective_doc_ids = body.document_ids
 
@@ -92,6 +95,10 @@ async def search_kb(body: KBSearchRequest):
         kb_id = effective_kb_ids[0]
         cached = await get_retrieval_cache(body.query, kb_id, body.top_k, body.strategy)
         if cached is not None:
+            # 只计数、不记耗时（duration 传 None）。缓存命中是 1ms 级的，混进
+            # 直方图会把 P95 稀释 —— 命中率一高，后端真变慢了也压不过 1 秒阈值，
+            # KBSearchHighLatency 就被缓存掩盖了。
+            record_kb_search("cache_hit")
             return cached
 
     if body.metadata_filter:
@@ -132,6 +139,7 @@ async def search_kb(body: KBSearchRequest):
             errors.append(f"{model_key}: {exc}")
 
     if not all_hits and errors:
+        record_kb_search("error", time.perf_counter() - search_started)
         raise HTTPException(500, f"检索失败: {'; '.join(errors)}")
 
     all_hits.sort(key=lambda h: h.score, reverse=True)
@@ -158,6 +166,12 @@ async def search_kb(body: KBSearchRequest):
         cacheable = [r.model_dump() for r in results]
         await set_retrieval_cache(body.query, kb_id, body.top_k, body.strategy, cacheable)
 
+    # partial 和 success 互斥：errors 非空但有结果，说明部分模型组失败、函数照常
+    # 200 返回**残缺结果** —— 调用方和用户都看不出有知识库掉出了结果集。这种静默
+    # 降级单独记一个状态，否则会被算成 success，而 5xx 那条 HTTP 指标也抓不到
+    # （根本没报错）。两条路径记在同一处，避免同一次检索被计两笔。
+    record_kb_search("partial" if errors else "success",
+                     time.perf_counter() - search_started)
     return results
 
 

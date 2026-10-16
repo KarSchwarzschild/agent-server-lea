@@ -6,6 +6,7 @@ Collection schema: dense_vector (FLOAT_VECTOR 1024d) + content (VARCHAR with BM2
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import structlog
@@ -100,26 +101,50 @@ class MilvusKBIndex:
         """
         if not rows:
             return []
-        result = self._client.insert(
-            collection_name=self._collection,
-            data=rows,
-        )
+        from lea_rag.metrics import record_vector_db_query
+
+        started = time.perf_counter()
+        try:
+            result = self._client.insert(
+                collection_name=self._collection,
+                data=rows,
+            )
+        except Exception:
+            record_vector_db_query("insert_error", time.perf_counter() - started)
+            raise
+        record_vector_db_query("insert", time.perf_counter() - started)
         ids = result.get("ids", []) if isinstance(result, dict) else getattr(result, "primary_keys", [])
         logger.info("milvus_inserted", collection=self._collection, count=len(rows))
         return ids
 
     def delete_by_document(self, document_id: int) -> None:
-        self._client.delete(
-            collection_name=self._collection,
-            filter=f"document_id == {document_id}",
-        )
+        from lea_rag.metrics import record_vector_db_query
+
+        started = time.perf_counter()
+        try:
+            self._client.delete(
+                collection_name=self._collection,
+                filter=f"document_id == {document_id}",
+            )
+        except Exception:
+            record_vector_db_query("delete_by_document_error", time.perf_counter() - started)
+            raise
+        record_vector_db_query("delete_by_document", time.perf_counter() - started)
         logger.info("milvus_deleted_by_doc", document_id=document_id)
 
     def delete_by_kb(self, kb_id: int) -> None:
-        self._client.delete(
-            collection_name=self._collection,
-            filter=f"kb_id == {kb_id}",
-        )
+        from lea_rag.metrics import record_vector_db_query
+
+        started = time.perf_counter()
+        try:
+            self._client.delete(
+                collection_name=self._collection,
+                filter=f"kb_id == {kb_id}",
+            )
+        except Exception:
+            record_vector_db_query("delete_by_kb_error", time.perf_counter() - started)
+            raise
+        record_vector_db_query("delete_by_kb", time.perf_counter() - started)
         logger.info("milvus_deleted_by_kb", kb_id=kb_id)
 
     @property

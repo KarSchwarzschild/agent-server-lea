@@ -22,25 +22,43 @@ http_request_duration = Histogram(
 )
 
 # KB 检索查询总数
+#
+# **去掉了 kb_id 标签**（2026-10-15）。知识库是用户建的，数量没有上限，所以
+# kb_id 是一条无界的序列增长路径 —— 跟"路由里带主键"是同一类问题，只是慢一些
+# （建 KB 要登录，不像扫 URL 那样能被匿名刷）。
+#
+# 而且它不换来任何东西：KBSearchHighLatency 用 `sum by (le)` 把 kb_id 聚合掉了，
+# 留着只付基数成本。histogram 尤其贵 —— 每个 kb_id 要乘 8 个 bucket 加 _sum
+# /_count，1000 个 KB 就是 10000 条序列，全是为了一个会被聚合掉的维度。
+#
+# 单个 KB 检索慢要排查的话看日志（那里有 kb_id），不该靠指标的标签维度。
+# 改 schema 没有迁移代价：这个指标此前一条序列都没有（埋点从没接上）。
 kb_search_total = Counter(
     'lea_rag_kb_search_total',
     'Total number of KB search queries',
-    ['kb_id', 'status']  # status: success, error
+    ['status']  # status: success, partial, error, cache_hit
 )
 
 # KB 检索延迟
 kb_search_duration = Histogram(
     'lea_rag_kb_search_duration_seconds',
     'KB search duration in seconds',
-    ['kb_id'],
     buckets=[.01, .05, .1, .25, .5, 1, 2.5, 5]
 )
 
 # 文档解析任务总数
+#
+# status 真实取值是 success / retry / failed，不是原来注释写的
+# pending/started/success/failed —— pending 和 started 没有调用点能产出（这个
+# 埋点在 Celery task 里，进到函数体时任务已经 started 了）。
+#
+# retry 和 failed 分开的理由：max_retries=2，一次彻底失败会产生 retry、retry、
+# failed 三笔。只记一个 failed 的话看到的失败数是真实失败文档数的三倍，而
+# "重试了但最后成功了"完全看不见 —— 后者恰恰是上游不稳的早期信号。
 document_parse_total = Counter(
     'lea_rag_document_parse_total',
     'Total number of document parsing tasks',
-    ['status']  # status: pending, started, success, failed
+    ['status']  # status: success, retry, failed
 )
 
 # 文档解析延迟
@@ -65,10 +83,19 @@ embedding_duration = Histogram(
 )
 
 # 向量库查询总数
+#
+# operation 的实际取值是下面这 8 个，都是代码里写死的字面量（有界）：
+#   search_dense / search_bm25          两条检索路径，分开看才知道是哪条慢
+#   insert / delete_by_document / delete_by_kb
+#   以上每个再加一个 _error 后缀的失败态
+#
+# 为什么失败也要记：两条 search 路径都**吞掉异常返回 []**，向量库挂了的表现是
+# "什么都没搜到"而接口照常 200。这个指标是唯一能把"库挂了"和"真的没匹配内容"
+# 分开的东西。
 vector_db_queries_total = Counter(
     'lea_rag_vector_db_queries_total',
     'Total number of vector database queries',
-    ['operation']  # operation: search, insert, delete
+    ['operation']
 )
 
 # 向量库查询延迟
@@ -164,14 +191,25 @@ def metrics_endpoint() -> Response:
     )
 
 
-def record_kb_search(kb_id: str, status: str, duration: float):
-    """记录 KB 检索指标"""
-    kb_search_total.labels(kb_id=kb_id, status=status).inc()
-    kb_search_duration.labels(kb_id=kb_id).observe(duration)
+def record_kb_search(status: str, duration: float | None = None):
+    """记录 KB 检索指标。调用点：server_kb.py 的 search_kb。
+
+    签名去掉了 kb_id —— 理由见 kb_search_total 的注释（无界标签，而且会被告警
+    聚合掉）。一次检索可以同时查多个 kb_ids，原来那个签名本身就有歧义：传哪个？
+
+    duration 是可选的，专为**缓存命中**留的：命中时传 None，只计数不记耗时。
+    理由是 KBSearchHighLatency 要答的问题是"检索后端是不是变慢了"，而缓存命中
+    是 1ms 级的。混进直方图的话，命中率一高 P95 就被稀释 —— 后端真慢了也压不过
+    1 秒的阈值，告警被缓存掩盖掉。
+    计数仍然要记（status="cache_hit"），否则总量少掉一大块，没法算命中率。
+    """
+    kb_search_total.labels(status=status).inc()
+    if duration is not None:
+        kb_search_duration.observe(duration)
 
 
-def record_document_parse(status: str, duration: float = None):
-    """记录文档解析指标"""
+def record_document_parse(status: str, duration: float | None = None):
+    """记录文档解析指标。调用点：tasks.py 的 process_document。"""
     document_parse_total.labels(status=status).inc()
     if duration is not None:
         document_parse_duration.observe(duration)

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -167,11 +168,20 @@ class HybridRetrieverV2:
         if filter_expr:
             kwargs["filter"] = filter_expr
 
+        # operation 用 search_dense / search_bm25 区分两条检索路径（下面那个 BM25
+        # 的同理）。两条路都**吞掉异常返回 []** —— 向量库挂了的表现是"什么都没
+        # 搜到"，接口照常 200。这个指标是唯一能把那件事和"真的没匹配内容"分开的
+        # 东西，所以 error 分支必须记。
+        from lea_rag.metrics import record_vector_db_query
+
+        _vq_started = time.perf_counter()
         try:
             results = client.search(**kwargs)
         except Exception as exc:
+            record_vector_db_query("search_dense_error", time.perf_counter() - _vq_started)
             logger.error("milvus_hybrid_search_failed", error=str(exc))
             return []
+        record_vector_db_query("search_dense", time.perf_counter() - _vq_started)
 
         hits: list[SearchHit] = []
         for result_list in results:
@@ -222,11 +232,16 @@ class HybridRetrieverV2:
         if filter_expr:
             kwargs["filter"] = filter_expr
 
+        from lea_rag.metrics import record_vector_db_query
+
+        _vq_started = time.perf_counter()
         try:
             results = client.search(**kwargs)
         except Exception as exc:
+            record_vector_db_query("search_bm25_error", time.perf_counter() - _vq_started)
             logger.error("bm25_search_failed", error=str(exc))
             return []
+        record_vector_db_query("search_bm25", time.perf_counter() - _vq_started)
 
         hits: list[SearchHit] = []
         for result_list in results:

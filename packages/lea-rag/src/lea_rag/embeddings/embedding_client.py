@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import base64
+import time
 from typing import Any
 
 import httpx
@@ -88,15 +89,40 @@ class EmbeddingClient:
             return data["dense"]
         raise ValueError(f"Unexpected response format: {list(data.keys())}")
 
+    # 指标埋在 _post / _apost 这两个咽喉点上，而不是在 embed_texts / embed_images /
+    # aembed_texts / aembed_images 四个入口各记一次：所有调用最终都收口到这里，
+    # 埋在咽喉上就不会漏，将来加新的 embed_xxx 入口也自动覆盖。
+    #
+    # 同一个 import 放在函数体里是为了避开循环导入 —— metrics 不依赖 embeddings，
+    # 但 lea_rag.metrics 在模块级会建一堆 Collector，而这个模块可能被 Celery
+    # worker 以不同顺序加载。放函数里最稳，且只付一次字典查找的代价。
     def _post(self, inputs: list[Any]) -> list[list[float]]:
-        resp = self.client.post(self._url, json=self._build_payload(inputs))
-        resp.raise_for_status()
-        return self._parse_response(resp.json())
+        from lea_rag.metrics import record_embedding
+
+        started = time.perf_counter()
+        try:
+            resp = self.client.post(self._url, json=self._build_payload(inputs))
+            resp.raise_for_status()
+            out = self._parse_response(resp.json())
+        except Exception:
+            record_embedding("error", time.perf_counter() - started)
+            raise
+        record_embedding("success", time.perf_counter() - started)
+        return out
 
     async def _apost(self, inputs: list[Any]) -> list[list[float]]:
-        resp = await self.aclient.post(self._url, json=self._build_payload(inputs))
-        resp.raise_for_status()
-        return self._parse_response(resp.json())
+        from lea_rag.metrics import record_embedding
+
+        started = time.perf_counter()
+        try:
+            resp = await self.aclient.post(self._url, json=self._build_payload(inputs))
+            resp.raise_for_status()
+            out = self._parse_response(resp.json())
+        except Exception:
+            record_embedding("error", time.perf_counter() - started)
+            raise
+        record_embedding("success", time.perf_counter() - started)
+        return out
 
     def embed_texts(self, texts: list[str]) -> list[list[float]]:
         if not texts:

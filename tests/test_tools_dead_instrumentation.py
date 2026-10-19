@@ -28,8 +28,6 @@ sys.path.insert(
 
 pytest.importorskip("prometheus_client", reason="需要 prometheus-client")
 
-from prometheus_client import generate_latest  # noqa: E402
-
 from lea_tools.metrics import (  # noqa: E402
     _endpoint_label,
     normalize_language,
@@ -38,6 +36,7 @@ from lea_tools.metrics import (  # noqa: E402
     record_sandbox_execution,
     record_tool_execution,
 )
+from prometheus_client import generate_latest  # noqa: E402
 
 
 def _line(prefix: str) -> str | None:

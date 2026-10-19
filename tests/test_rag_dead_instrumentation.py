@@ -23,14 +23,13 @@ sys.path.insert(
 
 pytest.importorskip("prometheus_client", reason="需要 prometheus-client")
 
-from prometheus_client import generate_latest  # noqa: E402
-
 from lea_rag.metrics import (  # noqa: E402
     record_document_parse,
     record_embedding,
     record_kb_search,
     record_vector_db_query,
 )
+from prometheus_client import generate_latest  # noqa: E402
 
 
 def _line(prefix: str) -> str | None:
@@ -98,8 +97,10 @@ def test_vector_db_search_paths_are_separate():
     """dense 和 bm25 分开 —— 不然不知道是哪条路慢。"""
     record_vector_db_query("search_dense", 0.02)
     record_vector_db_query("search_bm25", 0.05)
+    record_vector_db_query("search_hybrid_rrf", 0.07)
     assert _line('lea_rag_vector_db_queries_total{operation="search_dense"}')
     assert _line('lea_rag_vector_db_queries_total{operation="search_bm25"}')
+    assert _line('lea_rag_vector_db_queries_total{operation="search_hybrid_rrf"}')
 
 
 def test_vector_db_failure_is_recorded():

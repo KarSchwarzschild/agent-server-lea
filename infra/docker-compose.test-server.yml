@@ -245,6 +245,9 @@ services:
       - ../.env
     environment:
       <<: *service-env
+      # 默认 RRF。切到 weighted 做对照时只改环境变量，Prometheus 会按
+      # search_hybrid_rrf / search_hybrid_weighted 分开记录延迟。
+      LEA_RAG_HYBRID_RANKER: ${LEA_RAG_HYBRID_RANKER:-rrf}
     depends_on:
       milvus:
         condition: service_healthy

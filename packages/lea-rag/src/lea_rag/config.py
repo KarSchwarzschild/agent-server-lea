@@ -108,6 +108,12 @@ class RAGSettings(BaseSettings):
     rerank_top_k: int = 5
     query_optimize: bool = False
     section_boost: bool = True
+    # dense cosine 和 BM25 分数不在同一量纲，默认用 RRF 只按名次融合，避免
+    # 某一路因为分值尺度更大而长期压制另一条路。weighted 仅用于 A/B 对照。
+    hybrid_ranker: str = "rrf"
+    hybrid_dense_weight: float = 0.5
+    hybrid_bm25_weight: float = 0.5
+    hybrid_rrf_k: int = 60
 
     model_config = {"env_prefix": "LEA_RAG_"}
 

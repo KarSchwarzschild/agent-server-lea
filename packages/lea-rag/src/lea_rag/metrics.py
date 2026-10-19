@@ -84,8 +84,10 @@ embedding_duration = Histogram(
 
 # 向量库查询总数
 #
-# operation 的实际取值是下面这 8 个，都是代码里写死的字面量（有界）：
-#   search_dense / search_bm25          两条检索路径，分开看才知道是哪条慢
+# operation 的实际取值是下面这些，都是代码里写死的字面量（有界）：
+#   search_dense / search_bm25          两种单路检索，分开看才知道是哪条慢
+#   search_hybrid_rrf / search_hybrid_weighted
+#                                       Milvus 原生 hybrid RPC，按 ranker 分开计时
 #   insert / delete_by_document / delete_by_kb
 #   以上每个再加一个 _error 后缀的失败态
 #

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import structlog
+from pymilvus import AnnSearchRequest, RRFRanker, WeightedRanker
 
 from lea_rag.config import RAGSettings, RerankerSettings
 from lea_rag.embeddings.embedding_client import EmbeddingClient
@@ -149,42 +150,88 @@ class HybridRetrieverV2:
         filter_expr: str,
         top_k: int,
     ) -> list[SearchHit]:
+        """用 Milvus 原生 hybrid_search 做 dense + BM25 融合。
+
+        RRF 是默认排序器：COSINE 和 BM25 的原始分数没有可比性，直接相加会
+        让权重随索引、语料和查询类型漂移。WeightedRanker 仍保留为配置项，
+        便于在同一套数据上做 A/B 对比；两者都在一次 Milvus RPC 内完成，避免
+        应用层串行发两次搜索。
+        """
         collection = self._index.collection_name
         client = self._index.client
         candidate_limit = min(top_k * 4, 50)
 
-        search_params = {"metric_type": "COSINE", "params": {"nprobe": 16}}
-        kwargs: dict[str, Any] = {
-            "collection_name": collection,
-            "data": [query_vec],
-            "anns_field": "dense_vector",
-            "search_params": search_params,
-            "limit": candidate_limit,
-            "output_fields": [
-                "content", "kb_id", "document_id", "section_id",
-                "tenant_id", "chunk_type", "source_filename", "source_url", "page",
-            ],
-        }
-        if filter_expr:
-            kwargs["filter"] = filter_expr
-
-        # operation 用 search_dense / search_bm25 区分两条检索路径（下面那个 BM25
-        # 的同理）。两条路都**吞掉异常返回 []** —— 向量库挂了的表现是"什么都没
-        # 搜到"，接口照常 200。这个指标是唯一能把那件事和"真的没匹配内容"分开的
-        # 东西，所以 error 分支必须记。
         from lea_rag.metrics import record_vector_db_query
 
+        dense_req = AnnSearchRequest(
+            data=[query_vec],
+            anns_field="dense_vector",
+            param={"metric_type": "COSINE", "params": {"nprobe": 16}},
+            limit=candidate_limit,
+            filter=filter_expr or None,
+        )
+        bm25_req = AnnSearchRequest(
+            data=[query_text],
+            anns_field="sparse_vector",
+            param={"metric_type": "BM25"},
+            limit=candidate_limit,
+            filter=filter_expr or None,
+        )
+        ranker_name = self._hybrid_ranker_name()
+        if ranker_name == "weighted":
+            ranker = WeightedRanker(
+                self._settings.hybrid_dense_weight,
+                self._settings.hybrid_bm25_weight,
+                norm_score=True,
+            )
+        else:
+            ranker = RRFRanker(k=self._settings.hybrid_rrf_k)
+
+        output_fields = [
+            "content", "kb_id", "document_id", "section_id",
+            "tenant_id", "chunk_type", "source_filename", "source_url", "page",
+        ]
         _vq_started = time.perf_counter()
         try:
-            results = client.search(**kwargs)
+            results = client.hybrid_search(
+                collection_name=collection,
+                reqs=[dense_req, bm25_req],
+                ranker=ranker,
+                limit=candidate_limit,
+                output_fields=output_fields,
+            )
         except Exception as exc:
-            record_vector_db_query("search_dense_error", time.perf_counter() - _vq_started)
+            record_vector_db_query(
+                f"search_hybrid_{ranker_name}_error", time.perf_counter() - _vq_started
+            )
             logger.error("milvus_hybrid_search_failed", error=str(exc))
             return []
-        record_vector_db_query("search_dense", time.perf_counter() - _vq_started)
+        record_vector_db_query(
+            f"search_hybrid_{ranker_name}", time.perf_counter() - _vq_started
+        )
 
+        hits = self._parse_hits(results)
+
+        logger.info(
+            "hybrid_search_done",
+            query=query_text[:60],
+            ranker=ranker_name,
+            hits=len(hits),
+        )
+        return hits
+
+    def _hybrid_ranker_name(self) -> str:
+        """返回受限的排序器名称；未知配置安全回退到 RRF。"""
+        name = str(getattr(self._settings, "hybrid_ranker", "rrf")).strip().lower()
+        if name not in {"rrf", "weighted"}:
+            logger.warning("unknown_hybrid_ranker", ranker=name, fallback="rrf")
+            return "rrf"
+        return name
+
+    @staticmethod
+    def _parse_hits(results: Any) -> list[SearchHit]:
         hits: list[SearchHit] = []
-        for result_list in results:
+        for result_list in results or []:
             for hit in result_list:
                 entity = hit.get("entity", {}) if isinstance(hit, dict) else hit.entity
                 distance = hit.get("distance", 0.0) if isinstance(hit, dict) else hit.distance
@@ -200,15 +247,40 @@ class HybridRetrieverV2:
                     source_url=entity.get("source_url", ""),
                     page=entity.get("page", 0),
                 ))
-
-        logger.info("hybrid_search_done", query=query_text[:60], hits=len(hits))
         return hits
 
     def _dense_search(
         self, query_vec: list[float], filter_expr: str, top_k: int
     ) -> list[SearchHit]:
         """仅语义向量检索。"""
-        return self._hybrid_search("", query_vec, filter_expr, top_k)
+        collection = self._index.collection_name
+        client = self._index.client
+        candidate_limit = min(top_k * 4, 50)
+        kwargs: dict[str, Any] = {
+            "collection_name": collection,
+            "data": [query_vec],
+            "anns_field": "dense_vector",
+            "search_params": {"metric_type": "COSINE", "params": {"nprobe": 16}},
+            "limit": candidate_limit,
+            "output_fields": [
+                "content", "kb_id", "document_id", "section_id",
+                "tenant_id", "chunk_type", "source_filename", "source_url", "page",
+            ],
+        }
+        if filter_expr:
+            kwargs["filter"] = filter_expr
+
+        from lea_rag.metrics import record_vector_db_query
+
+        _vq_started = time.perf_counter()
+        try:
+            results = client.search(**kwargs)
+        except Exception as exc:
+            record_vector_db_query("search_dense_error", time.perf_counter() - _vq_started)
+            logger.error("milvus_dense_search_failed", error=str(exc))
+            return []
+        record_vector_db_query("search_dense", time.perf_counter() - _vq_started)
+        return self._parse_hits(results)
 
     def _keyword_search(
         self, query_text: str, filter_expr: str, top_k: int
@@ -243,23 +315,7 @@ class HybridRetrieverV2:
             return []
         record_vector_db_query("search_bm25", time.perf_counter() - _vq_started)
 
-        hits: list[SearchHit] = []
-        for result_list in results:
-            for hit in result_list:
-                entity = hit.get("entity", {}) if isinstance(hit, dict) else hit.entity
-                distance = hit.get("distance", 0.0) if isinstance(hit, dict) else hit.distance
-                hits.append(SearchHit(
-                    content=entity.get("content", ""),
-                    score=float(distance),
-                    kb_id=entity.get("kb_id", 0),
-                    document_id=entity.get("document_id", 0),
-                    section_id=entity.get("section_id", 0),
-                    tenant_id=entity.get("tenant_id", ""),
-                    chunk_type=entity.get("chunk_type", "text"),
-                    source_filename=entity.get("source_filename", ""),
-                    source_url=entity.get("source_url", ""),
-                    page=entity.get("page", 0),
-                ))
+        hits = self._parse_hits(results)
 
         logger.info("keyword_search_done", query=query_text[:60], hits=len(hits))
         return hits
@@ -293,9 +349,12 @@ class HybridRetrieverV2:
                         matched_ids.add(sec.id)
 
                 if matched_ids:
+                    # RRF 分数通常只有 0.03 左右，而 cosine/weighted 分数接近 1。
+                    # 按当前候选尺度加成，避免固定 0.1 让标题命中压过融合排序。
+                    boost_delta = max((h.score for h in hits), default=0.0) * 0.1
                     for h in hits:
                         if h.section_id in matched_ids:
-                            h.score += 0.1
+                            h.score += boost_delta
                     hits.sort(key=lambda x: x.score, reverse=True)
             finally:
                 db.close()

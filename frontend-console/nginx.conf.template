@@ -4,8 +4,15 @@ server {
     root /usr/share/nginx/html;
     index index.html;
 
+    # 同 frontend-lab/nginx.conf：proxy_pass 写字面主机名时 nginx 只在启动时解析
+    # 一次 DNS，gateway 重建换 IP 后这里攥着旧地址，全部 API 502 而静态页 200。
+    # 写成变量 + resolver 强制每次请求重新解析；用变量后必须显式带 $request_uri
+    # （原来是 ${LEA_GATEWAY_URL}/api/，location 前缀和替换串相同，等价于原样转发）。
+    resolver 127.0.0.11 valid=10s ipv6=off;
+    set $gateway_upstream "${LEA_GATEWAY_URL}";
+
     location /api/ {
-        proxy_pass ${LEA_GATEWAY_URL}/api/;
+        proxy_pass $gateway_upstream$request_uri;
         proxy_http_version 1.1;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;

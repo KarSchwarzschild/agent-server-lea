@@ -169,9 +169,8 @@ async def main() -> int:
         # 这是在验证"验证本身"。一个永远绿的检查和没有检查是一回事，所以把
         # BM25 那一路摘掉，直接问 Milvus 同一个 RRF ranker，看头名分数是否
         # 掉回单列表的 1/(k+1)。掉回去了，说明上面的 2/(k+1) 确实只能由双路产生。
-        from pymilvus import AnnSearchRequest, RRFRanker, WeightedRanker
-
         from lea_rag.server_kb import _get_embedder as _ge
+        from pymilvus import AnnSearchRequest, RRFRanker, WeightedRanker
         qvec = (await _ge("default").aembed_texts([QUERY]))[0]
         solo_ranker = (RRFRanker(k=k) if ranker == "rrf"
                        else WeightedRanker(0.5, norm_score=True))

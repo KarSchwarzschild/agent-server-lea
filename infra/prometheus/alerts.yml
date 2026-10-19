@@ -111,6 +111,180 @@ groups:
             5xx 错误率: {{ $value | humanizePercentage }}
             Instance: {{ $labels.instance }}
 
+      # lea-parser 原来没有这条 —— 另外五个服务都有，只有它漏了。
+      # lea_parser_http_requests_total 是补指标端点时（12f3987）加的，加完没回来
+      # 补告警，所以解析服务的 5xx 一直没人看。阈值和兄弟规则保持一致。
+      #
+      # ⚠️ status 标签是**分桶**的（`2xx`/`3xx`/`4xx`/`5xx`），不是三位数字 ——
+      # 四个 Python 服务的 _status_to_label() 都这么填，网关也是。所以这里写
+      # status="5xx" 而不是 status=~"5.."。
+      #
+      # 上面那四条兄弟规则用的是 `=~"5.."`，它们**能工作但属于巧合**：正则是全锚定
+      # 的，`.` 刚好把 `5xx` 里的两个 x 各匹配一个。留着不动（改动在跑的规则没收益），
+      # 但别照抄 —— 照着那个写法去写 status="500" 会得到一条永不触发的哑弹，因为
+      # 三位数字的 status 值在这个系统里从来不存在。
+      - alert: HighErrorRateParser
+        expr: |
+          (
+            sum(rate(lea_parser_http_requests_total{status="5xx"}[5m]))
+            /
+            sum(rate(lea_parser_http_requests_total[5m]))
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+          service: lea-parser
+        annotations:
+          summary: "lea-parser 5xx 错误率超过 5%"
+          description: |
+            5xx 错误率: {{ $value | humanizePercentage }}
+            解析失败会让"上传文档后搜不到内容"，但用户看到的是上传成功。
+            按格式看哪类文件在失败：
+              sum by (format) (rate(lea_parser_parse_total{status="error"}[5m]))
+
+      # ========== 静默失败告警 ==========
+      #
+      # 上面那六条看的都是 5xx。但这个系统里有一整类故障**根本不产生 5xx**：
+      #
+      #   - 向量库挂了 → _hybrid_search 吞掉异常返回 []，接口照常 200
+      #   - 部分知识库组失败 → 返回残缺结果 + 200，调用方看不出少了东西
+      #   - MCP / 沙箱失败 → 按约定返回 ToolResult(status="error") 而不是抛异常
+      #   - 文档解析失败 → 在 celery 任务里，压根不经过 HTTP
+      #
+      # 这些路径全都有埋点（record_vector_db_query 的 _error 后缀就是专门为了把
+      # "向量库挂了"和"真的没匹配内容"分开才加的），但在 2026-10-19 之前**没有
+      # 任何一条告警在用它们**。埋点有了、数据有了、没人看 —— 和之前那批死埋点
+      # 是镜像关系：那批是规则有、埋点没有，这批是埋点有、规则没有。
+      #
+      # 判定用比率而不是绝对值：这几条路径的流量都不高，单次抖动（1/100）不该告警，
+      # 但依赖真挂了的时候比率会冲到接近 1。分母为 0 时 PromQL 返回 NaN，比较结果
+      # 为假，不会误报。
+
+      - alert: VectorDBErrors
+        # operation 标签里带 _error 后缀的是失败态，分母是全部操作。
+        # 这是"Milvus 挂了"唯一会动的信号 —— 检索接口此时返回 200 + 空结果。
+        expr: |
+          (
+            sum(rate(lea_rag_vector_db_queries_total{operation=~".*_error"}[5m]))
+            /
+            sum(rate(lea_rag_vector_db_queries_total[5m]))
+          ) > 0.1
+        for: 5m
+        labels:
+          severity: critical
+          service: lea-rag
+        annotations:
+          summary: "向量库操作失败率 > 10%（检索会静默返回空结果）"
+          description: |
+            失败率: {{ $value | humanizePercentage }}
+            看是哪类操作在失败：
+              sum by (operation) (rate(lea_rag_vector_db_queries_total{operation=~".*_error"}[5m]))
+            search_* 失败 → 用户搜不到东西但界面不报错
+            insert_error → 文档入库失败，表现是"上传成功但搜不到"
+
+      - alert: KBSearchPartialResults
+        # partial 是 server_kb.py 里专门为"部分模型组失败、函数照常 200 返回
+        # 残缺结果"设的状态。这件事 5xx 抓不到（根本没报错），而用户和调用方
+        # 都看不出有知识库掉出了结果集。
+        expr: |
+          (
+            sum(rate(lea_rag_kb_search_total{status="partial"}[5m]))
+            /
+            sum(rate(lea_rag_kb_search_total[5m]))
+          ) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          service: lea-rag
+        annotations:
+          summary: "知识库检索有 > 5% 返回残缺结果（静默降级）"
+          description: |
+            比例: {{ $value | humanizePercentage }}
+            有知识库从结果集里掉出去了，但接口返回 200。
+            容器日志里 kb_search_error 那条会写明是哪个模型组失败的。
+
+      - alert: EmbeddingErrors
+        # 中转 API 不可用 / key 过期时的信号。这条路径在检索时会抛异常变成 5xx，
+        # 但在 celery 入库任务里只会让文档卡住 —— 两边都要有人看。
+        expr: |
+          (
+            sum(rate(lea_rag_embedding_total{status="error"}[5m]))
+            /
+            sum(rate(lea_rag_embedding_total[5m]))
+          ) > 0.1
+        for: 5m
+        labels:
+          severity: critical
+          service: lea-rag
+        annotations:
+          summary: "Embedding 调用失败率 > 10%（中转 API 或 key 的问题）"
+          description: |
+            失败率: {{ $value | humanizePercentage }}
+            embedding 挂了的后果分两头：检索侧抛 5xx，入库侧让文档永远卡在
+            processing。先确认中转 API 的 key 还有效。
+
+      - alert: DocumentParseFailing
+        # 在 celery 任务里（tasks.py），不经过 HTTP，所以 5xx 和 HTTP 指标都看不到。
+        # 单个坏文件（损坏的 PDF）是用户的问题不是系统的问题，所以用比率 + 长窗口，
+        # 只在"大面积失败"时才响。
+        expr: |
+          (
+            sum(rate(lea_rag_document_parse_total{status="failed"}[15m]))
+            /
+            sum(rate(lea_rag_document_parse_total[15m]))
+          ) > 0.2
+        for: 15m
+        labels:
+          severity: warning
+          service: lea-rag
+        annotations:
+          summary: "文档解析失败率 > 20%（持续 15 分钟）"
+          description: |
+            失败率: {{ $value | humanizePercentage }}
+            用户侧表现是"上传成功但搜不到内容"。
+            retry 态单独看：rate(lea_rag_document_parse_total{status="retry"}[15m])
+
+      - alert: MCPCallsFailing
+        # bad_request 不算（那是调用方参数错，不是依赖故障）。
+        # 阈值比别的高：第三方 MCP server 本身就不稳定，20% 以下属于常态。
+        expr: |
+          (
+            sum(rate(lea_tools_mcp_calls_total{status=~"error|unreachable|http_error"}[5m]))
+            /
+            sum(rate(lea_tools_mcp_calls_total[5m]))
+          ) > 0.2
+        for: 10m
+        labels:
+          severity: warning
+          service: lea-tools
+        annotations:
+          summary: "MCP 调用失败率 > 20%"
+          description: |
+            失败率: {{ $value | humanizePercentage }}
+            按 server 看是谁在失败（server_name 标签是白名单化的，不会爆基数）：
+              sum by (server_name, status) (rate(lea_tools_mcp_calls_total{status=~"error|unreachable|http_error"}[5m]))
+            unreachable 集中在一个 server 上 → 那个 server 自己的问题；
+            全面 unreachable → 大概是出网或 DNS。
+
+      - alert: SandboxUnavailable
+        # unavailable 的含义是沙箱后端压根连不上（SANDBOX_BACKEND 没配会静默
+        # fallback 到 mock，Cube 服务挂了也是这个态）。这不是"执行失败"而是
+        # "功能整体没了"，所以不用比率 —— 有就该看。
+        expr: |
+          increase(lea_tools_sandbox_executions_total{status="unavailable"}[5m]) > 0
+          or
+          increase(lea_tools_file_operations_total{status="unavailable"}[5m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+          service: lea-tools
+        annotations:
+          summary: "沙箱后端不可达（代码执行和文件读写整体不可用）"
+          description: |
+            5 分钟内有 {{ $value }} 次请求因为后端连不上被挡掉。
+            接口返回的是 200 + status=error，调用方不一定看得出来。
+            先确认 Cube 沙箱（10.192.241.137:3000）活着、SANDBOX_BACKEND 配了。
+
       # ========== 网关告警 ==========
       #
       # 网关是所有请求的必经之路，所以它的错误率是**唯一能反映"用户到底能不能用"

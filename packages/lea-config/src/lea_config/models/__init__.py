@@ -1,6 +1,6 @@
 """Models package — import all models to register with Base.metadata."""
 
-from lea_config.models.agent import Agent  # noqa: F401
+from lea_config.models.agent import Agent, AgentVersion  # noqa: F401
 from lea_config.models.binding import AgentKbBinding, AgentSkillBinding, AgentToolBinding  # noqa: F401
 from lea_config.models.knowledge import KnowledgeBase  # noqa: F401
 from lea_config.models.llm_provider import LLMProvider  # noqa: F401

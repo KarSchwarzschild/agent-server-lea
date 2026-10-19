@@ -1,6 +1,19 @@
 """Agent 模型。"""
 
-from sqlalchemy import JSON, Boolean, Column, DateTime, Integer, String, Text, UniqueConstraint, and_, func, or_
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    Column,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    and_,
+    func,
+    or_,
+)
 
 from lea_config.database import (
     DEFAULT_TENANT_ID,
@@ -45,6 +58,62 @@ class Agent(OwnerMixin, TenantMixin, Base):
     created_by = Column(String(100), nullable=True)
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+
+# 快照覆盖的字段 = AgentUpdate 允许改的那些。单独拎出来是因为三处要用同一份清单
+# （写版本、回滚、migration 037 的基线），各写一遍迟早漂移：漏一个字段的后果是
+# 它永远不进版本、回滚时被静默保留成当前值，而这件事不会报错。
+#
+# 刻意**不含** id / tenant_id / owner_* / is_system / created_* —— 那些是身份和
+# 归属，不是配置。回滚一次配置不该把 agent 换个主人。
+VERSIONED_FIELDS = (
+    "name",
+    "description",
+    "avatar",
+    "welcome_message",
+    "soul_prompt",
+    "category",
+    "example_questions",
+    "sort_order",
+    "model",
+    "temperature",
+    "max_turns",
+    "max_tokens",
+    "kb_mode",
+    "memory_mode",
+    "timeout_seconds",
+    "enabled",
+)
+
+
+def agent_snapshot(agent: "Agent") -> dict:
+    """按 VERSIONED_FIELDS 取一份配置快照。"""
+    return {f: getattr(agent, f) for f in VERSIONED_FIELDS}
+
+
+class AgentVersion(Base):
+    """不可变的 Agent 配置快照。
+
+    追加式：当前状态也在表里（revision 最大的那条）。"回滚到 N"＝读 N 的快照
+    写回 agents，并**再追加一条新 revision**，历史永不改写。
+    """
+
+    __tablename__ = "agent_versions"
+    __table_args__ = (
+        UniqueConstraint("agent_id", "revision", name="uq_agent_versions_agent_rev"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    agent_id = Column(
+        Integer, ForeignKey("agents.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    revision = Column(Integer, nullable=False)
+    snapshot = Column(JSON, nullable=False, default=dict)
+    # create / update / rollback / baseline
+    change_kind = Column(String(20), nullable=False, default="update")
+    change_note = Column(String(500), nullable=False, default="")
+    created_by = Column(String(100), nullable=True)
+    created_at = Column(DateTime, default=func.now())
 
 
 def visible_to(tenant_id: str, user_id: str | None):

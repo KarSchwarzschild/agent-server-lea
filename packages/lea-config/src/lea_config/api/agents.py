@@ -16,7 +16,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query
 from lea_authkit import Actor, require_actor
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
 from lea_config.database import (
@@ -25,7 +25,12 @@ from lea_config.database import (
     OWNER_SCOPE_USER,
     get_db,
 )
-from lea_config.models.agent import Agent
+from lea_config.models.agent import (
+    VERSIONED_FIELDS,
+    Agent,
+    AgentVersion,
+    agent_snapshot,
+)
 from lea_config.models.agent import visible_to as agent_visible_to
 from lea_config.models.binding import (
     AgentKbBinding,
@@ -361,6 +366,36 @@ def get_agent(
     return _agent_to_dict(agent, actor)
 
 
+def _append_version(
+    db: Session,
+    agent: Agent,
+    actor: Actor,
+    kind: str,
+    note: str = "",
+) -> AgentVersion:
+    """追加一条配置快照。调用方负责 commit。
+
+    revision 用"当前最大 +1"而不是计数：删过中间版本的话计数会撞 UNIQUE。
+    并发下两个请求可能算出同一个号，靠 uq_agent_versions_agent_rev 兜底报错 ——
+    这比静默覆盖好，而且 agent 编辑本身已经有乐观并发控制挡在前面了。
+    """
+    current_max = (
+        db.query(func.max(AgentVersion.revision))
+        .filter(AgentVersion.agent_id == agent.id)
+        .scalar()
+    )
+    version = AgentVersion(
+        agent_id=agent.id,
+        revision=(current_max or 0) + 1,
+        snapshot=agent_snapshot(agent),
+        change_kind=kind,
+        change_note=note[:500],
+        created_by=actor.user_id,
+    )
+    db.add(version)
+    return version
+
+
 @router.post("", status_code=201)
 async def create_agent(
     body: AgentCreate,
@@ -394,6 +429,11 @@ async def create_agent(
         **data,
     )
     db.add(agent)
+    # 先 flush 拿到 agent.id（版本行要外键引用它），再在同一个事务里追加 revision 1。
+    # 分成两次 commit 的话，中间崩了会留下一个没有基线版本的 agent —— 那之后第一次
+    # 编辑的历史里就只有"改成了什么"、没有"原来是什么"，回滚无从下手。
+    db.flush()
+    _append_version(db, agent, actor, "create")
     db.commit()
     db.refresh(agent)
 
@@ -434,6 +474,15 @@ async def update_agent(
 
     for k, v in fields.items():
         setattr(agent, k, v)
+
+    # 快照记**改完之后**的状态，且只在真的改了配置字段时记。
+    #
+    # 只改了 expected_updated_at（已经 pop 掉）或传了一组和当前值相同的字段时
+    # fields 为空/无变化 —— 那种"保存但什么都没动"不该在历史里堆一条，否则
+    # 版本列表会被无意义的条目淹掉，真正的变更反而难找。
+    changed = sorted(fields.keys())
+    if changed:
+        _append_version(db, agent, actor, "update", f"改了: {', '.join(changed)}")
     db.commit()
     db.refresh(agent)
 
@@ -461,6 +510,118 @@ async def delete_agent(
     await invalidate_agent_cache(actor.tenant_id)
 
     return {"message": "已删除"}
+
+
+# ── 配置版本 / 回滚 ────────────────────────────────────────
+#
+# agents 此前没有版本记录（skills 从 015 起就有），于是改坏了回不去。
+#
+# 读权限跟 get_agent 一致（能看到这个 agent 就能看它的历史）；回滚是写操作，
+# 走 _require_mine。
+
+
+class RollbackBody(BaseModel):
+    revision: int = Field(ge=1)
+
+
+def _version_to_dict(v: AgentVersion, *, with_snapshot: bool = False) -> dict:
+    d = {
+        "revision": v.revision,
+        "change_kind": v.change_kind,
+        "change_note": v.change_note,
+        "created_by": v.created_by,
+        "created_at": v.created_at.isoformat() if v.created_at else None,
+    }
+    # 列表里不带 snapshot：一个 agent 的 soul_prompt 可能很长，几十条版本
+    # 全带上会让列表接口返回几百 KB。要看内容走单条详情。
+    if with_snapshot:
+        d["snapshot"] = v.snapshot
+    return d
+
+
+@router.get("/{agent_id}/versions")
+def list_agent_versions(
+    agent_id: int,
+    limit: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+    actor: Actor = Depends(require_actor),
+):
+    """配置变更历史，新的在前。"""
+    _get_agent_or_404(db, agent_id, actor)
+    rows = (
+        db.query(AgentVersion)
+        .filter(AgentVersion.agent_id == agent_id)
+        .order_by(AgentVersion.revision.desc())
+        .limit(limit)
+        .all()
+    )
+    return {"items": [_version_to_dict(v) for v in rows], "total": len(rows)}
+
+
+@router.get("/{agent_id}/versions/{revision}")
+def get_agent_version(
+    agent_id: int,
+    revision: int,
+    db: Session = Depends(get_db),
+    actor: Actor = Depends(require_actor),
+):
+    """某一版的完整快照，用来回滚前先看看内容。"""
+    _get_agent_or_404(db, agent_id, actor)
+    v = (
+        db.query(AgentVersion)
+        .filter(AgentVersion.agent_id == agent_id, AgentVersion.revision == revision)
+        .first()
+    )
+    if not v:
+        raise HTTPException(404, f"revision {revision} 不存在")
+    return _version_to_dict(v, with_snapshot=True)
+
+
+@router.post("/{agent_id}/rollback")
+async def rollback_agent(
+    agent_id: int,
+    body: RollbackBody,
+    db: Session = Depends(get_db),
+    actor: Actor = Depends(require_actor),
+):
+    """回滚到指定 revision。
+
+    **追加式回滚**：读目标快照写回 agents，然后再追加一条新 revision。历史不被
+    改写，所以"回滚"这个动作本身也在历史里留痕，而且回滚之后还能再回滚回来。
+    直接把 revision 指针往回移的做法做不到后者。
+    """
+    from lea_config.services.cache import invalidate_agent_cache
+
+    agent = _get_agent_or_404(db, agent_id, actor)
+    _require_mine(agent, actor)
+
+    target = (
+        db.query(AgentVersion)
+        .filter(
+            AgentVersion.agent_id == agent_id,
+            AgentVersion.revision == body.revision,
+        )
+        .first()
+    )
+    if not target:
+        raise HTTPException(404, f"revision {body.revision} 不存在")
+
+    snap = target.snapshot or {}
+    # 只认 VERSIONED_FIELDS 里的键。快照是历史数据，万一某一版是旧代码写的、
+    # 含了后来删掉的字段，setattr 会抛 —— 更糟的是如果那个名字刚好撞上
+    # tenant_id 之类，回滚一次配置就把归属改了。
+    for field in VERSIONED_FIELDS:
+        if field in snap:
+            setattr(agent, field, snap[field])
+
+    _append_version(
+        db, agent, actor, "rollback", f"回滚自 revision {body.revision}"
+    )
+    db.commit()
+    db.refresh(agent)
+
+    await invalidate_agent_cache(actor.tenant_id)
+    return _agent_to_dict(agent, actor)
 
 
 # ── 共享 / 取消共享 ────────────────────────────────────────

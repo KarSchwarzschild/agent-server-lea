@@ -69,10 +69,19 @@ document_parse_duration = Histogram(
 )
 
 # 向量化处理总数
+#
+# status 的三个取值（都在 embedding_client.py 的 _post / _apost 里写死，有界）：
+#   success      拿到了可用的向量
+#   error        请求本身失败（非 2xx、解析不了、连不上）
+#   degenerate   **上游回了 200，但向量是废的** —— 条数不符 / 全零 / 空。
+#                中转 API key 过期时不一定回非 2xx，回 200 带零向量的话
+#                error 这一路永远不会涨，而检索会拿零向量算出一堆垃圾结果、
+#                照常 200 返回。这个状态是那件事唯一的信号。
+#                三者互斥，一次调用只记一笔，所以总量仍是干净的分母。
 embedding_total = Counter(
     'lea_rag_embedding_total',
     'Total number of embedding operations',
-    ['status']  # status: success, error
+    ['status']  # status: success, error, degenerate
 )
 
 # 向量化延迟

@@ -89,6 +89,39 @@ class EmbeddingClient:
             return data["dense"]
         raise ValueError(f"Unexpected response format: {list(data.keys())}")
 
+    @staticmethod
+    def _degenerate_reason(inputs: list[Any], vectors: list[list[float]]) -> str | None:
+        """检查"上游回了 200、但向量是废的"这种假成功。返回原因，正常时返回 None。
+
+        为什么需要这个：上游中转 API 不可用或 key 过期时，**不一定**会回非 2xx。
+        回 200 带一组空向量或全零向量，raise_for_status() 拿不到异常，
+        _parse_response 也拿不到异常 —— 于是 record_embedding("success") 照记，
+        检索照常返回 200，只是结果是按零向量算出来的垃圾。这比"搜不到"更糟：
+        搜不到至少是沉默，这个是**自信地给错答案**。
+
+        只查三件和模型无关、怎么看都是错的事：
+
+          条数不符    发了 N 条文本回来 M 条，对不上就没法 zip，后面全是错位
+          全零向量    embedding 不可能是零向量（余弦相似度对它无定义）
+          空向量      输入非空却回了零条
+
+        **刻意不查维度**：embedding_dim 是每个知识库自己的（db/models.py 默认
+        1024），而 EmbeddingSettings.dimension 是 1536，不同模型本来就不一样。
+        拿全局常量去判维度只会造出假警报。维度不对的后果 Milvus 自己会报
+        （"length of float data should divide the dim"），不需要在这里猜。
+        """
+        if not vectors:
+            return "empty_response" if inputs else None
+        if len(vectors) != len(inputs):
+            return f"count_mismatch(sent={len(inputs)},got={len(vectors)})"
+        for i, v in enumerate(vectors):
+            if not v:
+                return f"empty_vector(index={i})"
+            # any() 短路，正常向量第一个非零元素就返回，代价可忽略。
+            if not any(v):
+                return f"all_zero_vector(index={i},dim={len(v)})"
+        return None
+
     # 指标埋在 _post / _apost 这两个咽喉点上，而不是在 embed_texts / embed_images /
     # aembed_texts / aembed_images 四个入口各记一次：所有调用最终都收口到这里，
     # 埋在咽喉上就不会漏，将来加新的 embed_xxx 入口也自动覆盖。
@@ -107,7 +140,14 @@ class EmbeddingClient:
         except Exception:
             record_embedding("error", time.perf_counter() - started)
             raise
-        record_embedding("success", time.perf_counter() - started)
+        # degenerate 和 success 互斥，一次调用只记一笔 —— 否则总量会被记两次，
+        # 分母虚高，比率式告警就被稀释了（search_kb 的 partial/success 踩过）。
+        reason = self._degenerate_reason(inputs, out)
+        if reason:
+            logger.error("embedding_degenerate", reason=reason, model=self.model,
+                         url=self._url, count=len(inputs))
+        record_embedding("degenerate" if reason else "success",
+                         time.perf_counter() - started)
         return out
 
     async def _apost(self, inputs: list[Any]) -> list[list[float]]:
@@ -121,7 +161,12 @@ class EmbeddingClient:
         except Exception:
             record_embedding("error", time.perf_counter() - started)
             raise
-        record_embedding("success", time.perf_counter() - started)
+        reason = self._degenerate_reason(inputs, out)
+        if reason:
+            logger.error("embedding_degenerate", reason=reason, model=self.model,
+                         url=self._url, count=len(inputs))
+        record_embedding("degenerate" if reason else "success",
+                         time.perf_counter() - started)
         return out
 
     def embed_texts(self, texts: list[str]) -> list[list[float]]:

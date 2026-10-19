@@ -223,6 +223,38 @@ groups:
             embedding 挂了的后果分两头：检索侧抛 5xx，入库侧让文档永远卡在
             processing。先确认中转 API 的 key 还有效。
 
+      - alert: EmbeddingDegenerate
+        # 上面那条看的是"请求失败了"。这条看的是**请求成功了但向量是废的** ——
+        # 中转 API key 过期时不一定回非 2xx，回 200 带全零向量的话
+        # raise_for_status() 不抛、解析也不抛，status="error" 永远不涨。
+        #
+        # 后果比"搜不到"严重：零向量照样能算余弦相似度，于是检索返回一堆和
+        # 查询无关的结果、HTTP 200、界面上看不出任何异常 —— 自信地给错答案。
+        # 判定逻辑在 embedding_client.py 的 _degenerate_reason（条数不符/全零/空）。
+        #
+        # 阈值刻意比 EmbeddingErrors 低一个量级：废向量是"不该存在"的东西，
+        # 偶发一次就意味着有一批 chunk 被永久错向量化了（入库时写进 Milvus 就固化
+        # 了，不会自愈），所以 1% 就该看。
+        expr: |
+          (
+            sum(rate(lea_rag_embedding_total{status="degenerate"}[10m]))
+            /
+            sum(rate(lea_rag_embedding_total[10m]))
+          ) > 0.01
+        for: 5m
+        labels:
+          severity: critical
+          service: lea-rag
+        annotations:
+          summary: "Embedding 返回废向量（上游假成功，正在写入错误的向量）"
+          description: |
+            比例: {{ $value | humanizePercentage }}
+            上游回了 200 但向量不可用（全零 / 条数不符 / 空）。
+            容器日志里 embedding_degenerate 那条会写明具体原因和模型名：
+              docker logs lea-rag-test 2>&1 | grep embedding_degenerate
+            先确认中转 API 的 key 还有效。**入库侧发生过的话，那批文档需要重新
+            向量化** —— 零向量写进 Milvus 之后不会自己恢复。
+
       - alert: DocumentParseFailing
         # 在 celery 任务里（tasks.py），不经过 HTTP，所以 5xx 和 HTTP 指标都看不到。
         # 单个坏文件（损坏的 PDF）是用户的问题不是系统的问题，所以用比率 + 长窗口，

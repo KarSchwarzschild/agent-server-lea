@@ -116,3 +116,6 @@ packages/*/.go-build-cache/
 
 # pnpm 的本地 store。依赖快照在 pnpm-lock.yaml 里，store 是缓存。
 .pnpm-store/
+
+# 二期功能明细表的填充产出 —— 源文件在微信目录下，产出不入库
+二期功能明细表_完成情况.xlsx

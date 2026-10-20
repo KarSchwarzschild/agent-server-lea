@@ -114,6 +114,18 @@ class RAGSettings(BaseSettings):
     hybrid_dense_weight: float = 0.5
     hybrid_bm25_weight: float = 0.5
     hybrid_rrf_k: int = 60
+    # 图片 chunk 做 embedding 时额外带多少字周边正文。
+    #
+    # 为什么需要：图片单靠 VLM 描述检索不出来。一张柱状图的描述是"柱状图显示三个
+    # 季度的数据对比"，用户问"第三季度营收多少"匹配不上 —— 描述里没有"营收"这个
+    # 词，它在图片周围的正文里。带上同页正文之后这张图才可能被召回。
+    #
+    # 文本侧早就有这个机制（parser.py 的 window_content，前后各一个 chunk 一起
+    # embed，content 仍存窄的那份），图片侧一直没有。这里补齐，口径一致。
+    #
+    # 按字数而不是 token 数：embedding 服务那边不暴露分词器，拿字数当代理指标
+    # 够用，而且中文下字数和 token 数接近。0 表示不带上下文（退回原行为）。
+    image_context_chars: int = 500
 
     model_config = {"env_prefix": "LEA_RAG_"}
 

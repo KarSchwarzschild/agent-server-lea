@@ -13,6 +13,7 @@ from typing import Any
 import structlog
 from sqlalchemy.orm import Session
 
+from lea_rag.config import RAGSettings
 from lea_rag.db.models import Document, KnowledgeBase
 
 logger = structlog.get_logger()
@@ -48,7 +49,8 @@ class DocumentProcessor:
             self._process_audio(doc, kb, parse_result)
             chunks = self._save_chunks(doc, kb, parse_result)
             self._index_vectors(doc, kb, chunks)
-            self._index_images(doc, kb, parse_result)
+            # 把文本 chunk 传给图片索引：图片要靠同页正文补上下文（见 _image_context）
+            self._index_images(doc, kb, parse_result, chunks)
             self._update_success(doc, parse_result, len(chunks))
             self.db.commit()
             logger.info("document_processed", document_id=document_id, chunks=len(chunks))
@@ -218,8 +220,81 @@ class DocumentProcessor:
         except Exception as exc:
             logger.warning("vector_index_failed", document_id=doc.id, error=str(exc))
 
-    def _index_images(self, doc: Document, kb: KnowledgeBase, parse_result: dict) -> None:
-        """处理图片：VLM 生成描述（vlm_enabled）+ 原生图片 embed（multimodal）。"""
+    @staticmethod
+    def _compose_image_content(caption: str, page: int, context: str) -> str:
+        """拼图片 chunk 的文本。
+
+        格式刻意把"这是一张图"放在最前面：检索命中之后，调用方和模型都要能
+        一眼看出这段是图片而不是正文，否则模型会把 VLM 的描述当成文档原文引用。
+        """
+        head = caption.strip() or f"[图片 p{page}]"
+        if not context:
+            return head
+        return f"[图片 p{page}] {head}\n\n【图片所在位置的正文】\n{context}"
+
+    @staticmethod
+    def _image_page(item: dict) -> int:
+        """图片的页码，统一成 1-based。
+
+        解析器给的 page_idx 是 0-based，而文本 chunk 经 chunk_text_blocks 之后是
+        page_idx + 1（parser.py:155）。两边不统一的后果有两个，都发生过：
+
+          1. 按页码找同页正文会错位一页，拼进去的是邻页内容
+          2. source_url 里的 `#page=` 指向前一页 —— PDF 阅读器的页码是 1-based，
+             点引用跳转会跳错
+
+        所以在入口处归一，下面一律按 1-based 处理。兼容两种键名（mineru 给
+        page_idx，有的解析器给 page）。
+        """
+        if "page_idx" in item:
+            return int(item.get("page_idx") or 0) + 1
+        return int(item.get("page") or 0) or 1
+
+    def _image_context(self, chunks: list[dict], page: int, limit: int) -> str:
+        """取同页正文当图片的上下文，不够就往邻页借。
+
+        为什么要往邻页借：图片常出现在页首或页尾，相关的正文（图题、引述那段）
+        在上一页末或下一页初。只取同页会让这类图片拿到空上下文。
+
+        按 limit 截断而不是全拼：整页正文可能几千字，而图片描述只有几十字 ——
+        全拼进去等于让正文淹掉描述，这个 chunk 就变成了"又一份正文"，失去了
+        "这是一张图"的区分度。
+        """
+        if limit <= 0 or not chunks:
+            return ""
+
+        # 先同页，再按页距由近到远
+        def distance(c: dict) -> int:
+            return abs(int(c.get("metadata", {}).get("page", 0)) - page)
+
+        ordered = sorted(chunks, key=distance)
+        parts: list[str] = []
+        used = 0
+        for c in ordered:
+            if distance(c) > 1:  # 只借相邻一页
+                break
+            text = (c.get("content") or "").strip()
+            if not text:
+                continue
+            room = limit - used
+            if room <= 0:
+                break
+            parts.append(text[:room])
+            used += min(len(text), room)
+        return "\n\n".join(parts)
+
+    def _index_images(
+        self,
+        doc: Document,
+        kb: KnowledgeBase,
+        parse_result: dict,
+        chunks: list[dict] | None = None,
+    ) -> None:
+        """处理图片：VLM 生成描述（vlm_enabled）+ 原生图片 embed（multimodal）。
+
+        chunks 是同一文档的文本 chunk，用来给图片补上下文（见 _image_context）。
+        默认 None 是为了兼容旧调用方 —— 不传就退回"只用描述"的老行为。
+        """
         import base64
 
         image_items = parse_result.get("image_items", [])
@@ -228,6 +303,13 @@ class DocumentProcessor:
 
         if not getattr(kb, "vlm_enabled", False) and not getattr(kb, "multimodal", False):
             return
+
+        chunks = chunks or []
+        settings = RAGSettings()
+        ctx_limit = settings.image_context_chars
+        section_map = self._build_section_map(
+            parse_result.get("sections", []), parse_result.get("content_list", [])
+        )
 
         try:
             from lea_rag.index.milvus_index import MilvusKBIndex
@@ -240,21 +322,29 @@ class DocumentProcessor:
                 if not b64:
                     continue
                 img_bytes = base64.b64decode(b64)
-                page = item.get("page_idx", item.get("page", 0))
+                page = self._image_page(item)
                 caption = item.get("caption", "")
 
                 if getattr(kb, "vlm_enabled", False) and not caption:
                     caption = self._vlm_caption(kb, img_bytes)
 
+                # 图片继承所在页的章节，不再写死 0 —— section_boost 靠这一列加成，
+                # 写死 0 的话图片 chunk 永远拿不到章节加成，而同页的正文拿得到。
+                section_id = self._find_section_for_page(section_map, page) or 0
+                context = self._image_context(chunks, page, ctx_limit)
+
                 if getattr(kb, "multimodal", False):
                     try:
                         vec = embedder.embed_images([img_bytes])[0]
                         rows.append({
-                            "content": caption or f"[图片 p{page}]",
+                            # multimodal 路径的向量来自图片本身，上下文帮不到检索，
+                            # 所以只进 content 供展示和 BM25（BM25 的稀疏向量是
+                            # Milvus 从 content 现算的，所以带上下文仍有收益）。
+                            "content": self._compose_image_content(caption, page, context),
                             "dense_vector": vec,
                             "kb_id": kb.id,
                             "document_id": doc.id,
-                            "section_id": 0,
+                            "section_id": section_id,
                             "tenant_id": kb.tenant_id,
                             "chunk_type": "image",
                             "source_filename": doc.filename,
@@ -264,13 +354,21 @@ class DocumentProcessor:
                     except Exception as exc:
                         logger.warning("image_embed_skip", page=page, error=str(exc))
                 elif caption:
-                    vec = embedder.embed_texts([caption])[0]
+                    # caption 路径：**拿"描述 + 上下文"去 embed**，而 content 存
+                    # 同一份文本。和文本侧 window_content 的口径一致 —— 那边也是
+                    # 宽的去 embed、窄的存 content。
+                    #
+                    # 这里 content 和 embed 用同一份（都带上下文）而不是像文本侧
+                    # 那样分开：图片的"窄内容"就是那句描述，几十个字，单独展示
+                    # 没有意义；而带上下文的版本对人也更可读（知道这张图在讲什么）。
+                    enriched = self._compose_image_content(caption, page, context)
+                    vec = embedder.embed_texts([enriched])[0]
                     rows.append({
-                        "content": caption,
+                        "content": enriched,
                         "dense_vector": vec,
                         "kb_id": kb.id,
                         "document_id": doc.id,
-                        "section_id": 0,
+                        "section_id": section_id,
                         "tenant_id": kb.tenant_id,
                         "chunk_type": "image_caption",
                         "source_filename": doc.filename,

@@ -499,26 +499,110 @@ class DocumentProcessor:
                 parse_result["md_content"] = (parse_result.get("md_content", "") + "\n\n" + transcript).strip()
                 logger.info("asr_transcribed", document_id=doc.id, length=len(transcript))
 
+    @staticmethod
+    def _wav_to_pcm16k(file_path: str) -> bytes:
+        """把 WAV 转成基座 ASR 要的 16kHz / 16bit / 单声道裸 PCM。
+
+        基座的 /v1/audio/transcriptions 要 `request_format: "pcm"` 且明确规定
+        "音频位深 16，音频采样率 16000" —— 不是传原文件，是传重采样后的裸 PCM
+        的 base64。
+
+        只用标准库（wave + audioop），因为镜像里**没有 ffmpeg**。代价是只支持
+        WAV：mp3/m4a/flac/ogg 读不了，需要在 Dockerfile 里加 ffmpeg 才能支持。
+        上层按异常处理，不会静默返回空。
+
+        ⚠️ audioop 在 Python 3.13 被移除（PEP 594）。镜像现在是 3.11，所以还能用，
+        但升级到 3.13 时这个函数会在 import 处直接炸。那时候的正解是装 ffmpeg ——
+        它同时解决「只支持 WAV」这个限制，一并换掉即可。
+        """
+        import audioop
+        import wave
+
+        with wave.open(file_path, "rb") as w:
+            channels = w.getnchannels()
+            width = w.getsampwidth()
+            rate = w.getframerate()
+            frames = w.readframes(w.getnframes())
+
+        # 统一到 16bit
+        if width != 2:
+            frames = audioop.lin2lin(frames, width, 2)
+            width = 2
+        # 统一到单声道
+        if channels > 1:
+            frames = audioop.tomono(frames, width, 0.5, 0.5)
+        # 重采样到 16k
+        if rate != 16000:
+            frames, _ = audioop.ratecv(frames, width, 1, rate, 16000, None)
+        return frames
+
     def _asr_transcribe(self, model, file_path: str) -> str:
-        """调用 ASR 服务转写音频。"""
+        """调用 ASR 服务转写音频。
+
+        支持两种协议，按 model.config.protocol 选：
+
+          base_pcm（默认）  宿主基座的 /v1/audio/transcriptions ——
+                            JSON + base64 裸 PCM，参数 audio/audio_encoding/
+                            request_format/status/language
+          openai            OpenAI 兼容的 multipart 文件上传
+
+        为什么要分：两边**路径一样但请求体完全不同**。原来这里只实现了 OpenAI
+        那种 multipart，直接指向基座会被拒，而 except 会把它吞成空字符串 ——
+        表现是"上传成功但搜不到"，看不出是协议不对。
+        """
+        import base64
+
         import httpx
 
         if not file_path or not os.path.exists(file_path):
             return ""
+
+        # 字段名是 config（RetrievalModel 没有 extra 列）。写错了不会报错，
+        # 只会永远取到空字典 —— 于是协议配置读不到、静默走默认。
+        extra = model.config if isinstance(getattr(model, "config", None), dict) else {}
+        protocol = str(extra.get("protocol", "base_pcm")).strip().lower()
+        url = f"{model.api_base.rstrip('/')}/v1/audio/transcriptions"
+        headers = {}
+        if model.api_key:
+            headers["Authorization"] = f"Bearer {model.api_key}"
+        timeout = float(extra.get("timeout", 600.0))
+
         try:
-            headers = {}
-            if model.api_key:
-                headers["Authorization"] = f"Bearer {model.api_key}"
-            with open(file_path, "rb") as f:
+            if protocol == "openai":
+                with open(file_path, "rb") as f:
+                    resp = httpx.post(
+                        url, headers=headers,
+                        files={"file": (os.path.basename(file_path), f)},
+                        data={"model": model.model_name or model.name},
+                        timeout=timeout,
+                    )
+            else:
+                # 按类名调而不是 self：_wav_to_pcm16k 是 staticmethod，不需要实例，
+                # 这样这一步在单测里可以脱离实例直接验。
+                pcm = DocumentProcessor._wav_to_pcm16k(file_path)
                 resp = httpx.post(
-                    f"{model.api_base.rstrip('/')}/v1/audio/transcriptions",
-                    headers=headers,
-                    files={"file": (os.path.basename(file_path), f)},
-                    data={"model": model.model_name or model.name},
-                    timeout=120.0,
+                    url,
+                    headers={**headers, "Content-Type": "application/json"},
+                    json={
+                        "model": model.model_name or model.name,
+                        "audio": base64.b64encode(pcm).decode(),
+                        "audio_encoding": "base64",
+                        "request_format": "pcm",
+                        # 2 = 最后一帧。我们是整段一次性提交，不做流式分帧。
+                        "status": 2,
+                        "language": extra.get("language", "zh_cn"),
+                    },
+                    timeout=timeout,
                 )
             resp.raise_for_status()
             return resp.json().get("text", "")
         except Exception as exc:
-            logger.warning("asr_failed", error=str(exc))
+            # 把协议和模型名带进日志 —— 配错协议和服务真的挂了，表现都是空转写，
+            # 没有这两个字段分不开。
+            logger.warning(
+                "asr_failed",
+                protocol=protocol,
+                model=model.model_name or model.name,
+                error=str(exc)[:200],
+            )
             return ""

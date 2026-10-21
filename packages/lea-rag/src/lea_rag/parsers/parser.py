@@ -80,14 +80,46 @@ def mineru_native_exts() -> frozenset[str]:
     return _MINERU_NATIVE_EXTS if mineru_local_url() else frozenset({"pdf"})
 
 
+#: 图片：返回整图交给 VLM / multimodal，不做 OCR
+_IMAGE_EXTS = frozenset({"png", "jpg", "jpeg", "webp", "gif", "bmp"})
+
+#: 只用标准库（wave + audioop）就能转 PCM 的音频格式。
+_WAV_ONLY_AUDIO_EXTS = frozenset({"wav"})
+
+#: 需要 ffmpeg 才能转 PCM 的音视频格式。
+#:
+#: 音视频在这里是**同一条路**：kb_processor._to_pcm16k 用 ffmpeg 抽音轨，
+#: 对 mp4 和 mp3 是同一个命令（-vn 丢掉视频流）。所以 parse_audio 同时服务两者，
+#: 不需要单独的 parse_video。
+_FFMPEG_AUDIO_EXTS = frozenset({"mp3", "m4a", "flac", "ogg", "aac", "wma", "opus"})
+_FFMPEG_VIDEO_EXTS = frozenset({"mp4", "avi", "mov", "mkv", "webm", "flv", "wmv", "m4v"})
+
+
+def _has_ffmpeg() -> bool:
+    """ffmpeg 在不在。装在 lea-rag 镜像里（见 packages/lea-rag/Dockerfile）。"""
+    import shutil
+
+    return shutil.which("ffmpeg") is not None
+
+
+def media_exts() -> frozenset[str]:
+    """当前环境能转写的音视频格式。
+
+    没有 ffmpeg 时只剩 WAV —— 标准库的 wave 模块只认它。这个判断必须是运行时
+    的：镜像里有 ffmpeg，但本地开发和 CI 环境不一定有，写死会让白名单和实际
+    能力不一致（宽了是"上传成功但解析失败"）。
+    """
+    if _has_ffmpeg():
+        return _WAV_ONLY_AUDIO_EXTS | _FFMPEG_AUDIO_EXTS | _FFMPEG_VIDEO_EXTS
+    return _WAV_ONLY_AUDIO_EXTS
+
+
 #: 不依赖 MinerU 就能处理的格式。
 #: txt/md 在 kb_processor._parse 里直接读文本，不进 parse_document。
 _ALWAYS_SUPPORTED_EXTS = frozenset({
     "txt", "md",
     "docx", "pptx",                                  # python-docx / python-pptx
-    "png", "jpg", "jpeg", "webp", "gif", "bmp",      # 整图交给 VLM / multimodal
-    "mp3", "wav", "m4a", "flac", "ogg",              # ASR（要配 asr 模型）
-})
+}) | _IMAGE_EXTS
 
 
 def supported_upload_exts() -> frozenset[str]:
@@ -97,9 +129,10 @@ def supported_upload_exts() -> frozenset[str]:
     漂移的两个方向都坏 —— 白名单宽了是"上传成功但解析失败"，窄了是明明能解析
     却被 400 拒。
 
-    本地 MinerU 一配上，XLSX / EPUB / HTML / CSV / RTF / ODF 自动进白名单。
+    本地 MinerU 一配上，XLSX / EPUB / HTML / CSV / RTF / ODF 自动进白名单；
+    装了 ffmpeg，mp3/m4a/flac/ogg 和 mp4/avi/mov/mkv 等自动进白名单。
     """
-    return _ALWAYS_SUPPORTED_EXTS | mineru_native_exts()
+    return _ALWAYS_SUPPORTED_EXTS | mineru_native_exts() | media_exts()
 _MINERU_TOKEN: str | None = None
 
 
@@ -475,10 +508,11 @@ def parse_document(file_path: str, parser: str = "mineru") -> dict:
     ext = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
 
     # 图片：返回整图交给 VLM / multimodal，不做 OCR
-    if ext in ("png", "jpg", "jpeg", "webp", "gif", "bmp"):
+    if ext in _IMAGE_EXTS:
         return parse_image(file_path)
-    # 音频：MinerU 不做 ASR
-    if ext in ("mp3", "wav", "m4a", "flac", "ogg"):
+    # 音视频：MinerU 不做 ASR。两者走同一条路 —— ffmpeg 抽音轨对 mp4 和 mp3
+    # 是同一个命令，所以不需要单独的 parse_video。
+    if ext in (_WAV_ONLY_AUDIO_EXTS | _FFMPEG_AUDIO_EXTS | _FFMPEG_VIDEO_EXTS):
         return parse_audio(file_path)
 
     use_mineru = parser == "mineru" and ext in mineru_native_exts()
@@ -617,9 +651,13 @@ def parse_image(file_path: str) -> dict:
 
 
 def parse_audio(file_path: str) -> dict:
-    """音频文件解析骨架 — 需要 ASR 服务就绪后启用。
+    """音视频的解析入口 —— 只交出文件路径，真正的转写在 kb_processor 里。
 
-    当前行为：返回空文本 + 音频元信息，由 kb_processor 调用 ASR 转写。
+    **视频也走这里**：kb_processor._to_pcm16k 用 ffmpeg 抽音轨，对 mp4 和 mp3
+    是同一个命令（-vn 丢掉视频流）。所以没有 parse_video，一条路服务两者。
+
+    这里不直接转写，是因为 ASR 模型配置在 retrieval_models 表里，而 parser 层
+    拿不到 db session。分工：parser 只认文件，kb_processor 负责调外部服务。
     """
     filename = os.path.basename(file_path)
     file_size = os.path.getsize(file_path)

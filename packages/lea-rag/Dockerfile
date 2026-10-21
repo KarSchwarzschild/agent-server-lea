@@ -23,10 +23,22 @@ ENV PYTHONUNBUFFERED=1 \
 
 # 依赖里有需要编译的（grpcio 之类），装完把工具链删掉 —— 留着会让镜像大一倍，
 # 而且编译器留在运行镜像里本身就不该。
+#
+# ffmpeg 是**运行时**依赖，不能跟 build-essential 一起 purge：
+#
+#   - 视频入知识库靠它抽音轨（mp4 → wav → 基座 ASR）。没有它视频就只能走
+#     跨服务异步编排（subtitle_api），那要解决 VideoUrl/轮询/租户映射三件事。
+#   - 音频从「只支持 WAV」放开到 mp3/m4a/flac/ogg。标准库的 wave 只读 WAV。
+#   - audioop 在 Python 3.13 被移除（PEP 594），届时 _wav_to_pcm16k 会在 import
+#     处直接炸。有了 ffmpeg 那条退路就不再是唯一实现。
+#
+# 代价是镜像变大（ffmpeg + 它的编解码库约 100MB 量级）。换来的是三件事一起解决，
+# 而且视频不用再跨服务。
 COPY --from=ghcr.io/astral-sh/uv:0.6.12 /uv /usr/local/bin/uv
 COPY --from=deps /requirements.txt /tmp/requirements.txt
 RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential \
+    && apt-get install -y --no-install-recommends ffmpeg \
     && uv pip install --system --no-cache -r /tmp/requirements.txt \
     && apt-get purge -y build-essential \
     && apt-get autoremove -y \

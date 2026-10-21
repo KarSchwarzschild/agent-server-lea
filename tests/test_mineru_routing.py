@@ -95,12 +95,20 @@ def test_whitelist_always_has_the_basics(cloud):
         assert e in exts
 
 
-def test_video_is_not_in_whitelist(local):
-    """视频在这个平台还没有解析路径 —— lea-rag 的 parse_document 没有 video
-    分支（lea-parser 有，但知识库入库走的不是它）。白名单不该收。"""
-    exts = P.supported_upload_exts()
-    for e in ("mp4", "avi", "mov", "mkv"):
-        assert e not in exts
+def test_video_needs_ffmpeg_not_mineru(local, monkeypatch):
+    """视频不靠 MinerU —— 它的格式列表里没有视频。
+
+    视频走 ffmpeg 抽音轨 + 基座 ASR（见 test_media_ffmpeg.py）。所以即使本地
+    MinerU 配好了，没有 ffmpeg 视频也进不了白名单；反过来有 ffmpeg 就能进，
+    和 MinerU 无关。
+    """
+    assert not (P.mineru_native_exts() & {"mp4", "avi", "mov", "mkv"})
+
+    monkeypatch.setattr(P, "_has_ffmpeg", lambda: False)
+    assert "mp4" not in P.supported_upload_exts(), "没 ffmpeg 不该收视频"
+
+    monkeypatch.setattr(P, "_has_ffmpeg", lambda: True)
+    assert "mp4" in P.supported_upload_exts(), "有 ffmpeg 该收视频"
 
 
 # ── 路由与兜底 ──────────────────────────────────────────────────────────────

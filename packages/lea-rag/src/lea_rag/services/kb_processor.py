@@ -500,6 +500,57 @@ class DocumentProcessor:
                 logger.info("asr_transcribed", document_id=doc.id, length=len(transcript))
 
     @staticmethod
+    def _ffmpeg_to_pcm16k(file_path: str) -> bytes:
+        """用 ffmpeg 抽音轨并归一到 16kHz / 16bit / 单声道裸 PCM。
+
+        这条路同时覆盖三件事，所以优先走它：
+
+          视频     mp4/avi/mov/mkv 抽出音轨（标准库完全做不到）
+          有损音频 mp3/m4a/flac/ogg（wave 模块只认 WAV）
+          未来     audioop 在 Python 3.13 被移除，那时这是唯一实现
+
+        `-f s16le` 直接输出裸 PCM（不带 RIFF 头）。这个容器格式本身只能装音频，
+        所以 `-vn` 其实是冗余的（实测带不带输出字节数完全一致）—— 留着是为了让
+        「这里只要音频」这个意图写在命令里，而不是依赖读者知道 s16le 的性质。
+
+        输出走 stdout，不落临时文件 —— 容器里跑的是非 root 用户（uid 10001），
+        能写的目录有限，而且一个 3 小时的视频抽出来的 WAV 有几百 MB。
+        """
+        import subprocess
+
+        cmd = [
+            "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+            "-i", file_path,
+            "-vn",                  # 冗余但保留：声明「只要音频」，见 docstring
+            "-ac", "1",             # 单声道
+            "-ar", "16000",         # 16kHz
+            "-f", "s16le",          # 16bit 小端裸 PCM
+            "-",                    # 输出到 stdout
+        ]
+        proc = subprocess.run(cmd, capture_output=True, timeout=1800, check=False)
+        if proc.returncode != 0 or not proc.stdout:
+            err = (proc.stderr or b"").decode("utf-8", "replace")[:300]
+            raise RuntimeError(f"ffmpeg 抽音轨失败 (rc={proc.returncode}): {err}")
+        return proc.stdout
+
+    @staticmethod
+    def _has_ffmpeg() -> bool:
+        import shutil
+
+        return shutil.which("ffmpeg") is not None
+
+    @staticmethod
+    def _to_pcm16k(file_path: str) -> bytes:
+        """统一入口：有 ffmpeg 就用它，否则退回标准库（只能处理 WAV）。
+
+        不直接写死用 ffmpeg，是为了让本地开发和 CI 在没装 ffmpeg 的环境里仍能
+        处理 WAV —— 单测跑的就是这条退路。
+        """
+        if DocumentProcessor._has_ffmpeg():
+            return DocumentProcessor._ffmpeg_to_pcm16k(file_path)
+        return DocumentProcessor._wav_to_pcm16k(file_path)
+
+    @staticmethod
     def _wav_to_pcm16k(file_path: str) -> bytes:
         """把 WAV 转成基座 ASR 要的 16kHz / 16bit / 单声道裸 PCM。
 
@@ -577,9 +628,9 @@ class DocumentProcessor:
                         timeout=timeout,
                     )
             else:
-                # 按类名调而不是 self：_wav_to_pcm16k 是 staticmethod，不需要实例，
+                # 按类名调而不是 self：这几个都是 staticmethod，不需要实例，
                 # 这样这一步在单测里可以脱离实例直接验。
-                pcm = DocumentProcessor._wav_to_pcm16k(file_path)
+                pcm = DocumentProcessor._to_pcm16k(file_path)
                 resp = httpx.post(
                     url,
                     headers={**headers, "Content-Type": "application/json"},

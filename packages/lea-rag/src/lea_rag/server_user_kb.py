@@ -278,9 +278,20 @@ async def upload_document(
     require(actor, UPDATE, kb)
 
     file_ext = (file.filename or "file").rsplit(".", 1)[-1].lower()
-    allowed = {"pdf", "txt", "md", "docx", "pptx", "png", "jpg", "jpeg", "webp"}
+    # 和 server_kb.py 同源：白名单从解析能力推导，不写死。
+    #
+    # 这里原来是一份独立的硬编码集合，于是出现过「parser 放开了 mp4、
+    # supported_upload_exts() 也含 mp4，但上传仍然 400」—— 因为两个上传入口各有
+    # 一份名单，只改了一份。两处漂移的方向都坏：宽了是上传成功但解析失败，
+    # 窄了是明明能解析却被拒。
+    from lea_rag.parsers.parser import supported_upload_exts
+
+    allowed = supported_upload_exts()
     if file_ext not in allowed:
-        raise HTTPException(400, f"不支持的文件类型: {file_ext}")
+        raise HTTPException(
+            400,
+            f"不支持的文件类型: {file_ext}（当前支持 {', '.join(sorted(allowed))}）",
+        )
 
     content = await file.read()
     file_key = f"kb/{kb_id}/{file.filename}"

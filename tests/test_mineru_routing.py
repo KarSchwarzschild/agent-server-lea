@@ -209,3 +209,37 @@ def test_each_native_ext_has_a_mime():
     """
     missing = [e for e in P._MINERU_NATIVE_EXTS if e not in P._EXT_MIME]
     assert not missing, f"这些格式没有 mime 映射: {missing}"
+
+
+# ── 两个上传入口的白名单必须同源 ────────────────────────────────────────────
+
+
+def test_both_upload_endpoints_derive_the_whitelist():
+    """server_kb 和 server_user_kb 是两个独立的上传入口，白名单必须都从
+    supported_upload_exts() 推导。
+
+    这条是补的，因为真踩了：parser 放开 mp4、supported_upload_exts() 也含
+    mp4、server_kb 跟着放开了，但 server_user_kb 里还留着一份硬编码集合
+    {pdf,txt,md,docx,pptx,png,jpg,jpeg,webp}，于是部署上去 mp4 照样 400。
+    前一个版本甚至在 server_kb 的注释里写着"两处各写一遍迟早漂移"，然后只
+    改了一处。
+
+    用源码断言而不是起 FastAPI 测试客户端：这两个模块 import 时要连 DB 和
+    对象存储，在单元测试里拉不起来。断言的是"没有写死的格式集合"这个结构
+    性质，漂移一旦发生就红。
+    """
+    root = Path(__file__).resolve().parents[1] / "packages" / "lea-rag" / "src" / "lea_rag"
+
+    for name in ("server_kb.py", "server_user_kb.py"):
+        src = (root / name).read_text(encoding="utf-8")
+        assert "不支持的文件类型" in src, f"{name} 里找不到上传格式校验，这条测试该更新了"
+        assert "supported_upload_exts" in src, (
+            f"{name} 的上传白名单没有从 supported_upload_exts() 推导"
+        )
+        # 硬编码名单的特征：pdf 和 docx 写在同一个字面量集合里
+        for line in src.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#") or stripped.startswith("*"):
+                continue
+            if '"pdf"' in line and '"docx"' in line:
+                raise AssertionError(f"{name} 疑似又出现硬编码白名单: {stripped[:100]}")

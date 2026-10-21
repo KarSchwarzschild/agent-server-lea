@@ -114,10 +114,13 @@ def media_exts() -> frozenset[str]:
     return _WAV_ONLY_AUDIO_EXTS
 
 
+#: 直接按 UTF-8 读就行的格式，不需要任何解析器。
+#: kb_processor._parse 用它决定走"读文本"还是走 parse_document ——
+#: 那里原来是 else 兜底，于是 mp4 被 errors="ignore" 读成了 138 个乱码 chunk。
+PLAIN_TEXT_EXTS = frozenset({"txt", "md", "markdown", "json", "yaml", "yml", "log"})
+
 #: 不依赖 MinerU 就能处理的格式。
-#: txt/md 在 kb_processor._parse 里直接读文本，不进 parse_document。
-_ALWAYS_SUPPORTED_EXTS = frozenset({
-    "txt", "md",
+_ALWAYS_SUPPORTED_EXTS = PLAIN_TEXT_EXTS | frozenset({
     "docx", "pptx",                                  # python-docx / python-pptx
 }) | _IMAGE_EXTS
 
@@ -654,7 +657,8 @@ def parse_audio(file_path: str) -> dict:
     """音视频的解析入口 —— 只交出文件路径，真正的转写在 kb_processor 里。
 
     **视频也走这里**：kb_processor._to_pcm16k 用 ffmpeg 抽音轨，对 mp4 和 mp3
-    是同一个命令（-vn 丢掉视频流）。所以没有 parse_video，一条路服务两者。
+    是同一个命令（-f s16le 本身就只输出音频）。所以没有 parse_video，
+    一条路服务两者。
 
     这里不直接转写，是因为 ASR 模型配置在 retrieval_models 表里，而 parser 层
     拿不到 db session。分工：parser 只认文件，kb_processor 负责调外部服务。

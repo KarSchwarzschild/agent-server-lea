@@ -124,21 +124,43 @@ class DocumentProcessor:
         return sections
 
     def _parse(self, file_path: str, file_type: str) -> dict:
-        """解析文档，复用 Notebook 的 parser 逻辑。"""
-        from lea_rag.parsers.parser import parse_document
+        """解析文档。
 
-        if file_type in (
-            "pdf", "docx", "pptx",
-            "png", "jpg", "jpeg", "webp", "gif", "bmp",
-            "mp3", "wav", "m4a", "flac", "ogg",
-        ):
+        这里原来是「一份硬编码格式名单 + else 读文本兜底」，两个问题：
+
+        1. 名单是第三份（另两份在 server_kb.py / server_user_kb.py 的上传校验里），
+           跟着漂移。mp4 进了上传白名单但没进这份名单。
+        2. else 分支用 errors="ignore" 读任意文件。二进制掉进来不会报错 ——
+           mp4 被读成 `ftypisom...x264 - core 164...`，切出 138 个乱码 chunk，
+           文档状态 ready、error_message 空。搜出来的是码流参数。
+
+        改成从解析能力推导：纯文本直接读，其余交给 parse_document，
+        都不认的**抛异常**。宁可文档变 error 让人看见，也不要 ready 而内容是垃圾。
+        """
+        from lea_rag.parsers.parser import (
+            PLAIN_TEXT_EXTS,
+            _chunk_md_fallback,
+            parse_document,
+            supported_upload_exts,
+        )
+
+        if file_type in PLAIN_TEXT_EXTS:
+            with open(file_path, encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            return {
+                "md_content": content,
+                "text_chunks": _chunk_md_fallback(content),
+                "image_items": [],
+            }
+
+        if file_type in supported_upload_exts():
             return parse_document(file_path, parser="mineru")
 
-        from lea_rag.parsers.parser import _chunk_md_fallback
-        with open(file_path, encoding="utf-8", errors="ignore") as f:
-            content = f.read()
-        chunks = _chunk_md_fallback(content)
-        return {"md_content": content, "text_chunks": chunks, "image_items": []}
+        raise RuntimeError(
+            f"没有 {file_type} 的解析路径（当前支持 "
+            f"{', '.join(sorted(supported_upload_exts()))}）。"
+            "不按文本兜底 —— 二进制会被切成乱码 chunk 而文档显示 ready。"
+        )
 
     def _save_chunks(self, doc: Document, kb: KnowledgeBase, parse_result: dict) -> list[dict]:
         """保存分块到数据库，包含章节关联。"""
@@ -484,12 +506,20 @@ class DocumentProcessor:
             RetrievalModel.enabled == True,  # noqa: E712
         ).first()
         if not m:
+            # 原来是 logger.warning + return，于是音视频文档变成 ready / 0 chunk /
+            # 无错误 —— 用户看到"处理完成"，搜却什么都搜不到，日志里那条 warning
+            # 没有消费者。音视频除了转写没有别的内容来源，拿不到就是失败。
             logger.warning("asr_not_configured", document_id=doc.id)
-            return
+            raise RuntimeError(
+                "没有启用的 ASR 模型（retrieval_models 里 model_type='asr'），"
+                "音视频无法转写。"
+            )
 
+        got_any = False
         for item in audio_items:
             transcript = self._asr_transcribe(m, item.get("file_path", ""))
             if transcript:
+                got_any = True
                 from lea_rag.parsers.parser import chunk_text_blocks
                 blocks = [{"text": transcript, "page_idx": 0}]
                 chunks = chunk_text_blocks(blocks)
@@ -498,6 +528,14 @@ class DocumentProcessor:
                 parse_result.setdefault("text_chunks", []).extend(chunks)
                 parse_result["md_content"] = (parse_result.get("md_content", "") + "\n\n" + transcript).strip()
                 logger.info("asr_transcribed", document_id=doc.id, length=len(transcript))
+
+        # 同理：ASR 调通了但一个字都没转出来（空音轨、纯音乐、服务返回空），
+        # 这份文档也没有任何可检索内容。不能算成功。
+        if not got_any and not parse_result.get("text_chunks"):
+            raise RuntimeError(
+                f"ASR 没有转写出任何文字（{len(audio_items)} 个音轨），"
+                "文档没有可检索内容。可能是无人声、音轨为空或 ASR 服务返回空结果。"
+            )
 
     @staticmethod
     def _ffmpeg_to_pcm16k(file_path: str) -> bytes:

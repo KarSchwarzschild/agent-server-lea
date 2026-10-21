@@ -15,6 +15,91 @@ import structlog
 logger = structlog.get_logger()
 
 _MINERU_API_BASE = "https://mineru.net/api/v4"
+
+# MinerU **本地**原生解析支持的格式（docs: opendatalab.github.io/MinerU）。
+#
+# ⚠️ 云端不支持这里的大部分。官方文档写明：PDF 和图片在四个档位（Flash/Basic/
+# Standard/Advanced）都可用，而 Office、OpenDocument、EPUB、OFD、HTML/MHTML、
+# CSV/TSV **只用本地 Flash 原生解析**。所以这张表只在 MINERU_URL 已配置（自部署）
+# 时才生效，云端模式下仍按扩展名走各自的本地库。
+#
+# 不含图片：MinerU 对图片做的是 OCR（抽文字），而 parse_image 返回的是整图
+# base64，交给 kb_processor 走 VLM 描述或 multimodal 向量化。对知识库场景后者
+# 更有用（一张示意图 OCR 出来往往是空的）。要不要 OCR 取决于 KB 的 vlm_enabled /
+# multimodal 配置，而 parse_document 这一层拿不到 kb 对象，所以不在这里决定。
+#
+# 不含音频：MinerU 不做 ASR。音频走 parse_audio + kb_processor._process_audio。
+_MINERU_NATIVE_EXTS = frozenset({
+    "pdf",
+    "doc", "docx",
+    "ppt", "pptx",
+    "xls", "xlsx",
+    "rtf",
+    "odt", "ods", "odp",
+    "epub",
+    "ofd",
+    "html", "mhtml",
+    "csv", "tsv",
+})
+
+# 扩展名 → Content-Type。原来 _parse_pdf_mineru_local 把 mime 写死成
+# application/pdf，传 docx 进去会带错的 content-type，服务端按 mime 分派的话会
+# 失配 —— 而失配的表现是"解析出空内容"，不报错。
+_EXT_MIME = {
+    "pdf": "application/pdf",
+    "doc": "application/msword",
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "ppt": "application/vnd.ms-powerpoint",
+    "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "xls": "application/vnd.ms-excel",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "rtf": "application/rtf",
+    "odt": "application/vnd.oasis.opendocument.text",
+    "ods": "application/vnd.oasis.opendocument.spreadsheet",
+    "odp": "application/vnd.oasis.opendocument.presentation",
+    "epub": "application/epub+zip",
+    "ofd": "application/ofd",
+    "html": "text/html",
+    "mhtml": "message/rfc822",
+    "csv": "text/csv",
+    "tsv": "text/tab-separated-values",
+}
+
+
+def mineru_local_url() -> str:
+    """本地 MinerU 的地址；没配返回空串（表示走云端）。"""
+    return os.getenv("MINERU_URL", "").strip()
+
+
+def mineru_native_exts() -> frozenset[str]:
+    """当前部署下能交给 MinerU 的扩展名。
+
+    云端模式返回只含 pdf 的集合 —— 其余格式云端不支持（见 _MINERU_NATIVE_EXTS
+    的说明），交过去只会失败或拿到空内容。
+    """
+    return _MINERU_NATIVE_EXTS if mineru_local_url() else frozenset({"pdf"})
+
+
+#: 不依赖 MinerU 就能处理的格式。
+#: txt/md 在 kb_processor._parse 里直接读文本，不进 parse_document。
+_ALWAYS_SUPPORTED_EXTS = frozenset({
+    "txt", "md",
+    "docx", "pptx",                                  # python-docx / python-pptx
+    "png", "jpg", "jpeg", "webp", "gif", "bmp",      # 整图交给 VLM / multimodal
+    "mp3", "wav", "m4a", "flac", "ogg",              # ASR（要配 asr 模型）
+})
+
+
+def supported_upload_exts() -> frozenset[str]:
+    """当前部署真正能解析的扩展名，给上传接口做白名单。
+
+    必须从解析能力推导而不是在接口里写死一份：两处各写一遍的话迟早漂移，而
+    漂移的两个方向都坏 —— 白名单宽了是"上传成功但解析失败"，窄了是明明能解析
+    却被 400 拒。
+
+    本地 MinerU 一配上，XLSX / EPUB / HTML / CSV / RTF / ODF 自动进白名单。
+    """
+    return _ALWAYS_SUPPORTED_EXTS | mineru_native_exts()
 _MINERU_TOKEN: str | None = None
 
 
@@ -248,10 +333,17 @@ def parse_pdf_mineru(file_path: str) -> dict:
 
 
 def _parse_pdf_mineru_local(file_path: str, base_url: str) -> dict:
-    """本地自部署 MinerU（同步 /file_parse 接口）。"""
+    """本地自部署 MinerU（同步 /file_parse 接口）。
+
+    名字里的 pdf 是历史包袱 —— 本地 MinerU 原生支持 Office / OpenDocument /
+    EPUB / HTML / CSV 等（见 _MINERU_NATIVE_EXTS），这个函数对它们都适用，
+    mime 按扩展名查表给。
+    """
+    ext = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
+    mime = _EXT_MIME.get(ext, "application/octet-stream")
     with open(file_path, "rb") as f:
         filename = os.path.basename(file_path)
-        files = {"files": (filename, f, "application/pdf")}
+        files = {"files": (filename, f, mime)}
         data = {
             "lang_list": '["ch"]',
             "return_md": "true",
@@ -350,26 +442,68 @@ def _chunk_md_fallback(md_content: str) -> list[dict]:
     return chunks
 
 
+#: 扩展名 → 本地兜底解析器。MinerU 不可用或失败时走这里。
+#: 没有条目的格式（xlsx/epub/html/csv 等）只有 MinerU 这一条路。
+_FALLBACK_PARSERS: dict[str, str] = {
+    "docx": "parse_docx",
+    "pptx": "parse_pptx",
+}
+
+
 def parse_document(file_path: str, parser: str = "mineru") -> dict:
-    """统一入口。返回 {md_content, text_chunks, image_items}。"""
+    """统一入口。返回 {md_content, text_chunks, image_items}。
+
+    ## 路由
+
+    本地 MinerU 已配置（MINERU_URL）时，文档类格式一律优先交给它 —— 它的版面
+    分析、表格结构和阅读顺序比 python-docx / python-pptx 那种"按 XML 顺序平铺"
+    强得多，而且多覆盖 XLSX / EPUB / HTML / CSV / RTF / ODF 一批格式。
+
+    云端模式下只有 PDF 走 MinerU：官方文档写明 Office 等格式**只用本地原生解析**
+    （见 _MINERU_NATIVE_EXTS）。交给云端的后果不是报错而是拿到空内容 —— 那会让
+    "上传成功但搜不到"再多一个来源。
+
+    ## 兜底
+
+    MinerU 失败一律降级到本地解析器，不让一次服务抖动变成文档丢失：
+      pdf          → pymupdf
+      docx / pptx  → python-docx / python-pptx
+      其余格式     → 无兜底，抛出去由 kb_processor 记 error 状态
+
+    图片和音频不进 MinerU，理由见 _MINERU_NATIVE_EXTS 的注释。
+    """
     ext = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
 
-    if ext == "docx":
-        return parse_docx(file_path)
-    if ext == "pptx":
-        return parse_pptx(file_path)
+    # 图片：返回整图交给 VLM / multimodal，不做 OCR
     if ext in ("png", "jpg", "jpeg", "webp", "gif", "bmp"):
         return parse_image(file_path)
+    # 音频：MinerU 不做 ASR
     if ext in ("mp3", "wav", "m4a", "flac", "ogg"):
         return parse_audio(file_path)
 
-    if parser == "mineru":
+    use_mineru = parser == "mineru" and ext in mineru_native_exts()
+    if use_mineru:
         try:
             return parse_pdf_mineru(file_path)
         except Exception as exc:
-            logger.warning("mineru_fallback", error=str(exc))
-            return parse_pdf_pymupdf(file_path)
-    return parse_pdf_pymupdf(file_path)
+            logger.warning("mineru_fallback", ext=ext, error=str(exc))
+
+    # 兜底（MinerU 没走成，或压根没让它走）
+    fb = _FALLBACK_PARSERS.get(ext)
+    if fb == "parse_docx":
+        return parse_docx(file_path)
+    if fb == "parse_pptx":
+        return parse_pptx(file_path)
+
+    if ext in ("pdf", ""):
+        return parse_pdf_pymupdf(file_path)
+
+    # 只有 MinerU 能处理的格式，而它失败了。往上抛而不是返回空 —— 空内容会被
+    # 当成"解析成功但文档没内容"，文档状态变 ready，用户看不出有问题。
+    raise RuntimeError(
+        f"{ext} 只能由本地 MinerU 解析，而它不可用或解析失败"
+        f"（MINERU_URL={'已配置' if mineru_local_url() else '未配置'}）"
+    )
 
 
 def parse_docx(file_path: str) -> dict:

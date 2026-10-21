@@ -585,13 +585,17 @@ async def upload_document(
             raise HTTPException(404, "知识库不存在")
 
         file_ext = (file.filename or "file").rsplit(".", 1)[-1].lower()
-        allowed_ext = {
-            "pdf", "txt", "md", "docx", "pptx",
-            "png", "jpg", "jpeg", "webp", "gif", "bmp",
-            "mp3", "wav", "m4a", "flac", "ogg",
-        }
+        # 白名单从解析能力推导，不在这里写死 —— 两处各写一遍迟早漂移，而两个
+        # 漂移方向都坏：宽了是"上传成功但解析失败"，窄了是明明能解析却被 400 拒。
+        # 配上本地 MinerU（MINERU_URL）之后 XLSX / EPUB / HTML / CSV 等自动可用。
+        from lea_rag.parsers.parser import supported_upload_exts
+
+        allowed_ext = supported_upload_exts()
         if file_ext not in allowed_ext:
-            raise HTTPException(400, f"不支持的文件类型: {file_ext}")
+            raise HTTPException(
+                400,
+                f"不支持的文件类型: {file_ext}（当前支持 {', '.join(sorted(allowed_ext))}）",
+            )
 
         content = await file.read()
         file_key = f"kb/{kb_id}/{file.filename}"

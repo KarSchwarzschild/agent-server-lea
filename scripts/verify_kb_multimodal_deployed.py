@@ -99,6 +99,47 @@ def make_png() -> bytes:
     )
 
 
+def make_docx_with_image(png: bytes) -> bytes:
+    """造一个同时含正文和图片的 docx。
+
+    这是唯一能验上下文窗口的路径：纯 PNG 上传没有正文，拼不出上下文。而正文里
+    刻意放一个**描述里不会出现的词**（营收），用来判断正文是否真的进了图片 chunk。
+    """
+    import tempfile
+
+    from docx import Document as Docx
+    from docx.shared import Inches
+
+    d = Docx()
+    d.add_paragraph("下图为本年度第三季度营收情况，同比增长百分之十二。")
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+        f.write(png)
+        img_path = f.name
+    try:
+        d.add_picture(img_path, width=Inches(1))
+    finally:
+        os.unlink(img_path)
+    d.add_paragraph("以上数据来自财务部门的季度报表汇总。")
+
+    buf = io.BytesIO()
+    d.save(buf)
+    return buf.getvalue()
+
+
+def chunk_contents(kb_id: int, chunk_type: str) -> list[str]:
+    """取某种 chunk_type 的 content，用来检查上下文有没有拼进去。"""
+    from lea_rag.index.milvus_index import MilvusKBIndex
+
+    idx = MilvusKBIndex()
+    rows = idx.client.query(
+        collection_name=idx.collection_name,
+        filter=f'kb_id == {kb_id} and chunk_type == "{chunk_type}"',
+        output_fields=["content", "page", "section_id"],
+        limit=20,
+    )
+    return rows
+
+
 def make_wav() -> bytes:
     """造 0.1 秒静音 WAV（44 字节头 + 数据）。"""
     sr, n = 8000, 800
@@ -131,17 +172,23 @@ def milvus_counts(kb_id: int) -> dict[str, int]:
     return out
 
 
-def wait_ready(kb_id: int, doc_id: int, timeout: int = 180) -> str:
-    """等 celery 把文档处理完。返回最终 status。"""
+def wait_ready(kb_id: int, doc_id: int, timeout: int = 240) -> str:
+    """等 celery 把文档处理完。返回最终 status。
+
+    /kb/{id}/documents 返回的是**列表**（response_model=list[DocumentOut]），
+    不是 {items: [...]}。
+    """
     deadline = time.time() + timeout
     last = "?"
     while time.time() < deadline:
         st, docs = call("GET", f"/kb/{kb_id}/documents")
-        if st == 200 and isinstance(docs, dict):
-            for d in docs.get("documents", docs.get("items", [])):
+        if st == 200 and isinstance(docs, list):
+            for d in docs:
                 if d.get("id") == doc_id:
                     last = d.get("status", "?")
-                    if last in ("ready", "failed"):
+                    # 失败态在这个库里叫 error（update_document_status 写的），
+                    # 不是 failed
+                    if last in ("ready", "error", "failed"):
                         return last
         time.sleep(5)
     return f"timeout(last={last})"
@@ -151,7 +198,7 @@ def main() -> int:
     checks: list[tuple[str, bool, str]] = []
 
     print("=== 建临时 KB（vlm_enabled=1, multimodal=0，和线上 4 个 KB 同配置）===")
-    st, kb = call("POST", "/kb", {
+    st, kb = call("POST", "/kb/create", {
         "name": f"多模态验证_{os.getpid()}",
         "description": "verify only",
         "tenant_id": TENANT,
@@ -181,6 +228,27 @@ def main() -> int:
                 "图片产生了 image_caption chunk（VLM 描述入库）",
                 cnt.get("image_caption", 0) > 0,
                 f"image_caption={cnt.get('image_caption')} image={cnt.get('image')}",
+            ))
+
+        # ── 1b. docx（含图 + 正文）—— 验上下文窗口 ───────────────────────
+        print("\n=== 1b. 上传含图 docx（验上下文窗口）===")
+        st, doc = upload(
+            kb_id, "verify_report.docx", make_docx_with_image(make_png()),
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+        print(f"  HTTP {st}  {str(doc)[:120]}")
+        if st in (200, 201) and isinstance(doc, dict):
+            final = wait_ready(kb_id, doc["id"])
+            print(f"  处理状态: {final}")
+            rows = chunk_contents(kb_id, "image_caption")
+            for r in rows:
+                print(f"  image_caption: page={r.get('page')} section={r.get('section_id')}")
+                print(f"    {str(r.get('content'))[:200]}")
+            has_ctx = any("营收" in str(r.get("content", "")) for r in rows)
+            checks.append((
+                "**上下文窗口生效**：图片 chunk 里含正文的词（营收）",
+                has_ctx,
+                f"{len(rows)} 个 image_caption chunk",
             ))
 
         # ── 2. 音频 ─────────────────────────────────────────────────────────
@@ -220,18 +288,24 @@ def main() -> int:
         return 0 if ok else 1
     finally:
         print("\n=== 清理 ===")
+        # 先删文档（有端点），再清 Milvus。**没有删 KB 的端点** —— server_kb.py
+        # 里只有 DELETE /kb/{id}/documents/{doc_id}，所以临时 KB 会留在库里，
+        # 结尾打出 id 供人工清理。
+        st, docs = call("GET", f"/kb/{kb_id}/documents")
+        if st == 200 and isinstance(docs, list):
+            for d in docs:
+                call("DELETE", f"/kb/{kb_id}/documents/{d['id']}")
+            print(f"  删了 {len(docs)} 个文档")
         try:
             from lea_rag.index.milvus_index import MilvusKBIndex
 
             idx = MilvusKBIndex()
             idx.delete_by_kb(kb_id)
             idx.client.flush(collection_name=idx.collection_name)
-            left = milvus_counts(kb_id)["_total"]
-            print(f"  Milvus 剩余 {left} 行")
+            print(f"  Milvus 剩余 {milvus_counts(kb_id)['_total']} 行")
         except Exception as exc:
             print(f"  Milvus 清理失败: {exc}")
-        st, _ = call("DELETE", f"/kb/{kb_id}")
-        print(f"  DELETE /kb/{kb_id} -> {st}")
+        print(f"  ⚠️ 临时 KB id={kb_id} 需要手工删（没有删 KB 的端点）")
 
 
 if __name__ == "__main__":

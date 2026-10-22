@@ -625,6 +625,17 @@ class DocumentProcessor:
             frames, _ = audioop.ratecv(frames, width, 1, rate, 16000, None)
         return frames
 
+    @staticmethod
+    def _split_pcm(pcm: bytes, seconds: float) -> list[bytes]:
+        """把 16k/16bit/mono 裸 PCM 按秒切段。
+
+        PCM 未压缩，切分就是字节算术：16000 采样/秒 × 2 字节 = 32000 字节/秒。
+        按偶数字节对齐，否则会把一个 16bit 采样劈成两半、后面全是噪声。
+        """
+        bps = 16000 * 2
+        step = max(2, int(seconds * bps) // 2 * 2)
+        return [pcm[i:i + step] for i in range(0, len(pcm), step)] or [b""]
+
     def _asr_transcribe(self, model, file_path: str) -> str:
         """调用 ASR 服务转写音频。
 
@@ -638,6 +649,24 @@ class DocumentProcessor:
         为什么要分：两边**路径一样但请求体完全不同**。原来这里只实现了 OpenAI
         那种 multipart，直接指向基座会被拒，而 except 会把它吞成空字符串 ——
         表现是"上传成功但搜不到"，看不出是协议不对。
+
+        ## 为什么要分段
+
+        基座的 spark-asr **对长音频静默截断**：实测 600s 和 180s 返回几乎等长的
+        文本（462 / 464 字符），HTTP 都是 200，没有任何错误字段。换算下来约 120-130s
+        之后的内容直接丢掉。用变速音频验证过这是输入时长封顶而不是输出字符封顶：
+        同样 150s 输入，慢速出 292 字符、正常 464、快速 697。
+
+        所以 10 分钟的讲座视频整段提交会"成功"，只是后面 8 分钟没了。
+        分段长度取 60s（文档里写的默认上限，也是实测边界的一半余量）。
+
+        funasr 虽然号称支持 3 小时，但当前稳定 500「接收消息超时」（连打 3 次），
+        所以不能靠它。
+
+        ## 分段失败一律抛
+
+        第 3 段失败而其余成功的话，拼出来的文本缺中间一块且**读不出来缺了** ——
+        这正是整个这轮在修的那类静默失败。宁可整份文档变 error。
         """
         import base64
 
@@ -655,43 +684,72 @@ class DocumentProcessor:
         if model.api_key:
             headers["Authorization"] = f"Bearer {model.api_key}"
         timeout = float(extra.get("timeout", 600.0))
+        model_name = model.model_name or model.name
 
-        try:
-            if protocol == "openai":
+        if protocol == "openai":
+            try:
                 with open(file_path, "rb") as f:
                     resp = httpx.post(
                         url, headers=headers,
                         files={"file": (os.path.basename(file_path), f)},
-                        data={"model": model.model_name or model.name},
+                        data={"model": model_name},
                         timeout=timeout,
                     )
-            else:
-                # 按类名调而不是 self：这几个都是 staticmethod，不需要实例，
-                # 这样这一步在单测里可以脱离实例直接验。
-                pcm = DocumentProcessor._to_pcm16k(file_path)
+                resp.raise_for_status()
+                return resp.json().get("text", "")
+            except Exception as exc:
+                # 协议和模型名必须进日志 —— 配错协议和服务真的挂了，表现都是
+                # 空转写，没有这两个字段分不开。
+                logger.warning(
+                    "asr_failed", protocol=protocol, model=model_name,
+                    error=str(exc)[:200],
+                )
+                return ""
+
+        # 按类名调而不是 self：这几个都是 staticmethod，不需要实例，
+        # 这样这一步在单测里可以脱离实例直接验。
+        pcm = DocumentProcessor._to_pcm16k(file_path)
+        seg_secs = float(extra.get("segment_seconds", 60.0))
+        segments = DocumentProcessor._split_pcm(pcm, seg_secs)
+
+        parts: list[str] = []
+        for i, seg in enumerate(segments):
+            try:
                 resp = httpx.post(
                     url,
                     headers={**headers, "Content-Type": "application/json"},
                     json={
-                        "model": model.model_name or model.name,
-                        "audio": base64.b64encode(pcm).decode(),
+                        "model": model_name,
+                        "audio": base64.b64encode(seg).decode(),
+                        # 必填但**不校验** —— 实测填 lame / speex 这种明显错的
+                        # 编解码器，返回的转写一样正确。所以这个字段检测不出
+                        # 配置错误，别指望它。
                         "audio_encoding": "base64",
                         "request_format": "pcm",
-                        # 2 = 最后一帧。我们是整段一次性提交，不做流式分帧。
+                        # 2 = 最后一帧。每段都是独立的一次性提交，不做流式分帧。
                         "status": 2,
                         "language": extra.get("language", "zh_cn"),
                     },
                     timeout=timeout,
                 )
-            resp.raise_for_status()
-            return resp.json().get("text", "")
-        except Exception as exc:
-            # 把协议和模型名带进日志 —— 配错协议和服务真的挂了，表现都是空转写，
-            # 没有这两个字段分不开。
-            logger.warning(
-                "asr_failed",
-                protocol=protocol,
-                model=model.model_name or model.name,
-                error=str(exc)[:200],
+                resp.raise_for_status()
+                parts.append(resp.json().get("text", "") or "")
+            except Exception as exc:
+                logger.warning(
+                    "asr_segment_failed",
+                    protocol=protocol, model=model_name,
+                    segment=i, total=len(segments), error=str(exc)[:200],
+                )
+                raise RuntimeError(
+                    f"ASR 第 {i + 1}/{len(segments)} 段失败：{str(exc)[:150]}。"
+                    "不返回残缺转写 —— 缺中间一段的文本读不出来缺了什么。"
+                ) from exc
+
+        if len(segments) > 1:
+            logger.info(
+                "asr_segmented",
+                model=model_name, segments=len(segments),
+                seconds=round(len(pcm) / 32000, 1),
+                chars=sum(len(p) for p in parts),
             )
-            return ""
+        return "".join(parts)

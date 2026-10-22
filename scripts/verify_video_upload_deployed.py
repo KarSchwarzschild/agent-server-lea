@@ -32,7 +32,12 @@ sys.path.insert(0, "/app/src")
 
 BASE = "http://127.0.0.1:8300"
 TENANT = "verify-video"
-VIDEO = "/tmp/kbtest.mp4"
+#: 第一个参数指定视频。默认那个是 440Hz 正弦，只能验"进得来"；
+#: 要验转写内容对不对得用有人声的（/tmp/asrtest.mp4）。
+VIDEO = sys.argv[1] if len(sys.argv) > 1 else "/tmp/kbtest.mp4"
+#: 第二个参数给期望关键词（逗号分隔），用来判断转写内容是否正确 ——
+#: 只检测"不是二进制垃圾"还不够，内容可能是另一段音频的转写。
+EXPECT = [w for w in (sys.argv[2].split(",") if len(sys.argv) > 2 else []) if w]
 
 ok = True
 
@@ -117,6 +122,33 @@ def fetch_chunk_sample(doc_id: int) -> str | None:
         return None
 
 
+def fetch_all_chunks(doc_id: int) -> str | None:
+    """拼起这份文档的所有 chunk 正文。
+
+    只看第一条不够：spark-asr 对长音频静默截断，而截断的表现是**后面的段没了**，
+    第一条 chunk 完全正常。要判断转写完整就得看全文。
+    """
+    try:
+        from lea_rag.db.database import SessionLocal
+        from sqlalchemy import text
+
+        db = SessionLocal()
+        try:
+            rows = db.execute(
+                text(
+                    "SELECT content FROM kb_document_chunks "
+                    "WHERE document_id = :d ORDER BY id"
+                ),
+                {"d": doc_id},
+            ).fetchall()
+            return "".join(r[0] or "" for r in rows)
+        finally:
+            db.close()
+    except Exception as e:  # noqa: BLE001
+        print(f"  （读全文失败：{type(e).__name__}: {e}）")
+        return None
+
+
 def looks_binary(s: str) -> bool:
     """这段文本是不是二进制被当文本读出来的。
 
@@ -180,17 +212,31 @@ else:
     pcm = DP._to_pcm16k(VIDEO)
     secs = len(pcm) / 2 / 16000
 
-    probe = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=nw=1:nk=1", VIDEO],
-        capture_output=True, text=True, check=False,
-    )
-    src = float(probe.stdout.strip()) if probe.returncode == 0 and probe.stdout.strip() else None
+    # 比的必须是**音轨流**时长，不是 format=duration。
+    #
+    # format=duration 是容器时长 = 所有流里最长的那个。用 lavfi 造的测试视频
+    # 视频流常比音轨长（asrtest.mp4：音轨 12.248s / 视频 13.960s），拿它比
+    # 会把正确的抽取判成失败 —— 第一版就是这样误报的。
+    def _probe(*args: str) -> float | None:
+        p = subprocess.run(
+            ["ffprobe", "-v", "error", *args, "-of", "default=nw=1:nk=1", VIDEO],
+            capture_output=True, text=True, check=False,
+        )
+        try:
+            return float(p.stdout.strip().splitlines()[0])
+        except (ValueError, IndexError):
+            return None
+
+    src = _probe("-select_streams", "a:0", "-show_entries", "stream=duration")
+    container = _probe("-show_entries", "format=duration")
 
     if src and abs(secs - src) < 0.3:
-        good(f"PCM 时长 {secs:.3f}s 对得上源视频 {src:.3f}s")
+        extra_note = ""
+        if container and abs(container - src) > 0.3:
+            extra_note = f"（容器 {container:.3f}s 更长，因为视频流更长 —— 不该拿它比）"
+        good(f"PCM 时长 {secs:.3f}s 对得上音轨 {src:.3f}s {extra_note}")
     elif src:
-        bad(f"PCM 时长 {secs:.3f}s 和源视频 {src:.3f}s 差太多")
+        bad(f"PCM 时长 {secs:.3f}s 和音轨 {src:.3f}s 差太多")
     else:
         good(f"PCM {len(pcm)} 字节 = {secs:.3f}s（ffprobe 没读到源时长，跳过比对）")
 
@@ -294,6 +340,40 @@ if kb_id and os.path.exists(VIDEO):
                         "ready 但 chunk 正文是二进制垃圾（容器格式/码流参数），"
                         f"不是转写文本：{sample[:120]!r}"
                     )
+                elif EXPECT:
+                    # 「不是二进制」还不够：内容可能是别的音频的转写，或者只转了
+                    # 开头一小截（spark-asr 对长音频静默截断）。所以要按已知原文
+                    # 的关键词算覆盖率。
+                    allsrc = fetch_all_chunks(doc_id) or sample
+                    hit = [w for w in EXPECT if w in allsrc]
+                    rate = len(hit) / len(EXPECT)
+                    print(f"  转写全文 {len(allsrc)} 字符: {allsrc[:200]!r}")
+
+                    # ⚠ 关键词覆盖率**对截断是瞎的**。实测 300s 视频（同一段
+                    # 12.25s 语音循环 24 遍）：转 1 遍和转 24 遍都是 10/10，
+                    # 因为 10 个关键词全在第一遍里。
+                    #
+                    # 所以长音频还要看**量**：spark-asr 不分段时封顶约 462 字符，
+                    # 分段生效后 300s 应该出 ~1150 字符。超过封顶才说明分段真跑了。
+                    CAP = 470          # 实测封顶 462-464，留点余量
+                    if secs > 150 and len(allsrc) <= CAP:
+                        bad(
+                            f"{secs:.0f}s 音频只转出 {len(allsrc)} 字符（≤{CAP} 封顶线）"
+                            " —— 分段没生效，后半截被静默丢掉了"
+                        )
+                    elif secs > 150:
+                        good(
+                            f"长音频分段生效：{secs:.0f}s → {len(allsrc)} 字符，"
+                            f"远超不分段的 ~462 封顶"
+                        )
+
+                    if rate >= 0.8:
+                        good(f"转写内容正确：关键词 {len(hit)}/{len(EXPECT)} 命中 {hit}")
+                    else:
+                        bad(
+                            f"转写内容不全：关键词只命中 {len(hit)}/{len(EXPECT)} "
+                            f"{hit}，缺 {[w for w in EXPECT if w not in allsrc]}"
+                        )
                 else:
                     good(f"转写出真实文本：{sample[:80]!r}")
             elif "ASR" in err or "asr" in err.lower():

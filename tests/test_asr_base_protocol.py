@@ -208,9 +208,19 @@ def test_config_field_name_is_config_not_extra():
     assert "extra" not in cols, "模型加了 extra 列的话，_asr_transcribe 要跟着改"
 
 
-def test_failure_returns_empty_and_logs(monkeypatch):
-    """ASR 挂了返回空字符串（上层据此跳过），但必须打日志 —— 否则"搜不到"
-    这件事在任何地方都查不到。
+def test_failure_raises_and_logs(monkeypatch):
+    """base_pcm 失败必须抛 + 打日志。
+
+    这条原来叫 test_failure_returns_empty_and_logs，钉的是"返回空字符串、
+    上层据此跳过"。那个前提在加分段转写时被推翻了：分段之后"返回空"会退化成
+    "返回残缺拼接"（第 3 段失败、其余成功 → 文本缺中间一块且读不出来缺了什么），
+    所以 base_pcm 这条路改成一律抛。
+
+    日志仍然必须打，而且要带 protocol 和 model —— 配错协议和服务真挂了，
+    表现都是转写失败，没这两个字段分不开。
+
+    openai 分支保持返回空（它不分段，没有残缺问题），见
+    tests/test_asr_segmentation.py::test_openai_protocol_still_swallows_errors。
     """
     import httpx
 
@@ -225,14 +235,14 @@ def test_failure_returns_empty_and_logs(monkeypatch):
 
     p = mk_wav(16000, 1, 2)
     try:
-        out = DocumentProcessor._asr_transcribe(None, FakeModel(), p)
+        with pytest.raises(RuntimeError) as ei:
+            DocumentProcessor._asr_transcribe(None, FakeModel(), p)
     finally:
         os.unlink(p)
 
-    assert out == ""
+    assert "1/1" in str(ei.value), "报错要说清是第几段"
     assert logged, "失败没打日志"
     kw = logged[0][1]
-    # 协议和模型名要进日志：配错协议和服务真挂了，表现都是空转写，没这两个字段分不开
     assert kw.get("protocol") == "base_pcm"
     assert kw.get("model") == "funasr"
 

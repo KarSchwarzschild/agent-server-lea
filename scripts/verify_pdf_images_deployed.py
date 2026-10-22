@@ -156,6 +156,12 @@ PDF = os.path.join(FIX, man["file"])
 TEXT_PHRASE = man["text_phrase"]
 IMAGE_PHRASE = man["image_phrase"]
 
+# 第二个样本：嵌「无文字图形」的 PDF。有则一起跑。
+PHOTO_MAN = os.path.join(FIX, "photopdf_manifest.json")
+photo_man = (
+    json.load(open(PHOTO_MAN, encoding="utf-8")) if os.path.exists(PHOTO_MAN) else None
+)
+
 print("=" * 72)
 print("MinerU 状态")
 print("=" * 72)
@@ -166,8 +172,15 @@ print(f"  MINERU_URL（本地）: {P.mineru_local_url() or '未配置 → 云端
 print(f"  MINERU_TOKEN: {len(tok)} 字符，JWT={len(tok.split('.')) == 3}")
 print(f"  pdf 进 MinerU 吗: {'pdf' in P.mineru_native_exts()}")
 print()
-print(f"  样本 {man['file']}：文字层含「{TEXT_PHRASE}」，"
+print(f"  样本 A {man['file']}：文字层含「{TEXT_PHRASE}」，"
       f"嵌入 {man['embedded_images']} 张图（图里写着「{IMAGE_PHRASE}」）")
+if photo_man:
+    print(f"  样本 B {photo_man['file']}：文字层含「{photo_man['text_phrase']}」，"
+          f"嵌入 {photo_man['embedded_images']} 张**无文字**图形")
+print()
+print("  两个样本分辨两条路：")
+print("    A 的图里有字 → MinerU 可能 OCR 进正文，不一定走图片路径")
+print("    B 的图没有字 → OCR 无从下手，只有图片路径才能让它进库")
 print()
 
 st, kb = call("POST", "/kb/create", {
@@ -253,16 +266,23 @@ else:
         bad(f"文字层没提到「{TEXT_PHRASE}」，正文：{body[:150]!r}")
 
     caps = [r.get("content") or "" for r in rows if r.get("chunk_type") == "image_caption"]
-    all_text = body + "\n" + "\n".join(caps)
-    if IMAGE_PHRASE in all_text:
-        good(f"图里的「{IMAGE_PHRASE}」也提取到了 —— PDF 图片进得去")
+    # 分两条路报，别混成一句"图片进得去"。
+    #
+    # 实测（换上有效 token 后）：图里的 CRIMSONKEEL-5518 出现在 **text chunk**
+    # 里，Milvus 只有 {'text': 1}，0 条 image_caption。说明 MinerU 把这张图判成
+    # 文字区域、OCR 出来拼进了正文 —— 对这个样本有效，但不能由此说"图片路径通"，
+    # 真实图表 OCR 不出东西。所以才有样本 B。
+    if caps and IMAGE_PHRASE in "\n".join(caps):
+        good(f"图片路径：{len(caps)} 条 image_caption，含「{IMAGE_PHRASE}」")
+    elif IMAGE_PHRASE in body:
+        good(f"OCR 路径：图里的「{IMAGE_PHRASE}」被 OCR 进了正文"
+             f"（Milvus {types}，无 image_caption）")
+        print("    → 这张图有文字所以能 OCR。真实图表走不了这条路，见样本 B")
     elif caps:
         bad(f"有 {len(caps)} 条 image_caption 但不含「{IMAGE_PHRASE}」："
             f"{caps[0][:120]!r}")
     else:
-        print("  ✗ Milvus 里 0 条 image_caption —— PDF 里的图片**没有被提取**")
-        print("    这是 MinerU 降级的代价：parse_pdf_pymupdf 的 image_items 写死为空")
-        ok = False
+        bad("图里的短语既不在正文也没有 image_caption —— 图片内容整个丢了")
 
 # ── 4. 对照判定 ─────────────────────────────────────────────────────────────
 print()
@@ -284,9 +304,70 @@ if png_doc:
         print("    → VLM 这次没认出图中文字，所以 PDF 那一项无法归因，"
               "需要换个更清晰的图重测")
 
+# ── 5. 样本 B：无文字图形，这才是真图表的代理 ──────────────────────────────
+photo_verdict = None
+if photo_man:
+    print()
+    print("=" * 72)
+    print("5. 样本 B：嵌「无文字图形」的 PDF（OCR 无从下手）")
+    print("=" * 72)
+    ppdf = os.path.join(FIX, photo_man["file"])
+    st, resp3 = upload(kb_id, ppdf)
+    if st not in (200, 201, 202) or not isinstance(resp3, dict):
+        bad(f"样本 B 上传失败 {st}: {resp3}")
+    else:
+        pdoc = resp3["id"]
+        good(f"上传成功 doc={pdoc}")
+        print("  等解析落地…")
+        f2 = wait(kb_id, {pdoc})
+        d2 = f2.get(pdoc)
+        if not d2:
+            bad("样本 B 没拿到终态")
+        else:
+            pbody = chunks_of(pdoc)
+            prows = milvus_rows(pdoc)
+            ptypes: dict = {}
+            for r in prows:
+                ptypes[r.get("chunk_type")] = ptypes.get(r.get("chunk_type"), 0) + 1
+            pcaps = [
+                r.get("content") or "" for r in prows
+                if r.get("chunk_type") in ("image_caption", "image")
+            ]
+            print(f"  状态={d2.get('status')} chunks={d2.get('chunk_count')}，"
+                  f"Milvus {len(prows)} 行 {ptypes}")
+
+            tp = photo_man["text_phrase"]
+            if tp in pbody:
+                good(f"文字层提取到「{tp}」")
+            else:
+                bad(f"文字层没提到「{tp}」：{pbody[:120]!r}")
+
+            kws = photo_man["image_keywords"]
+            capjoin = "\n".join(pcaps)
+            hit = [k for k in kws if k in capjoin]
+            if pcaps and hit:
+                good(f"图片路径通：{len(pcaps)} 条图片 chunk，描述命中 {hit}")
+                print(f"    描述：{capjoin[:160]!r}")
+                photo_verdict = "图片路径通"
+            elif pcaps:
+                print(f"  ⚠ 有 {len(pcaps)} 条图片 chunk 但描述没命中 {kws}：")
+                print(f"    {capjoin[:200]!r}")
+                print("    → 图片交出来了，是 VLM 描述用词不同；链路通")
+                photo_verdict = "图片路径通（描述用词不同）"
+            else:
+                print("  ✗ 0 条图片 chunk —— 无文字图形**没进知识库**")
+                print("    PDF 里的真实图表（饼图、照片、示意图）检索不到")
+                photo_verdict = "图片路径不通"
+                ok = False
+
 print()
 print("=" * 72)
-print("PASS —— PDF 图文都进得去" if ok else "FAIL —— 见上面标 ✗ 的项")
+if ok:
+    print("PASS —— PDF 文本和图片都进得去")
+else:
+    print("FAIL —— 见上面标 ✗ 的项")
+if photo_verdict:
+    print(f"       无文字图形：{photo_verdict}")
 print("=" * 72)
 st, _ = call("DELETE", f"/knowledge-bases/{kb_id}")
 print(f"清理测试库 id={kb_id}: {st}")

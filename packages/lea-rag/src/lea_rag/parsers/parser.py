@@ -186,19 +186,56 @@ def _parse_content_list(content_list_raw, images_dict: dict) -> dict:
             if table_text.strip():
                 text_blocks.append({"text": table_text, "page_idx": page_idx})
 
-        elif item_type == "image":
+        elif item.get("img_path"):
+            # **按有没有 img_path 判断，不枚举 type。**
+            #
+            # 原来写的是 `elif item_type == "image"`，于是 MinerU 给饼图的
+            # type="chart" 落到末尾被静默丢掉 —— 图片在 zip 的 images/ 里、
+            # images_dict 也收到了，只是没人去取。实测确认（见
+            # scripts/probe_mineru_block_types.py）：
+            #
+            #     type=text   img_path=无   ← 已处理
+            #     type=chart  img_path=有   ← 曾被丢掉
+            #
+            # MinerU 的 type 枚举没有公开文档（定义在 docvortex 包里，而我们
+            # 只调云端 API 不装它）。所以枚举 type 是个只会漏的办法：漏一个就
+            # 静默丢一类内容，而表现是"解析成功、图表检索不到"。
+            # 反过来按 img_path 判断，任何带图的块都进得来。
             img_path = item.get("img_path", "")
             img_filename = img_path.split("/")[-1] if "/" in img_path else img_path
             base64_data = images_dict.get(img_filename, "")
-            caption_list = item.get("image_caption", [])
+            # caption 的键名跟着 type 变：image_caption / chart_caption /
+            # table_caption。统一按 {type}_caption 取，再退回通用键名。
+            caption_list = (
+                item.get(f"{item_type}_caption")
+                or item.get("image_caption")
+                or item.get("caption")
+                or []
+            )
+            if isinstance(caption_list, str):
+                caption_list = [caption_list]
             caption = caption_list[0] if caption_list else ""
+            # chart 还带 content（图表的结构化数据）。实测这张饼图是空串，
+            # 但有值时它比 VLM 描述准确得多，该优先用。
+            inline = (item.get("content") or "").strip()
+            if inline and not caption:
+                caption = inline
             if base64_data:
                 image_items.append({
                     "img_path": img_path,
                     "base64": base64_data,
                     "page_idx": page_idx,
                     "caption": caption,
+                    # 带上原始 type，下游要区分"图表"和"插图"时用得上
+                    "block_type": item_type,
                 })
+            else:
+                # zip 里没有对应文件 —— 不该静默跳过，这是"图表丢了"的另一个入口
+                logger.warning(
+                    "mineru_image_missing_in_zip",
+                    block_type=item_type, img_path=img_path,
+                    available=len(images_dict),
+                )
 
     return {"text_blocks": text_blocks, "image_items": image_items}
 

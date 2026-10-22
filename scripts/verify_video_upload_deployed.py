@@ -251,18 +251,22 @@ else:
         bad("全静音 —— 音轨没抽出来")
 
     # 反证：无音轨的视频必须抛错，不能静默返回空
-    d = tempfile.mkdtemp()
-    silent = os.path.join(d, "noaudio.mp4")
-    subprocess.run(
-        ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
-         "-f", "lavfi", "-i", "color=c=red:s=160x120:d=1", "-c:v", "libx264", silent],
-        check=True, capture_output=True,
-    )
-    try:
-        out = DP._to_pcm16k(silent)
-        bad(f"反证失败：无音轨视频返回了 {len(out)} 字节而没抛错")
-    except Exception as e:
-        good(f"反证通过：无音轨视频抛错（{type(e).__name__}）")
+    #
+    # 用 TemporaryDirectory 而不是 mkdtemp：第一版用后者且没删，这个脚本跑了
+    # 五次就在容器 /tmp 下留了五个 tmpXXXX/noaudio.mp4。验证脚本自己留垃圾，
+    # 下次排查磁盘时会被当成生产代码的临时文件泄漏。
+    with tempfile.TemporaryDirectory() as d:
+        silent = os.path.join(d, "noaudio.mp4")
+        subprocess.run(
+            ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+             "-f", "lavfi", "-i", "color=c=red:s=160x120:d=1", "-c:v", "libx264", silent],
+            check=True, capture_output=True,
+        )
+        try:
+            out = DP._to_pcm16k(silent)
+            bad(f"反证失败：无音轨视频返回了 {len(out)} 字节而没抛错")
+        except Exception as e:
+            good(f"反证通过：无音轨视频抛错（{type(e).__name__}）")
 
 print()
 print("=" * 68)

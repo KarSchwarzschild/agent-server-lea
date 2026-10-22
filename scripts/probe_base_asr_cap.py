@@ -53,18 +53,22 @@ def make(secs: float, src: bytes) -> bytes:
 
 
 def tempo(src: bytes, rate: float) -> bytes:
-    """变速不变调，得到不同语速的同内容音频。"""
-    d = tempfile.mkdtemp()
-    raw = os.path.join(d, "in.raw")
-    with open(raw, "wb") as f:
-        f.write(src)
-    p = subprocess.run(
-        ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
-         "-f", "s16le", "-ar", "16000", "-ac", "1", "-i", raw,
-         "-filter:a", f"atempo={rate}", "-f", "s16le", "-"],
-        capture_output=True, check=True,
-    )
-    return p.stdout
+    """变速不变调，得到不同语速的同内容音频。
+
+    用 TemporaryDirectory 而不是 mkdtemp —— 后者不会自己删，探针跑几次就在
+    容器 /tmp 下留一堆 tmpXXXX/，下次排查磁盘时会被当成生产代码的泄漏。
+    """
+    with tempfile.TemporaryDirectory() as d:
+        raw = os.path.join(d, "in.raw")
+        with open(raw, "wb") as f:
+            f.write(src)
+        p = subprocess.run(
+            ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+             "-f", "s16le", "-ar", "16000", "-ac", "1", "-i", raw,
+             "-filter:a", f"atempo={rate}", "-f", "s16le", "-"],
+            capture_output=True, check=True,
+        )
+        return p.stdout
 
 
 def ask(data: bytes, timeout: float = 900.0):

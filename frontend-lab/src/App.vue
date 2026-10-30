@@ -453,14 +453,10 @@ const projectFormOpen = ref(false)
 const editingProjectId = ref<number | null>(null)
 const projectForm = ref({ name: '', description: '' })
 const currentSessionId = ref('')
-// openSession 世代计数——每次调用 +1，openSession 自己在每个 await 之后
-// 比对"发起时的世代"跟"现在的世代"，不一致就说明用户在它跑到一半时又点了
-// 别的会话，整段剩余步骤全部丢弃，不再写任何共享状态。
-//
-// 不能只判断 currentSessionId.value === sessionId：如果用户快速来回点
-// A→B→A（最后又点回 A），currentSessionId 又变回了 A，但这次残留的、
-// 该丢弃的其实是"中间那次 A"的过时响应,不是真正最新的第三次调用——只有
-// 一个严格递增的计数器才能唯一标识"这是不是最新发起的那一次"。
+const sessionLoading = ref(false)
+// 每次离开会话或开始一轮发送都使旧世代失效。历史加载、SSE 和重连共用它，
+// 避免旧请求迟到的 session/done 事件覆盖新对话，或把新消息发回旧 session。
+// 仅比较 session ID 不够：新草稿尚无 ID，A→B→A 也可能收到第一次 A 的响应。
 let openSessionGeneration = 0
 const agentId = ref(0)
 const prompt = ref('')
@@ -2047,12 +2043,14 @@ async function openSandboxArtifact(artifact: SandboxArtifact) {
   workspaceError.value = `产物 ${artifact.path} 不在当前工作区文件列表里，可能已被覆盖或列表被截断。`
 }
 
-async function openSession(sessionId: string) {
-  // 只在真的切到另一个会话时才 detach——重复点当前正打开的这个会话（比如
-  // 手滑点了两下侧栏），不能把自己正在看的这条流也一起断了。
-  if (currentSessionId.value && currentSessionId.value !== sessionId) detachCurrentStream()
+async function openSession(sessionId: string, forceReload = false) {
+  // 重复点正在生成的会话不应重载历史、再订阅一遍同一轮。
+  if (!forceReload && currentSessionId.value === sessionId && streamRunning.value) return
+  detachCurrentStream()
+  if (currentSessionId.value !== sessionId) messages.value = []
   currentSessionId.value = sessionId
   const generation = ++openSessionGeneration
+  sessionLoading.value = true
   try {
     const conversation = conversations.value.find(item => item.id === sessionId)
     agentId.value = conversation?.agent_id || 0
@@ -2080,14 +2078,17 @@ async function openSession(sessionId: string) {
       references: referencesFromExtra(message.extra),
       usage: usageFromExtra(message.extra)
     }))
-    sessionAttachments.value = (await listSessionAttachments(sessionId)).attachments || []
+    const attachments = await listSessionAttachments(sessionId)
     if (generation !== openSessionGeneration) return
+    sessionAttachments.value = attachments.attachments || []
     await loadSessionWorkspace(sessionId)
     if (generation !== openSessionGeneration) return
     void scrollToBottom(true)
-    await resumeActiveRunIfAny(sessionId)
+    await resumeActiveRunIfAny(sessionId, generation)
   } catch (error) {
     requestLogs.value.unshift({ method: 'GET', path: `/api/sessions/${sessionId}/messages`, status: 'ERR', time: 0, body: error instanceof Error ? error.message : String(error) })
+  } finally {
+    if (generation === openSessionGeneration) sessionLoading.value = false
   }
 }
 
@@ -2102,7 +2103,7 @@ async function openSession(sessionId: string) {
 // `from` 传空串 = 从头补（resumeMessageStream 的既有约定，见它自己的注释）——
 // 刷新之后 lastEventId 这种内存态游标本来就丢了，没有更精确的续传点可用，
 // 只能整轮从头重放。
-async function resumeActiveRunIfAny(sessionId: string) {
+async function resumeActiveRunIfAny(sessionId: string, generation: number) {
   let running = false
   try {
     running = (await getTurnStatus(sessionId)).running
@@ -2111,7 +2112,7 @@ async function resumeActiveRunIfAny(sessionId: string) {
     // 阻塞正常打开会话，顶多是这次刷新没接上，用户手动重发一次也能恢复。
     return
   }
-  if (!running) return
+  if (generation !== openSessionGeneration || !running) return
 
   messages.value.push({ id: Date.now(), role: 'assistant', author: 'LEA', text: '', status: 'running', activities: [] })
   const assistant = messages.value[messages.value.length - 1]!
@@ -2120,9 +2121,10 @@ async function resumeActiveRunIfAny(sessionId: string) {
   lastEventId = ''
   resumeAttempts = 0
   try {
-    stopCurrentStream = await resumeMessageStream(sessionId, '', event => applyChatEvent(assistant, event))
+    await attachChatStream(generation,
+      resumeMessageStream(sessionId, '', event => applyChatEvent(assistant, event, generation)))
   } catch (error) {
-    finishBrokenTurn(assistant, error instanceof Error ? error.message : String(error))
+    finishBrokenTurn(assistant, error instanceof Error ? error.message : String(error), generation)
   }
 }
 
@@ -2155,9 +2157,10 @@ async function removeConversation(sessionId: string) {
   }
 }
 
-async function ensureCurrentSession() {
+async function ensureCurrentSession(generation = openSessionGeneration) {
   if (currentSessionId.value) return currentSessionId.value
   const result = await createSession(agentId.value, selectedProjectId.value || undefined, modelDraft.value.trim() || undefined)
+  if (generation !== openSessionGeneration) return result.session_id
   currentSessionId.value = result.session_id
   selectedConversation.value = result.session_id
   upsertConversation(result.session_id)
@@ -2228,7 +2231,10 @@ async function commitPendingAttachments() {
 }
 
 async function loadSessionAttachments(sessionId: string) {
-  sessionAttachments.value = (await listSessionAttachments(sessionId)).attachments || []
+  const generation = openSessionGeneration
+  const result = await listSessionAttachments(sessionId)
+  if (generation !== openSessionGeneration || currentSessionId.value !== sessionId) return
+  sessionAttachments.value = result.attachments || []
 }
 
 async function unmountResource(resource: SessionAttachment) {
@@ -2347,11 +2353,18 @@ function answerAskUser(activity: ActivityItem, candidate: string) {
 }
 
 async function sendChatMessage(value: string, planAction = '') {
-  if (!value.trim() || streamRunning.value) return
+  if (!value.trim() || streamRunning.value || sessionLoading.value) return
+  const generation = ++openSessionGeneration
+  // 配置/附件的准备也属于本轮，不能在等待期间再次发送。
+  streamRunning.value = true
   try {
-    await flushPendingLibraryImports()
+    await flushPendingLibraryImports(generation)
+    if (generation !== openSessionGeneration) return
     await persistSelectedConfiguration()
+    if (generation !== openSessionGeneration) return
   } catch (error) {
+    if (generation !== openSessionGeneration) return
+    streamRunning.value = false
     messages.value.push({
       id: Date.now(),
       role: 'system',
@@ -2380,12 +2393,15 @@ async function sendChatMessage(value: string, planAction = '') {
   resumeAttempts = 0
   resumeAvailable.value = false
   try {
-    stopCurrentStream = await sendMessageStream({ session_id: currentSessionId.value || undefined, agent_id: agentId.value, project_id: selectedProjectId.value || undefined, message: value, model: modelDraft.value.trim() || undefined, attachment_ids: attachmentIds.value, plan_mode: planAction ? false : chatMode.value === 'plan', plan_action: planAction, attachments: attachmentsPayload }, event => applyChatEvent(assistant, event))
+    await attachChatStream(generation,
+      sendMessageStream({ session_id: currentSessionId.value || undefined, agent_id: agentId.value, project_id: selectedProjectId.value || undefined, message: value, model: modelDraft.value.trim() || undefined, attachment_ids: attachmentIds.value, plan_mode: planAction ? false : chatMode.value === 'plan', plan_action: planAction, attachments: attachmentsPayload }, event => applyChatEvent(assistant, event, generation)))
+    if (generation !== openSessionGeneration) return
     // 挂载的整体替换是后端在处理这条消息时原子完成的（跟这次 fetch 是同一个
     // 请求），走到这里说明已经落库——把暂存的转成已确认，跟服务端同步一次
     // 用来刷新 chip 显示，不影响已经在跑的这一轮。
     void commitPendingAttachments()
   } catch (error) {
+    if (generation !== openSessionGeneration) return
     // 该对话已被另一个标签页删除——不是这一轮回答失败，是这条会话本身没了。
     // 引导回到列表/新对话，而不是让用户对着一句裸错误反复重试同一个已经
     // 不存在的 session_id。
@@ -2402,12 +2418,28 @@ async function sendChatMessage(value: string, planAction = '') {
   }
 }
 
+// 响应头可能在用户离开之后才回来；此时才拿到的 abort 也只属于旧连接。
+// 不提前取消 POST，保证已经提交的旧任务能在服务端继续生成并保存历史。
+async function attachChatStream(generation: number, stream: Promise<() => void>) {
+  const stop = await stream
+  if (generation !== openSessionGeneration || !streamRunning.value) {
+    stop()
+    return
+  }
+  stopCurrentStream = stop
+}
+
 // applyChatEvent 是 SSE 事件的唯一落点 —— 首次发送和断线续传共用它。
 //
 // 抽出来不是为了短，是因为**续传必须走完全相同的解释逻辑**：补发的事件跟直播的
 // 事件是同一批（服务端只是从日志里重放），两处各写一遍的话，差异只会在断线之后
 // 才显形，而那是最难复现的场景。
-function applyChatEvent(assistant: Message, event: ChatEvent) {
+function applyChatEvent(assistant: Message, event: ChatEvent, generation: number) {
+  if (generation !== openSessionGeneration) {
+    // 旧任务仍可能刚创建会话；同步侧栏即可，不改变正在看的新对话。
+    if (event.type === 'session' || event.type === 'done') void refreshSessionList().catch(() => {})
+    return
+  }
   // 游标每个事件都更新。续传靠它，所以放在所有分支之前 —— 放进某个分支里
   // 就会漏掉没被显式处理的事件类型，断点因此往回退，重连后收到重复内容。
   if (event.id) lastEventId = event.id
@@ -2510,7 +2542,7 @@ function applyChatEvent(assistant: Message, event: ChatEvent) {
       } else if (event.type === STREAM_CLOSED) {
         // done 之后服务端也会关连接，所以这个事件**正常结束时同样会到**。
         // 只有还在 running 才说明是真断了。
-        if (assistant.status === 'running') void handleStreamClosed(assistant)
+        if (assistant.status === 'running') void handleStreamClosed(assistant, generation)
       }
   // 每个事件都可能带来新内容（delta/工具卡片/AskUser 问题……），容器是自己
   // 滚动的（见 messageListEl 的说明），不追着滚新内容就会落在视口外——
@@ -2523,39 +2555,37 @@ function applyChatEvent(assistant: Message, event: ChatEvent) {
 // 关键是**先问一次 status 再动手**，而不是盲目重连：那一轮可能早就在服务端跑完了
 // （我们只是没收到最后几个事件），这时候续传流是白费的，直接拉历史就能拿到完整答案。
 // status 查的是控制面，多副本下有效。
-async function handleStreamClosed(assistant: Message) {
+async function handleStreamClosed(assistant: Message, generation: number) {
+  if (generation !== openSessionGeneration) return
   const sessionId = currentSessionId.value
   if (!sessionId) {
-    finishBrokenTurn(assistant, '连接中断')
+    finishBrokenTurn(assistant, '连接中断', generation)
     return
   }
   if (resumeAttempts >= MAX_RESUME_ATTEMPTS) {
-    finishBrokenTurn(assistant, '连接中断，已停止自动重连')
+    finishBrokenTurn(assistant, '连接中断，已停止自动重连', generation)
     return
   }
   resumeAttempts += 1
   try {
     const { running } = await getTurnStatus(sessionId)
+    if (generation !== openSessionGeneration) return
     if (!running) {
       // 那一轮已经结束了，答案在库里。拉一次历史，比续传一条已经没有后续的流实在。
-      await openSession(sessionId)
-      assistant.status = 'done'
-      streamRunning.value = false
-      resumeAvailable.value = false
+      await openSession(sessionId, true)
       return
     }
-    stopCurrentStream = await resumeMessageStream(sessionId, lastEventId, event => applyChatEvent(assistant, event))
+    await attachChatStream(generation,
+      resumeMessageStream(sessionId, lastEventId, event => applyChatEvent(assistant, event, generation)))
   } catch (error) {
+    if (generation !== openSessionGeneration) return
     // 410 log_expired：事件日志没了，流补不回来 —— 但对话内容在库里，这不是错误。
     // 按 code 分支，不去匹配中文文案（文案一改就失效，见 ApiError 的注释）。
     if (error instanceof ApiError && error.code === 'log_expired') {
-      await openSession(sessionId)
-      assistant.status = 'done'
-      streamRunning.value = false
-      resumeAvailable.value = false
+      await openSession(sessionId, true)
       return
     }
-    finishBrokenTurn(assistant, error instanceof Error ? error.message : String(error))
+    finishBrokenTurn(assistant, error instanceof Error ? error.message : String(error), generation)
   }
 }
 
@@ -2563,7 +2593,8 @@ async function handleStreamClosed(assistant: Message) {
 //
 // 必须放掉 streamRunning：它同时是输入框的禁用条件（sendChatMessage 开头那句
 // `if (streamRunning) return`），卡住不放的表现是整个对话框永久变灰、只能刷新页面。
-function finishBrokenTurn(assistant: Message, reason: string) {
+function finishBrokenTurn(assistant: Message, reason: string, generation: number) {
+  if (generation !== openSessionGeneration) return
   assistant.status = 'failed'
   if (!assistant.text) assistant.text = reason
   stopCurrentStream = null
@@ -2576,14 +2607,16 @@ function finishBrokenTurn(assistant: Message, reason: string) {
 async function retryResume() {
   const assistant = [...messages.value].reverse().find(item => item.role === 'assistant')
   if (!assistant) return
+  const generation = ++openSessionGeneration
   resumeAttempts = 0
   assistant.status = 'running'
   streamRunning.value = true
   resumeAvailable.value = false
-  await handleStreamClosed(assistant)
+  await handleStreamClosed(assistant, generation)
 }
 
 async function addMessage() {
+  if (streamRunning.value || sessionLoading.value) return
   const value = prompt.value.trim()
   if (!value) return
   prompt.value = ''
@@ -2713,6 +2746,8 @@ function openProject(project: ProjectItem) {
 // 时候结束（可能是一个跑很久的任务）才解锁，期间用户会以为整个应用卡死了。
 // 本地这条 fetch 的读取循环也会在背景里空转，直到服务端关闭连接才停。
 function detachCurrentStream() {
+  ++openSessionGeneration
+  sessionLoading.value = false
   stopCurrentStream?.()
   stopCurrentStream = null
   streamRunning.value = false
@@ -2728,15 +2763,21 @@ function detachCurrentStream() {
 // 先 POST 再 abort：反过来的话连接已经断了，而 stop 是否送达就全看运气了。
 // POST 失败也照样 abort —— 至少把界面还给用户，总比卡在"生成中"强。
 async function stopStream() {
+  // 先使准备中和已断开的回调失效，避免等停止请求返回时又提交本轮消息。
+  const generation = ++openSessionGeneration
+  sessionLoading.value = false
   const sessionId = currentSessionId.value
+  const stop = stopCurrentStream
   if (sessionId) {
     try {
       await stopGeneration(sessionId)
     } catch (error) {
+      if (generation !== openSessionGeneration) return
       connectionError.value = `停止请求没送达：${error instanceof Error ? error.message : String(error)}`
     }
   }
-  stopCurrentStream?.()
+  stop?.()
+  if (generation !== openSessionGeneration) return
   stopCurrentStream = null
   streamRunning.value = false
   resumeAvailable.value = false
@@ -2876,11 +2917,14 @@ function removePendingLibraryImport(file: UserFile) {
 // ensureCurrentSession 保证这时候一定有 session_id 可用——这一步不能再往后
 // 推了：attachment_id 是导入这个动作的产物，发消息请求本身要带着它，没法
 // 像 skill/tool 那样让后端在处理消息的同一个请求里顺带做掉。
-async function flushPendingLibraryImports(): Promise<void> {
+async function flushPendingLibraryImports(generation = openSessionGeneration): Promise<void> {
   if (!pendingLibraryImports.value.length) return
-  const sessionId = await ensureCurrentSession()
-  for (const file of pendingLibraryImports.value) {
+  const imports = [...pendingLibraryImports.value]
+  const sessionId = await ensureCurrentSession(generation)
+  if (generation !== openSessionGeneration) return
+  for (const file of imports) {
     const imported = await importFileToSession(sessionId, file.kind, file.id)
+    if (generation !== openSessionGeneration) return
     attachmentIds.value.push(imported.attachment_id)
     attachmentFiles.value.unshift({
       id: imported.attachment_id,
@@ -3224,7 +3268,7 @@ function escapeHtml(text: string): string {
                    是禁用的死键（sendChatMessage 开头就 return），占着位置还误导人。 -->
               <n-button v-if="streamRunning" type="error" secondary @click="stopStream">停止生成</n-button>
               <n-button v-else-if="resumeAvailable" type="warning" secondary @click="retryResume">重新连接</n-button>
-              <n-button v-else type="primary" @click="addMessage">发送</n-button>
+              <n-button v-else type="primary" :disabled="sessionLoading" @click="addMessage">发送</n-button>
             </div>
           </div>
         </section>
